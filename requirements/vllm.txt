@@ -1,0 +1,10 @@
+# Local scheduler/VLM serving environment.
+# Install this inside the existing vllm environment.
+vllm
+transformers
+torch
+pillow
+qwen-vl-utils
+
+# Runtime model path currently used by the profile:
+# /mnt/wangwai/weights/Qwen/Qwen3-VL-8B-Instruct

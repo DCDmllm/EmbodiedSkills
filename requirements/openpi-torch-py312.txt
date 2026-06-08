@@ -1,0 +1,16 @@
+# OpenPI/pi0.5 worker environment.
+# Install this inside the existing openpi-torch-py312 environment.
+-e .
+
+numpy
+pillow
+pyyaml
+torch
+transformers==4.53.2
+safetensors
+
+# The worker imports RoboTwin's OpenPI source via PYTHONPATH:
+# /mnt/wangwai/RoboTwin/policy/pi05/src
+#
+# Keep JAX/Flax out of this torch worker unless a future OpenPI path explicitly
+# needs them. Current ClawVLA pi0.5 path uses the torch OpenPI loader/hook.

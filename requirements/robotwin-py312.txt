@@ -1,0 +1,12 @@
+# Main ClawVLA agent + RoboTwin environment.
+# Install this inside the existing robotwin-py312 environment.
+-e .
+
+numpy
+openai>=1.0.0
+pillow
+pyyaml
+rich>=13.0.0
+
+# RoboTwin/CUDA/SAPIEN/PyTorch dependencies are provided by the robotwin-py312 env.
+# Do not install torch from this file unless rebuilding that environment.

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+
+# ClawVLA runtime outputs
+tmp_runs/
+tmp_artifacts/
+*.log
+*.jsonl
+
+# Local dependency scratch space
+.deps/
+
+# Editor/system files
+.DS_Store
+.vscode/
+.idea/
