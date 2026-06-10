@@ -141,6 +141,36 @@ tmp_artifacts/<prefix>/            # observation/action/overlay artifacts
 
 terminal 只显示 Rich trace 和关键事件；完整 JSON 写入文件。
 
+## Agent RL
+
+RL 训练代码是项目的一部分，位于：
+
+```text
+src/clawvla/rl/          # verl GRPO runner、agent loop adapter、policy proxy、trajectory archive
+src/clawvla/rewards/     # RoboTwin reward snapshot / dense reward
+configs/rl/              # 训练、smoke、reward、cluster 配置
+scripts/run_clawvla_rl.sh
+```
+
+核心约束：
+
+- 训练一个统一 VLM policy；`vision/scheduler/verifier/recovery` 都走同一个 policy。
+- OpenPI/pi0.5 冻结，只作为动作 backend。
+- 训练样本保留真实图文输入；有 image ref 但没有 multimodal payload 会直接报错。
+- loss mask 只覆盖模型输出 token；工具返回、环境状态、skill 结果不进 loss。
+- 超长 prompt/response 不静默截断，配置不够会显式失败。
+- 未配置 reward 的任务会在 preflight 失败，不做未知任务静默 fallback。
+
+常用入口：
+
+```bash
+cd /mnt/wangwai/vla/clawvla
+./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_grpo.yaml --mode dry-run
+./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_real_5step_1update.yaml --mode train --run-id rl_real5_1update
+```
+
+更完整说明见 [docs/agent_rl.md](docs/agent_rl.md)。
+
 ## 脚本说明
 
 主入口：

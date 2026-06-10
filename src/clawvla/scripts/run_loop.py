@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    _apply_runtime_environment(config)
     result_output = Path(args.result_output) if args.result_output else _default_run_path(config, args.artifact_prefix, "result.json")
     with _openpi_worker_lifecycle(config, args.config, args.artifact_prefix):
         runtime = AgentRuntime(config)
@@ -45,6 +46,7 @@ def main() -> None:
         runtime.blackboard.write("run_robotwin", bool(args.run))
         runtime.blackboard.write("artifact_prefix", args.artifact_prefix)
         runtime.blackboard.task_instruction = args.instruction
+        _install_rl_reward_tracker(runtime, config)
 
         if args.initial_observe and not args.no_initial_observe:
             bootstrap = _bootstrap_observe(runtime, args.instruction, args.artifact_prefix, args.run)
@@ -97,6 +99,12 @@ def _openpi_runtime_cfg(config: AgentConfig) -> dict[str, object]:
         return {}
     runtime_cfg = backend_cfg.get("openpi_runtime", {})
     return dict(runtime_cfg) if isinstance(runtime_cfg, dict) else {}
+
+
+def _apply_runtime_environment(config: AgentConfig) -> None:
+    env = getattr(config.runtime_environment, "env", {})
+    for key, value in env.items():
+        os.environ[str(key)] = str(value)
 
 
 def _start_openpi_worker(
@@ -259,6 +267,25 @@ def _model_call_summary(runtime: AgentRuntime) -> list[dict[str, object]]:
         if event.event_type in {"model.call", "model.output"}:
             calls.append({"event_index": event_index, "event_type": event.event_type, **event.payload})
     return calls[-32:]
+
+
+def _install_rl_reward_tracker(runtime: AgentRuntime, config: AgentConfig) -> None:
+    output_path = os.environ.get("CLAWVLA_RL_REWARD_JSONL")
+    if not output_path:
+        return
+    from clawvla.rl.reward_tracker import RuntimeRewardTracker
+
+    task_name = os.environ.get("CLAWVLA_RL_TASK_NAME") or config.robotwin.task_name
+    step_cost = float(os.environ.get("CLAWVLA_RL_STEP_COST") or 0.05)
+    tracker = RuntimeRewardTracker(task_name=task_name, output_path=output_path, step_cost=step_cost)
+    runtime.blackboard.write("rl_reward_tracker", tracker, event_type="rl.reward_tracker_installed")
+    emit_status_notice(
+        "rl_reward_tracker_installed",
+        success=True,
+        source="run_loop",
+        reason=f"task={task_name} output={output_path}",
+        always=True,
+    )
 
 
 if __name__ == "__main__":

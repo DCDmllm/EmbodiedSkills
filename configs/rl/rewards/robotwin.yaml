@@ -1,0 +1,20 @@
+reward:
+  registry:
+    - clawvla.rl.reward_registry:register_builtin_robotwin
+  task_map:
+    place_container_plate: robotwin
+    stack_blocks_two: robotwin
+    open_laptop: robotwin
+    handover_mic: robotwin
+    handover_block: robotwin
+    press_stapler: robotwin
+    click_bell: robotwin
+    click_alarmclock: robotwin
+    lift_pot: robotwin
+    grab_roller: robotwin
+    blocks_ranking_rgb: robotwin
+  step_cost: 0.05
+  incomplete_episode_penalty: -1.0
+  invalid_decision_penalty: -2.0
+  skill_failure_penalty: -1.0
+  infra_failure_reward: null

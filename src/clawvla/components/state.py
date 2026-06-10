@@ -3,7 +3,7 @@ from __future__ import annotations
 from ..blackboard import Blackboard
 from ..schema import PerceptionResult, SkillRequest, SkillResult, WorldRelation, WorldState
 from ..skills.base import SkillContext, SkillRegistry
-from .skill_helpers import get_attr, ok, register_skill, to_dict
+from .skill_helpers import get_attr, ok, register_skill, to_dict, unavailable
 
 
 def register_state_skills(registry: SkillRegistry) -> None:
@@ -16,15 +16,51 @@ def register_state_skills(registry: SkillRegistry) -> None:
 def update_world_state(request: SkillRequest, context: SkillContext) -> SkillResult:
     blackboard = context.blackboard
     perception = blackboard.read("perception")
-    perception_was_missing = not isinstance(perception, PerceptionResult)
     if not isinstance(perception, PerceptionResult):
-        perception = PerceptionResult(
-            observation_id=get_attr(blackboard.read("observation"), "observation_id"),
-            metadata={"mode": "placeholder_perception", "reason": "perception_missing_before_world_state_update"},
+        reason = "missing_perception_before_world_state_update"
+        blackboard.write(
+            "last_state_error",
+            {"reason": reason, "observation_id": get_attr(blackboard.read("observation"), "observation_id")},
+            event_type="state.update_world_state_unavailable",
         )
-    perception_is_placeholder = perception_was_missing or "placeholder" in str(perception.metadata).lower()
+        return unavailable(
+            "world_state_unavailable",
+            reason,
+            {"observation_id": get_attr(blackboard.read("observation"), "observation_id")},
+        )
     if not perception.candidates:
-        perception.metadata.setdefault("world_state_update_note", "empty_perception_candidates")
+        reason = "empty_perception_candidates_before_world_state_update"
+        blackboard.write(
+            "last_state_error",
+            {
+                "reason": reason,
+                "observation_id": perception.observation_id,
+                "perception_metadata": dict(perception.metadata),
+            },
+            event_type="state.update_world_state_unavailable",
+        )
+        return unavailable(
+            "world_state_unavailable",
+            reason,
+            {"perception": perception.to_dict()},
+        )
+    perception_is_placeholder = "placeholder" in str(perception.metadata).lower()
+    if perception_is_placeholder:
+        reason = "placeholder_perception_before_world_state_update"
+        blackboard.write(
+            "last_state_error",
+            {
+                "reason": reason,
+                "observation_id": perception.observation_id,
+                "perception_metadata": dict(perception.metadata),
+            },
+            event_type="state.update_world_state_unavailable",
+        )
+        return unavailable(
+            "world_state_unavailable",
+            reason,
+            {"perception": perception.to_dict()},
+        )
     world_state = WorldState(
         task_instruction=blackboard.task_instruction,
         geometry_summary=dict(perception.geometry_summary),
@@ -38,14 +74,13 @@ def update_world_state(request: SkillRequest, context: SkillContext) -> SkillRes
         uncertainty_reasons=[str(item) for item in perception.uncertainty.get("reasons", [])],
         metadata={
             "perception_metadata": perception.metadata,
-            "placeholder": bool(perception_is_placeholder or not perception.candidates),
-            "placeholder_reason": "empty_or_placeholder_perception" if perception_is_placeholder or not perception.candidates else None,
+            "placeholder": False,
+            "placeholder_reason": None,
         },
     )
     blackboard.write("world_state", world_state, event_type="state.update_world_state")
     blackboard.write("stage", world_state.stage)
-    status = "world_state_updated_from_placeholder_perception" if world_state.metadata["placeholder"] else "world_state_updated"
-    return ok(status, {"world_state": world_state.to_dict()})
+    return ok("world_state_updated", {"world_state": world_state.to_dict()})
 
 
 def track_object_identity(request: SkillRequest, context: SkillContext) -> SkillResult:

@@ -1,0 +1,47 @@
+extends:
+  - qwen3vl_pi05_grpo.yaml
+
+name: qwen3vl_pi05_real_5step_1update
+
+rollout:
+  max_steps: 5
+  run_robotwin: true
+  start_openpi_worker: true
+  episodes: 1
+  group_size: 1
+  artifact_prefix: clawvla_rl_real5_1update
+  seeds:
+    - 0
+  episode_timeout_s: 1800.0
+  openpi_port_base: 9265
+
+verl:
+  train_mode: full
+  lora_merge_for_rollout: false
+  force_full_gpu_workers: false
+  rollout_n: 4
+  total_epochs: 1
+  total_training_steps: 1
+  actor_ppo_mini_batch_size: 1
+  actor_ppo_micro_batch_size_per_gpu: 1
+  rollout_log_prob_micro_batch_size_per_gpu: 1
+  ref_log_prob_micro_batch_size_per_gpu: 1
+
+cluster:
+  policy_gpus:
+    - 2
+    - 3
+    - 4
+    - 5
+  openpi_gpus:
+    - 6
+  robotwin_gpus:
+    - 7
+  ray_num_workers: 1
+
+checkpoint:
+  save_freq: -1
+  keep_last: 1
+
+metadata:
+  notes: Real RoboTwin/OpenPI five-step multimodal GRPO startup check with one optimizer update.

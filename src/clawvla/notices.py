@@ -90,7 +90,12 @@ def _collect_markers(value: Any, *, depth: int = 0, budget: list[int] | None = N
     if isinstance(value, dict):
         found: set[str] = set()
         for key, item in value.items():
-            found.update(_collect_markers(str(key), depth=depth + 1, budget=budget))
+            marker_key = _marker_for_exact_key(str(key))
+            if marker_key is not None:
+                if _marker_value_is_active(item):
+                    found.add(marker_key)
+            else:
+                found.update(_collect_markers(str(key), depth=depth + 1, budget=budget))
             found.update(_collect_markers(item, depth=depth + 1, budget=budget))
         return found
     if isinstance(value, (list, tuple, set)):
@@ -100,6 +105,24 @@ def _collect_markers(value: Any, *, depth: int = 0, budget: list[int] | None = N
         return found
     text = str(value).lower()
     return {marker for marker in NOTICE_MARKERS if marker in text}
+
+
+def _marker_for_exact_key(key: str) -> str | None:
+    lowered = key.lower()
+    for marker in NOTICE_MARKERS:
+        if marker in lowered:
+            return marker
+    return None
+
+
+def _marker_value_is_active(value: Any) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip()) and value.strip().lower() not in {"false", "none", "null", "no"}
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return bool(value)
 
 
 def _jsonable(value: Any) -> Any:

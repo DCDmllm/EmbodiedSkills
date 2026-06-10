@@ -18,8 +18,14 @@ dist/
 # ClawVLA runtime outputs
 tmp_runs/
 tmp_artifacts/
+runs/
+checkpoints/
+outputs/
+wandb/
 *.log
 *.jsonl
+*.pid
+*.exit
 
 # Local dependency scratch space
 .deps/

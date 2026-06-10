@@ -138,6 +138,7 @@ class AgentLoop:
                     return LoopRunResult("invalid_decision", stage, records, reason=error)
                 continue
 
+            self._before_skill(decision, step_index)
             result = self.runtime.run_skill(
                 str(decision.next_component),
                 str(decision.next_skill),
@@ -146,6 +147,7 @@ class AgentLoop:
                 budget_steps=decision.budget_steps,
                 metadata={"loop_step": step_index, "loop_stage": stage},
             )
+            self._after_skill(decision, step_index, result)
             record = LoopStepRecord(step_index, stage_before, decision, result.status, result.to_dict())
             records.append(record)
             self._write_loop_history(records)
@@ -168,7 +170,7 @@ class AgentLoop:
             self._apply_stage(decision)
             stage = self.policy.normalize_stage(self.runtime.blackboard.read("stage") or decision.stage or stage)
 
-        return LoopRunResult("max_steps_reached", stage, records, reason=f"max_steps={self.config.max_steps}")
+        return self._max_steps_result(stage, records)
 
     def _choose_decision(self, stage: str) -> SkillResult:
         allowed_skills = self._state_gated_allowed_skills(
@@ -189,6 +191,29 @@ class AgentLoop:
             **self.config.scheduler_payload,
         }
         return self.runtime.run_skill("scheduler", "choose_next_skill", payload, stage=stage)
+
+    def _max_steps_result(self, stage: str, records: list[LoopStepRecord]) -> LoopRunResult:
+        reason = f"max_steps={self.config.max_steps}"
+        failure_statuses = {
+            "invalid_decision",
+            "scheduler_failed",
+            "skill_exception",
+            "skill_failed",
+        }
+        failed_records: list[str] = []
+        for record in records:
+            result = record.result if isinstance(record.result, dict) else {}
+            success = result.get("success")
+            if record.status in failure_statuses or success is False:
+                failed_records.append(f"step={record.step_index}:status={record.status}")
+        if failed_records:
+            return LoopRunResult(
+                "max_steps_reached_with_failures",
+                stage,
+                records,
+                reason=f"{reason}; failures={';'.join(failed_records[-3:])}",
+            )
+        return LoopRunResult("max_steps_reached", stage, records, reason=reason)
 
     def _enabled_allowed_skills(self, allowed_skills: dict[str, list[str]]) -> dict[str, list[str]]:
         enabled_components = set(self.runtime.components.names())
@@ -234,7 +259,22 @@ class AgentLoop:
 
     def _post_skill_update(self, decision: LoopDecision, result: SkillResult) -> None:
         is_execute_action = decision.next_component == "motion" and decision.next_skill == "execute_action"
-        if decision.next_component in {"vision", "motion", "verifier"} and not is_execute_action:
+        should_update_world_state = (
+            decision.next_component in {"motion", "verifier"} and not is_execute_action
+        ) or (
+            decision.next_component == "vision"
+            and decision.next_skill
+            in {
+                "perceive_scene",
+                "localize_task_objects",
+                "ground_task_objects",
+                "lift_depth_cluster",
+                "lift_geometry",
+                "bind_arm",
+                "estimate_uncertainty",
+            }
+        )
+        if should_update_world_state:
             self.runtime.run_skill("state", "update_world_state", {"stage": decision.stage}, stage=decision.stage)
         if is_execute_action and result.status == "action_executed":
             self.runtime.blackboard.write("stage", "verify", event_type="loop.stage_forced_after_execute_action")
@@ -256,6 +296,29 @@ class AgentLoop:
             payload.setdefault("use_model", True)
             payload.setdefault("image_paths", self._current_vlm_image_paths())
         return payload
+
+    def _before_skill(self, decision: LoopDecision, step_index: int) -> None:
+        tracker = self.runtime.blackboard.read("rl_reward_tracker")
+        hook = getattr(tracker, "before_skill", None)
+        if callable(hook):
+            hook(
+                blackboard=self.runtime.blackboard,
+                component=str(decision.next_component),
+                skill=str(decision.next_skill),
+                step_index=step_index,
+            )
+
+    def _after_skill(self, decision: LoopDecision, step_index: int, result: SkillResult) -> None:
+        tracker = self.runtime.blackboard.read("rl_reward_tracker")
+        hook = getattr(tracker, "after_skill", None)
+        if callable(hook):
+            hook(
+                blackboard=self.runtime.blackboard,
+                component=str(decision.next_component),
+                skill=str(decision.next_skill),
+                step_index=step_index,
+                result=result,
+            )
 
     def _robotwin_needs_setup(self) -> bool:
         env = self.runtime.blackboard.read("env_adapter")
