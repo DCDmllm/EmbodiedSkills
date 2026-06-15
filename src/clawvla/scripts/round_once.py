@@ -40,9 +40,9 @@ def main() -> None:
         "perceive_scene",
         {"use_model": True, "image_paths": image_paths},
     )
-    ground_result = runtime.run_skill(
+    localize_result = runtime.run_skill(
         "vision",
-        "ground_task_objects",
+        "localize_task_objects",
         {"use_model": True, "image_paths": image_paths},
     )
     uncertainty_result = runtime.run_skill(
@@ -66,7 +66,7 @@ def main() -> None:
             {
                 "capture": capture_result.to_dict(),
                 "perceive": perceive_result.to_dict(),
-                "ground": ground_result.to_dict(),
+                "localize": localize_result.to_dict(),
                 "uncertainty": uncertainty_result.to_dict(),
                 "world_state": world_state_result.output.get("world_state"),
                 "decision": decision_result.output.get("decision"),

@@ -83,7 +83,7 @@
         "capture_views",
         "perceive_scene",
         "localize_task_objects",
-        "ground_task_objects",
+        "refresh_preflight_observation",
         "render_grounding_overlay",
         "lift_depth_cluster",
         "lift_geometry",
@@ -97,8 +97,6 @@
       "prompt_format": "json",
       "skills": [
         "update_world_state",
-        "track_object_identity",
-        "infer_relations",
         "summarize_state"
       ]
     },
@@ -113,7 +111,7 @@
         "select_current_subgoal",
         "advance_subgoal",
         "allocate_budget",
-        "request_reobserve"
+        "repair_stage_transition"
       ]
     },
     "safety": {
@@ -144,9 +142,7 @@
       "model": "verifier",
       "prompt_format": "json",
       "skills": [
-        "verify_progress",
-        "score_residual",
-        "diagnose_failure"
+        "verify_progress"
       ]
     },
     "recovery": {
@@ -195,6 +191,7 @@
     "enable_pointcloud": true,
     "enable_actor_segmentation": false,
     "enable_mesh_segmentation": false,
+    "camera_profile": "Large_D435_Wide",
     "planner_image_mode": "current_rgb_4",
     "static_camera_preset": "selected_global_4",
     "artifact_dir": "/mnt/wangwai/vla/clawvla/tmp_artifacts"
@@ -221,7 +218,7 @@
       "device": "cuda",
       "openpi_src": "/mnt/wangwai/RoboTwin/policy/pi05/src",
       "policy_kwargs": {
-        "n_action_steps": 10,
+        "n_action_steps": 30,
         "train_config_name": "pi05_base_finetune_on_robotwin_clean_randomized_joint_training",
         "asset_id": "pi0.5_clean_randomize_joint_training"
       },

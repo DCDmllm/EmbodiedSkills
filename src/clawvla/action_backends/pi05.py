@@ -137,6 +137,7 @@ class Pi05ActionBackend:
         payload = {
             "artifact_dir": str(artifact_dir),
             "prompt": prompt,
+            "motion_plan": request.get("motion_plan"),
             "num_steps": request.get("num_steps") or self.config.get("policy_kwargs", {}).get("sample_num_steps") or 10,
             "horizon": request.get("horizon") or self.config.get("policy_kwargs", {}).get("n_action_steps") or 10,
         }
@@ -145,7 +146,14 @@ class Pi05ActionBackend:
         with socket.create_connection((host, port), timeout=float(runtime_cfg.get("timeout", 600.0))) as sock:
             sock.sendall((json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8"))
             response = _read_socket_json_line(sock)
+        if response.get("success") is False:
+            errors = response.get("errors")
+            if not isinstance(errors, list):
+                errors = []
+            raise RuntimeError(f"{response.get('status')}: {';'.join(str(error) for error in errors)}")
         chunk_payload = response["action_chunk"]
+        if not isinstance(chunk_payload, dict):
+            raise RuntimeError(f"pi05_worker_missing_action_chunk: response_keys={sorted(str(key) for key in response.keys())}")
         return ActionChunk(
             action_type=str(chunk_payload["action_type"]),
             commands=[[float(item) for item in command] for command in chunk_payload["commands"]],
@@ -876,21 +884,15 @@ def _resolve_prompt(
     observation: ObservationBundle | None,
     request: dict[str, Any],
 ) -> str:
-    if request.get("prompt"):
-        return str(request["prompt"])
+    _ = (backend, motion_goal, world_state, observation)
     motion_plan = request.get("motion_plan")
     if isinstance(motion_plan, dict) and motion_plan.get("vla_prompt"):
         return str(motion_plan["vla_prompt"])
-    if isinstance(motion_plan, dict) and motion_plan.get("task_instruction"):
-        return str(motion_plan["task_instruction"])
-    if observation is not None and observation.task_instruction:
-        return str(observation.task_instruction)
-    if world_state is not None and world_state.task_instruction:
-        return str(world_state.task_instruction)
-    if motion_goal is not None and motion_goal.motion_hint:
-        return str(motion_goal.motion_hint)
-    task_prompt = backend.config.get("default_prompt")
-    return str(task_prompt or "perform the task")
+    raise ValueError(
+        "motion_plan.vla_prompt is required for VLA execution; refusing to fall back to request.prompt, "
+        "observation.task_instruction, world_state.task_instruction, motion_goal.motion_hint, default_prompt, "
+        "or 'perform the task'. Run motion.plan_motion first so the VLA receives only the current subgoal instruction."
+    )
 
 
 def _state_from_observation(observation: ObservationBundle | None) -> tuple["np.ndarray", str]:
@@ -934,6 +936,8 @@ def _read_socket_json_line(sock: socket.socket) -> dict[str, Any]:
         if b"\n" in chunk:
             break
     data = b"".join(chunks).split(b"\n", 1)[0]
+    if not data:
+        raise RuntimeError("pi05_worker_empty_response")
     return json.loads(data.decode("utf-8"))
 
 

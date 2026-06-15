@@ -7,7 +7,6 @@ import numpy as np
 
 from ..artifacts import ArtifactStore
 from ..config import RobotwinConfig, RuntimeEnvironment
-from ..notices import emit_status_notice
 from ..schema import ActionChunk, CameraView, ObservationBundle, RobotArmState
 from .base import RobotEnvAdapter
 from .robotwin_session import RoboTwinSession, robotwin_cwd
@@ -68,19 +67,7 @@ class RoboTwinAdapter(RobotEnvAdapter):
             self.last_observation = observation
             return observation
 
-        observation = ObservationBundle(
-            task_instruction=kwargs.get("instruction"),
-            metadata=self._capture_metadata({**kwargs, "placeholder": True}),
-        )
-        emit_status_notice(
-            "robotwin_capture_placeholder",
-            success=True,
-            source="robotwin.capture_views",
-            reason="no_raw_observation_or_bound_task_env",
-            payload=observation.metadata,
-        )
-        self.last_observation = observation
-        return observation
+        raise RuntimeError("robotwin_observation_unavailable:no_raw_observation_or_bound_task_env")
 
     def _capture_metadata(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         metadata = {
@@ -92,6 +79,7 @@ class RoboTwinAdapter(RobotEnvAdapter):
             "now_ep_num": self.config.now_ep_num,
             "enable_depth": self.config.enable_depth,
             "enable_pointcloud": self.config.enable_pointcloud,
+            "camera_profile": self.config.camera_profile,
             "planner_image_mode": self.config.planner_image_mode,
             "static_camera_preset": self.config.static_camera_preset,
             "artifact_dir": self.config.artifact_dir,

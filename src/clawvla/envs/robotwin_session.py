@@ -64,8 +64,10 @@ def prepare_task_args(config: RobotwinConfig, overrides: dict[str, Any] | None =
     args["eval_video_log"] = False
     args["need_plan"] = False
 
+    camera_map = load_yaml(camera_config_path)
     apply_embodiment_files(args, repo_root, load_yaml(embodiment_config_path))
-    apply_camera_defaults(args, load_yaml(camera_config_path))
+    apply_camera_profile(args, camera_map, config.camera_profile)
+    apply_camera_defaults(args, camera_map)
     args["save_path"] = resolve_repo_relative(repo_root, str(args.get("save_path", "./data")))
 
     if overrides:
@@ -108,6 +110,28 @@ def apply_camera_defaults(args: dict[str, Any], camera_map: dict[str, Any]) -> N
     if isinstance(head_camera_type, str) and isinstance(camera_map.get(head_camera_type), dict):
         args["head_camera_h"] = camera_map[head_camera_type].get("h")
         args["head_camera_w"] = camera_map[head_camera_type].get("w")
+
+
+def apply_camera_profile(args: dict[str, Any], camera_map: dict[str, Any], camera_profile: str | None) -> None:
+    if not camera_profile:
+        return
+    if camera_profile not in camera_map:
+        raise ValueError(f"RoboTwin camera_profile is not defined in _camera_config.yml: {camera_profile}")
+    camera = args.setdefault("camera", {})
+    if not isinstance(camera, dict):
+        raise ValueError(f"RoboTwin task camera config must be a dict, got {type(camera).__name__}")
+    camera["head_camera_type"] = camera_profile
+    camera["wrist_camera_type"] = camera_profile
+    for config_key in ("left_embodiment_config", "right_embodiment_config"):
+        embodiment_config = args.get(config_key)
+        if not isinstance(embodiment_config, dict):
+            continue
+        static_cameras = embodiment_config.get("static_camera_list")
+        if not isinstance(static_cameras, list):
+            continue
+        for camera_info in static_cameras:
+            if isinstance(camera_info, dict) and camera_info.get("name") in {"head_camera", "front_camera"}:
+                camera_info["type"] = camera_profile
 
 
 def load_yaml(path: Path) -> dict[str, Any]:

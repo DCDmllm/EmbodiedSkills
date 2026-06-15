@@ -180,6 +180,7 @@ class PerceptionResult(DictSerializable):
 class Subgoal(DictSerializable):
     subgoal_id: str
     type: str
+    instruction: str | None = None
     source_candidate_id: str | None = None
     target_candidate_id: str | None = None
     status: str = "pending"
@@ -191,6 +192,7 @@ class Subgoal(DictSerializable):
         return cls(
             subgoal_id=str(payload.get("subgoal_id") or payload.get("id") or f"S{index + 1}"),
             type=str(payload.get("type") or payload.get("skill") or payload.get("name") or "act"),
+            instruction=str(payload["instruction"]).strip() if payload.get("instruction") is not None else None,
             source_candidate_id=(
                 str(payload["source_candidate_id"])
                 if payload.get("source_candidate_id") is not None

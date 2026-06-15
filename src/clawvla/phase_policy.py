@@ -14,43 +14,43 @@ DEFAULT_ALLOWED_SKILLS: dict[str, dict[str, list[str]]] = {
             "capture_views",
             "perceive_scene",
             "localize_task_objects",
-            "ground_task_objects",
-            "render_grounding_overlay",
             "lift_depth_cluster",
             "lift_geometry",
             "bind_arm",
             "estimate_uncertainty",
         ],
-        "state": ["update_world_state", "track_object_identity", "infer_relations", "summarize_state"],
+        "state": ["update_world_state", "summarize_state"],
     },
     "plan": {
-        "scheduler": ["build_task_plan", "select_current_subgoal", "advance_subgoal", "allocate_budget", "request_reobserve"],
-        "state": ["summarize_state", "infer_relations"],
-    },
-    "preflight": {
-        "safety": [
-            "validate_skill_request",
-            "validate_arm_binding",
-            "check_reachability",
-            "check_workspace",
-            "preflight_action",
+        "scheduler": [
+            "build_task_plan",
+            "select_current_subgoal",
+            "advance_subgoal",
+            "allocate_budget",
+            "repair_stage_transition",
         ],
         "state": ["summarize_state"],
     },
+    "preflight": {
+        "vision": ["refresh_preflight_observation"],
+        "safety": ["preflight_action"],
+        "scheduler": ["repair_stage_transition"],
+    },
     "execute": {
-        "motion": ["build_motion_goal", "plan_motion", "emit_action_chunk", "execute_action"],
+        "motion": ["build_motion_goal", "plan_motion", "emit_action_chunk", "validate_action_chunk", "execute_action"],
         "state": ["summarize_state"],
+        "scheduler": ["repair_stage_transition"],
     },
     "verify": {
-        "verifier": ["verify_progress", "score_residual", "diagnose_failure"],
+        "verifier": ["verify_progress"],
         "state": ["update_world_state", "summarize_state"],
-        "vision": ["capture_views", "perceive_scene", "localize_task_objects", "ground_task_objects", "render_grounding_overlay", "estimate_uncertainty"],
-        "scheduler": ["advance_subgoal"],
+        "vision": ["capture_verify_views"],
+        "scheduler": ["advance_subgoal", "repair_stage_transition"],
     },
     "recover": {
         "recovery": ["decide_recovery", "build_retry_request"],
-        "scheduler": ["request_reobserve"],
-        "vision": ["capture_views", "perceive_scene", "localize_task_objects", "ground_task_objects", "render_grounding_overlay", "estimate_uncertainty"],
+        "scheduler": ["repair_stage_transition"],
+        "vision": ["capture_views", "perceive_scene", "localize_task_objects", "estimate_uncertainty"],
         "state": ["summarize_state"],
     },
 }
@@ -67,8 +67,6 @@ class PhasePolicy:
         return self.stage_order[0]
 
     def next_stage(self, current_stage: str) -> str:
-        if current_stage == "recover":
-            return "observe"
         try:
             index = self.stage_order.index(current_stage)
         except ValueError:

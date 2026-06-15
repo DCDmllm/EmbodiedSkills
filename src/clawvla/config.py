@@ -62,6 +62,7 @@ class RobotwinConfig:
     enable_pointcloud: bool = True
     enable_actor_segmentation: bool = False
     enable_mesh_segmentation: bool = False
+    camera_profile: str | None = None
     planner_image_mode: str = "current_rgb_4"
     static_camera_preset: str = "selected_global_4"
     artifact_dir: str = "/mnt/wangwai/vla/clawvla/tmp_artifacts"

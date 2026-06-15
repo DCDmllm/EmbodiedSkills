@@ -9,6 +9,8 @@ from typing import Any
 from .config import EnvCommandConfig
 from .trajectory import TrajectoryWriter
 
+_LOCAL_NO_PROXY = ("127.0.0.1", "localhost", "::1")
+
 
 def command_env(config: EnvCommandConfig, extra: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ)
@@ -17,7 +19,15 @@ def command_env(config: EnvCommandConfig, extra: dict[str, str] | None = None) -
     env.update({str(key): str(value) for key, value in config.env.items()})
     if extra:
         env.update({str(key): str(value) for key, value in extra.items()})
+    _ensure_local_no_proxy(env)
     return env
+
+
+def _ensure_local_no_proxy(env: dict[str, str]) -> None:
+    for key in ("NO_PROXY", "no_proxy"):
+        existing = [item.strip() for item in env.get(key, "").split(",") if item.strip()]
+        values = list(dict.fromkeys([*existing, *_LOCAL_NO_PROXY]))
+        env[key] = ",".join(values)
 
 
 def run_logged_subprocess(

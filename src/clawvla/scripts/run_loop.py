@@ -242,8 +242,6 @@ def _bootstrap_observe(runtime: AgentRuntime, instruction: str, artifact_prefix:
     for component, skill, skill_payload in [
         ("vision", "perceive_scene", {"use_model": True, "image_paths": image_paths}),
         ("vision", "localize_task_objects", {"use_model": True, "image_paths": image_paths}),
-        ("vision", "ground_task_objects", {"use_model": True, "image_paths": image_paths}),
-        ("vision", "render_grounding_overlay", {"artifact_prefix": artifact_prefix}),
         ("vision", "estimate_uncertainty", {"use_model": True, "image_paths": image_paths}),
     ]:
         result = runtime.run_skill(component, skill, skill_payload, stage="observe")

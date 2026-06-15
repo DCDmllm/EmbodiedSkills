@@ -29,7 +29,7 @@
       "--dtype",
       "bfloat16",
       "--max-model-len",
-      "16384"
+      "32768"
     ]
   }
 }

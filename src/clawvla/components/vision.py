@@ -15,9 +15,34 @@ from .vision_geometry import LiftGeometryConfig, lift_perception_geometry
 
 def register_vision_skills(registry: SkillRegistry) -> None:
     register_skill(registry, "vision", "capture_views", "Collect public camera/depth/proprioception observations.", capture_views)
-    register_skill(registry, "vision", "perceive_scene", "Produce visual candidates from the current observation.", perceive_scene)
-    register_skill(registry, "vision", "localize_task_objects", "Localize task-relevant objects with bbox evidence.", localize_task_objects)
-    register_skill(registry, "vision", "ground_task_objects", "Bind task language to visual candidates.", ground_task_objects)
+    register_skill(
+        registry,
+        "vision",
+        "capture_verify_views",
+        "Verify-only capture: collect fresh camera observations for verifier input without perception or planning.",
+        capture_verify_views,
+    )
+    register_skill(
+        registry,
+        "vision",
+        "perceive_scene",
+        "Detect visual candidates only; does not bind task source_candidate_id or target_candidate_id.",
+        perceive_scene,
+    )
+    register_skill(
+        registry,
+        "vision",
+        "localize_task_objects",
+        "Bind task source_candidate_id and target_candidate_id to existing visual candidates.",
+        localize_task_objects,
+    )
+    register_skill(
+        registry,
+        "vision",
+        "refresh_preflight_observation",
+        "Preflight-only repair: capture fresh views, refresh perception/localization, and update world_state.",
+        refresh_preflight_observation,
+    )
     register_skill(registry, "vision", "render_grounding_overlay", "Render bbox/role overlays for VLM-side prompts.", render_grounding_overlay)
     register_skill(
         registry,
@@ -67,6 +92,73 @@ def capture_views(request: SkillRequest, context: SkillContext) -> SkillResult:
     return ok("observation_captured", {"observation": to_dict(observation)})
 
 
+def capture_verify_views(request: SkillRequest, context: SkillContext) -> SkillResult:
+    blackboard = context.blackboard
+    env = blackboard.read("env_adapter")
+    if request.stage != "verify":
+        return unavailable("verify_observation_unavailable", f"capture_verify_views_only_allowed_in_verify:{request.stage}", {})
+    execution_report = blackboard.read("execution_report")
+    if not isinstance(execution_report, dict) or execution_report.get("status") != "action_executed":
+        return unavailable("verify_observation_unavailable", "missing_action_executed_report", {"execution_report": to_dict(execution_report)})
+    if env is None or not hasattr(env, "capture_views"):
+        return unavailable("verify_observation_unavailable", "missing_env_capture_views_adapter", {})
+
+    source_observation_id = _execution_observation_id(execution_report)
+    loop_step = request.metadata.get("loop_step")
+    step_part = f"step_{int(loop_step):04d}" if isinstance(loop_step, int) else str(request.payload.get("step") or "step_unknown")
+    base_prefix = str(request.payload.get("artifact_prefix") or blackboard.read("artifact_prefix") or "agent_loop")
+    artifact_prefix = f"{base_prefix}/verify/{step_part}"
+    try:
+        observation = env.capture_views(
+            artifact_prefix=artifact_prefix,
+            instruction=request.payload.get("instruction") or blackboard.task_instruction,
+        )
+    except Exception as exc:
+        report = {
+            "backend": "robotwin" if env is not None else "none",
+            "exception_type": type(exc).__name__,
+            "message": str(exc),
+            "task_env_bound": bool(getattr(env, "session", None) and getattr(env.session, "task_env", None)),
+        }
+        blackboard.write("last_verify_observation_error", report, event_type="vision.capture_verify_views_unavailable")
+        return unavailable("verify_observation_unavailable", str(exc), {"capture_error": report})
+
+    if observation is None or not _observation_image_paths(observation):
+        return unavailable("verify_observation_unavailable", "missing_verify_observation_images", {"observation": to_dict(observation)})
+
+    if hasattr(observation, "metadata") and isinstance(observation.metadata, dict):
+        observation.metadata.update(
+            {
+                "source": "vision.capture_verify_views",
+                "verify_active": True,
+                "verify_stage": request.stage,
+                "verify_loop_step": loop_step,
+                "source_execution_observation_id": source_observation_id,
+                "artifact_prefix": artifact_prefix,
+            }
+        )
+    blackboard.write("verify_observation", observation, event_type="vision.capture_verify_views")
+    blackboard.write(
+        "last_verify_capture",
+        {
+            "status": "verify_observation_captured",
+            "observation_id": get_attr(observation, "observation_id"),
+            "source_execution_observation_id": source_observation_id,
+            "image_paths": _observation_image_paths(observation),
+            "artifact_prefix": artifact_prefix,
+        },
+        event_type="vision.capture_verify_views",
+    )
+    return ok(
+        "verify_observation_captured",
+        {
+            "verify_observation": to_dict(observation),
+            "source_execution_observation_id": source_observation_id,
+            "image_paths": _observation_image_paths(observation),
+        },
+    )
+
+
 def perceive_scene(request: SkillRequest, context: SkillContext) -> SkillResult:
     blackboard = context.blackboard
     existing = blackboard.read("perception")
@@ -86,8 +178,7 @@ def perceive_scene(request: SkillRequest, context: SkillContext) -> SkillResult:
                     {
                         "candidate_id": "C1",
                         "label": "short visual label or null",
-                        "bbox_by_view": {"camera_name": [0, 0, 0, 0]},
-                        "visibility": "yes|partial|no|uncertain",
+                        "visibility": "yes|partial|uncertain",
                         "confidence": 0.0,
                         "status": "short status",
                     }
@@ -102,10 +193,10 @@ def perceive_scene(request: SkillRequest, context: SkillContext) -> SkillResult:
                 "top-level JSON object must contain exactly the keys candidates and uncertainty. The first "
                 "top-level key must be candidates. Do not wrap the answer in perception/result/output/data. "
                 "Do not echo inputs. Keep stable candidate ids when current_candidates are provided. Do not "
-                "use [0, 0, 0, 0] as a real bbox; if an object is not visible, leave that view absent. If "
+                "estimate image coordinates. If "
                 "current_source_candidate_id/current_target_candidate_id are already set and the new "
                 "observation does not clearly contradict them, preserve those ids. Do not replace an already "
-                "grounded container/plate with visibility=no, bbox=[0,0,0,0], and null source/target."
+                "grounded container/plate with visibility=no and null source/target."
             ),
             payload=payload,
             image_paths=request.payload.get("image_paths"),
@@ -139,12 +230,14 @@ def perceive_scene(request: SkillRequest, context: SkillContext) -> SkillResult:
         status = "scene_perceived_by_model" if not preserved_count else "scene_perceived_by_model_merged_existing"
         return ok(status, {"perception": perception.to_dict(), "preserved_existing_candidates": preserved_count})
 
-    perception = blackboard.read("perception") or PerceptionResult(
-        observation_id=get_attr(blackboard.read("observation"), "observation_id"),
-        metadata={"mode": "placeholder_perception"},
+    return unavailable(
+        "scene_perception_unavailable",
+        "vision_model_unavailable",
+        {
+            "observation_id": observation_id,
+            "existing_perception": existing_perception.to_dict() if existing_perception is not None else None,
+        },
     )
-    blackboard.write("perception", perception, event_type="vision.perceive_scene")
-    return ok("scene_perceived_placeholder", {"perception": to_dict(perception)})
 
 
 def localize_task_objects(request: SkillRequest, context: SkillContext) -> SkillResult:
@@ -154,11 +247,10 @@ def localize_task_objects(request: SkillRequest, context: SkillContext) -> Skill
         raw = call_component_json(
             context,
             instruction=(
-                "Refine task-relevant object localization for the task. Output only the required schema object. "
+                "Bind the task source object and target object to semantic visual candidates. Output only the required schema object. "
                 "Do not echo task_instruction, observation, current_perception, required_schema, or any input object. "
                 "Top-level keys must be candidates, source_candidate_id, target_candidate_id, and uncertainty. "
-                "Keep stable candidate ids when possible. Return bbox_by_view for visible candidates. "
-                "Do not use [0, 0, 0, 0] as a real bbox; if an object is not visible, leave that view absent."
+                "Keep stable candidate ids when possible. Do not estimate image coordinates."
             ),
             payload={
                 "task_instruction": blackboard.task_instruction,
@@ -169,10 +261,9 @@ def localize_task_objects(request: SkillRequest, context: SkillContext) -> Skill
                         {
                             "candidate_id": "C1",
                             "label": "object label",
-                            "bbox_by_view": {"camera_name": [0, 0, 0, 0]},
-                            "visibility": "yes|partial|no|uncertain",
+                            "visibility": "yes|partial|uncertain",
                             "confidence": 0.0,
-                            "status": "localized object status",
+                            "status": "semantic object status",
                         }
                     ],
                     "source_candidate_id": "candidate id or null",
@@ -210,82 +301,165 @@ def localize_task_objects(request: SkillRequest, context: SkillContext) -> Skill
             )
         if localized.observation_id is None:
             localized.observation_id = get_attr(blackboard.read("observation"), "observation_id")
+        contract_errors = _localization_contract_errors(localized)
+        if contract_errors:
+            _emit_invalid_model_output("vision.localize_task_objects", "localization_contract_failed", raw)
+            blackboard.write(
+                "last_localization_error",
+                {
+                    "reason": "localization_contract_failed",
+                    "errors": contract_errors,
+                    "raw_keys": sorted(str(key) for key in raw.keys()),
+                    "candidate_summaries": _compact_candidates(localized),
+                    "existing_perception": perception.to_dict(),
+                },
+                event_type="vision.localize_task_objects_invalid_output",
+            )
+            return unavailable(
+                "localization_invalid_model_output",
+                "localization_contract_failed",
+                {
+                    "errors": contract_errors,
+                    "raw_keys": sorted(str(key) for key in raw.keys()),
+                    "existing_perception": perception.to_dict(),
+                },
+            )
         localized.metadata.update(perception.metadata)
         localized.metadata["localization_source"] = "vision_model"
         blackboard.write("perception", localized, event_type="vision.localize_task_objects")
         return ok("task_objects_localized_by_model", {"perception": localized.to_dict()})
 
-    perception.metadata.setdefault("localization_source", "existing_or_placeholder")
-    blackboard.write("perception", perception, event_type="vision.localize_task_objects")
-    return ok("task_objects_localized_placeholder", {"perception": perception.to_dict()})
+    return unavailable(
+        "localization_unavailable",
+        "vision_model_unavailable",
+        {"existing_perception": perception.to_dict()},
+    )
 
 
-def ground_task_objects(request: SkillRequest, context: SkillContext) -> SkillResult:
+def refresh_preflight_observation(request: SkillRequest, context: SkillContext) -> SkillResult:
+    from .state import update_world_state
+
     blackboard = context.blackboard
-    perception = _ensure_perception(blackboard)
-    if context.has_model and request.payload.get("use_model", False):
-        raw = call_component_json(
-            context,
-            instruction=(
-                "Ground the task source object and target object to existing visual candidate ids. "
-                "Output only the required schema object. Do not echo task_instruction, perception, "
-                "required_schema, or any input object. Top-level keys must be source_candidate_id, "
-                "target_candidate_id, and uncertainty. If the task is 'place the container on the plate', "
-                "the source is the movable container and the target is the plate."
-            ),
-            payload={
-                "task_instruction": blackboard.task_instruction,
-                "candidates": _compact_candidates(perception),
-                "required_schema": {
-                    "source_candidate_id": "candidate id or null",
-                    "target_candidate_id": "candidate id or null",
-                    "uncertainty": {"needs_reobserve": False, "reasons": []},
-                },
-            },
-            image_paths=request.payload.get("image_paths"),
-            render_format=request.payload.get("render_format", "json"),
+    preflight_report = blackboard.read("preflight_report")
+    preflight_errors = {str(error) for error in (getattr(preflight_report, "errors", []) or [])}
+    allowed_errors = {
+        "stale_perception",
+        "stale_world_state",
+        "world_state_requires_reobserve",
+        "missing_observation",
+        "missing_observation_id",
+    }
+    if not (preflight_errors & allowed_errors or any(error.startswith("camera_") for error in preflight_errors)):
+        return unavailable(
+            "preflight_observation_refresh_unavailable",
+            "missing_preflight_visual_error",
+            {"preflight_errors": sorted(preflight_errors)},
         )
-        source_id = str(raw.get("source_candidate_id")) if raw.get("source_candidate_id") is not None else None
-        target_id = str(raw.get("target_candidate_id")) if raw.get("target_candidate_id") is not None else None
-        candidate_ids = {candidate.candidate_id for candidate in perception.candidates}
-        if source_id not in candidate_ids:
-            source_id = None
-        if target_id not in candidate_ids:
-            target_id = None
-        if source_id is None or target_id is None:
-            _emit_invalid_model_output("vision.ground_task_objects", "missing_source_or_target_in_model_output", raw)
-            blackboard.write(
-                "last_grounding_error",
-                {
-                    "reason": "missing_source_or_target_in_model_output",
-                    "raw_keys": sorted(str(key) for key in raw.keys()),
-                    "candidate_ids": sorted(candidate_ids),
-                    "source_candidate_id": source_id,
-                    "target_candidate_id": target_id,
-                },
-                event_type="vision.ground_task_objects_invalid_output",
-            )
-            return unavailable(
-                "task_grounding_invalid_model_output",
-                "missing_source_or_target_in_model_output",
-                {
-                    "raw_keys": sorted(str(key) for key in raw.keys()),
-                    "candidate_ids": sorted(candidate_ids),
-                    "perception": perception.to_dict(),
-                },
-            )
-        perception.source_candidate_id = source_id
-        perception.target_candidate_id = target_id
-        if isinstance(raw.get("uncertainty"), dict):
-            perception.uncertainty.update(raw["uncertainty"])
-        perception.metadata["grounding_source"] = "vision_model"
-        blackboard.write("perception", perception, event_type="vision.ground_task_objects")
-        return ok("task_objects_grounded_by_model", {"perception": perception.to_dict()})
 
-    perception.source_candidate_id = request.payload.get("source_candidate_id") or perception.source_candidate_id
-    perception.target_candidate_id = request.payload.get("target_candidate_id") or perception.target_candidate_id
-    blackboard.write("perception", perception, event_type="vision.ground_task_objects")
-    return ok("task_objects_grounded_placeholder", {"perception": perception.to_dict()})
+    steps: list[dict[str, Any]] = []
+
+    def run_step(component: str, skill: str, payload: dict[str, Any]) -> SkillResult:
+        emit_runtime_event(
+            "clawvla_preflight_refresh_step_start",
+            {"component": component, "skill": skill, "payload_keys": sorted(payload.keys())},
+        )
+        step_request = SkillRequest(component=component, skill=skill, payload=payload, stage="preflight")
+        if component == "vision" and skill == "capture_views":
+            result = capture_views(step_request, context)
+        elif component == "vision" and skill == "perceive_scene":
+            result = perceive_scene(step_request, context)
+        elif component == "vision" and skill == "localize_task_objects":
+            result = localize_task_objects(step_request, context)
+        elif component == "state" and skill == "update_world_state":
+            result = update_world_state(
+                step_request,
+                SkillContext(component_name="state", blackboard=blackboard, model_runtime=context.model_runtime),
+            )
+        else:
+            raise ValueError(f"Unsupported preflight refresh step: {component}.{skill}")
+        steps.append(
+            {
+                "component": component,
+                "skill": skill,
+                "success": result.success,
+                "status": result.status,
+                "errors": list(result.errors),
+            }
+        )
+        emit_runtime_event(
+            "clawvla_preflight_refresh_step_finish",
+            {
+                "component": component,
+                "skill": skill,
+                "success": result.success,
+                "status": result.status,
+                "errors": result.errors[:3],
+            },
+        )
+        return result
+
+    capture_payload = {
+        "artifact_prefix": request.payload.get("artifact_prefix") or blackboard.read("artifact_prefix") or "agent_loop",
+        "instruction": request.payload.get("instruction") or blackboard.task_instruction,
+    }
+    env = blackboard.read("env_adapter")
+    session = getattr(env, "session", None)
+    if session is None or getattr(session, "task_env", None) is None:
+        capture_payload["setup"] = True
+
+    capture = run_step("vision", "capture_views", capture_payload)
+    if not capture.success:
+        return unavailable(
+            "preflight_observation_refresh_failed",
+            "capture_views_failed",
+            {"steps": steps, "failed_result": capture.to_dict()},
+        )
+
+    image_paths = _observation_image_paths(blackboard.read("observation"))
+    perceive = run_step("vision", "perceive_scene", {"use_model": True, "image_paths": image_paths})
+    if not perceive.success:
+        return unavailable(
+            "preflight_observation_refresh_failed",
+            "perceive_scene_failed",
+            {"steps": steps, "failed_result": perceive.to_dict()},
+        )
+
+    localize = run_step("vision", "localize_task_objects", {"use_model": True, "image_paths": image_paths})
+    if not localize.success:
+        return unavailable(
+            "preflight_observation_refresh_failed",
+            "localize_task_objects_failed",
+            {"steps": steps, "failed_result": localize.to_dict()},
+        )
+
+    world_state = run_step("state", "update_world_state", {"stage": "preflight"})
+    if not world_state.success:
+        return unavailable(
+            "preflight_observation_refresh_failed",
+            "update_world_state_failed",
+            {"steps": steps, "failed_result": world_state.to_dict()},
+        )
+
+    mark_motion_artifacts_stale(blackboard, "preflight_observation_refreshed", include_goal=True)
+    blackboard.write(
+        "last_preflight_observation_refresh",
+        {
+            "status": "preflight_observation_refreshed",
+            "steps": steps,
+            "observation_id": get_attr(blackboard.read("observation"), "observation_id"),
+        },
+        event_type="vision.refresh_preflight_observation",
+    )
+    blackboard.write("stage", "preflight", event_type="vision.refresh_preflight_observation_stage")
+    return ok(
+        "preflight_observation_refreshed",
+        {
+            "steps": steps,
+            "observation": to_dict(blackboard.read("observation")),
+            "perception": to_dict(blackboard.read("perception")),
+            "world_state": to_dict(blackboard.read("world_state")),
+        },
+    )
 
 
 def render_grounding_overlay(request: SkillRequest, context: SkillContext) -> SkillResult:
@@ -429,13 +603,38 @@ def _compact_candidates(perception: PerceptionResult) -> list[dict[str, Any]]:
         {
             "candidate_id": candidate.candidate_id,
             "label": candidate.label,
-            "bbox_by_view": dict(candidate.bbox_by_view),
             "visibility": candidate.visibility,
             "confidence": candidate.confidence,
             "status": candidate.status,
         }
         for candidate in perception.candidates
     ]
+
+
+def _localization_contract_errors(perception: PerceptionResult) -> list[str]:
+    errors: list[str] = []
+    candidate_ids = {candidate.candidate_id for candidate in perception.candidates}
+    source_id = perception.source_candidate_id
+    target_id = perception.target_candidate_id
+    if not source_id:
+        errors.append("missing_source_candidate_id")
+    if not target_id:
+        errors.append("missing_target_candidate_id")
+    if source_id and source_id not in candidate_ids:
+        errors.append("source_candidate_not_found")
+    if target_id and target_id not in candidate_ids:
+        errors.append("target_candidate_not_found")
+    if source_id and target_id and source_id == target_id:
+        errors.append("source_target_same_candidate")
+    by_id = {candidate.candidate_id: candidate for candidate in perception.candidates}
+    for role, candidate_id in (("source", source_id), ("target", target_id)):
+        if not candidate_id or candidate_id not in by_id:
+            continue
+        candidate = by_id[candidate_id]
+        visibility = str(getattr(candidate, "visibility", "uncertain") or "uncertain").lower()
+        if visibility == "no":
+            errors.append(f"{role}_visibility_no")
+    return errors
 
 
 def _emit_invalid_model_output(source: str, reason: str, raw: dict[str, Any]) -> None:
@@ -517,6 +716,22 @@ def _candidate_has_real_bbox(candidate: object) -> bool:
         if (x1, y1, x2, y2) != (0.0, 0.0, 0.0, 0.0) and x2 > x1 and y2 > y1:
             return True
     return False
+
+
+def _observation_image_paths(observation: object | None) -> list[str]:
+    camera_views = getattr(observation, "camera_views", {})
+    if not isinstance(camera_views, dict):
+        return []
+    return [str(view.rgb_path) for view in camera_views.values() if getattr(view, "rgb_path", None)]
+
+
+def _execution_observation_id(execution_report: object | None) -> str | None:
+    if not isinstance(execution_report, dict):
+        return None
+    observation = execution_report.get("observation")
+    if isinstance(observation, dict) and observation.get("observation_id") is not None:
+        return str(observation["observation_id"])
+    return None
 
 
 def _artifact_prefix(observation: object | None) -> str | None:

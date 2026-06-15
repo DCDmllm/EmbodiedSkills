@@ -22,10 +22,26 @@ runs/
 checkpoints/
 outputs/
 wandb/
+ray_results/
+slurm-*.out
+*.out
+*.err
 *.log
 *.jsonl
 *.pid
 *.exit
+
+# Large model/checkpoint artifacts
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+
+# Local-only overrides
+*.local
+*.local.*
+.codex/
+.envrc
 
 # Local dependency scratch space
 .deps/

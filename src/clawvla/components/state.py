@@ -3,13 +3,17 @@ from __future__ import annotations
 from ..blackboard import Blackboard
 from ..schema import PerceptionResult, SkillRequest, SkillResult, WorldRelation, WorldState
 from ..skills.base import SkillContext, SkillRegistry
-from .skill_helpers import get_attr, ok, register_skill, to_dict, unavailable
+from .skill_helpers import get_attr, ok, register_skill, unavailable
 
 
 def register_state_skills(registry: SkillRegistry) -> None:
-    register_skill(registry, "state", "update_world_state", "Update blackboard world state from perception.", update_world_state)
-    register_skill(registry, "state", "track_object_identity", "Track object identity across observations.", track_object_identity)
-    register_skill(registry, "state", "infer_relations", "Infer spatial/task relations from world state.", infer_relations)
+    register_skill(
+        registry,
+        "state",
+        "update_world_state",
+        "Write world_state from perception after source_candidate_id/target_candidate_id are bound.",
+        update_world_state,
+    )
     register_skill(registry, "state", "summarize_state", "Summarize compact state for scheduling/model prompts.", summarize_state)
 
 
@@ -76,29 +80,12 @@ def update_world_state(request: SkillRequest, context: SkillContext) -> SkillRes
             "perception_metadata": perception.metadata,
             "placeholder": False,
             "placeholder_reason": None,
+            "observation_id": perception.observation_id,
         },
     )
     blackboard.write("world_state", world_state, event_type="state.update_world_state")
     blackboard.write("stage", world_state.stage)
     return ok("world_state_updated", {"world_state": world_state.to_dict()})
-
-
-def track_object_identity(request: SkillRequest, context: SkillContext) -> SkillResult:
-    blackboard = context.blackboard
-    world_state = blackboard.read("world_state")
-    if world_state is not None:
-        world_state.metadata.setdefault("identity_tracking", {"status": "placeholder"})
-        blackboard.write("world_state", world_state, event_type="state.track_object_identity")
-    return ok("identity_tracking_placeholder", {"world_state": to_dict(world_state)})
-
-
-def infer_relations(request: SkillRequest, context: SkillContext) -> SkillResult:
-    blackboard = context.blackboard
-    world_state = blackboard.read("world_state")
-    if world_state is not None:
-        world_state.relations = _merge_relations(world_state.relations, _basic_relations_from_world(world_state))
-        blackboard.write("world_state", world_state, event_type="state.infer_relations")
-    return ok("relations_placeholder", {"world_state": to_dict(world_state)})
 
 
 def summarize_state(request: SkillRequest, context: SkillContext) -> SkillResult:
@@ -120,34 +107,3 @@ def _basic_relations(perception: PerceptionResult) -> list[WorldRelation]:
             metadata={"source": "grounding"},
         )
     ]
-
-
-def _basic_relations_from_world(world_state: WorldState) -> list[WorldRelation]:
-    source = world_state.candidate_by_id(world_state.source_candidate_id)
-    target = world_state.candidate_by_id(world_state.target_candidate_id)
-    if source is None or target is None:
-        return []
-    relations = _basic_relations(
-        PerceptionResult(
-            source_candidate_id=source.candidate_id,
-            target_candidate_id=target.candidate_id,
-        )
-    )
-    if source.metric_geometry.has_position and target.metric_geometry.has_position:
-        relations.append(
-            WorldRelation(
-                relation="source_and_target_have_metric_geometry",
-                source_candidate_id=source.candidate_id,
-                target_candidate_id=target.candidate_id,
-                confidence=min(source.confidence, target.confidence),
-                metadata={"source": "metric_geometry_presence"},
-            )
-        )
-    return relations
-
-
-def _merge_relations(existing: list[WorldRelation], new_relations: list[WorldRelation]) -> list[WorldRelation]:
-    merged = {(item.relation, item.source_candidate_id, item.target_candidate_id): item for item in existing}
-    for relation in new_relations:
-        merged[(relation.relation, relation.source_candidate_id, relation.target_candidate_id)] = relation
-    return list(merged.values())

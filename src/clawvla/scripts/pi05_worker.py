@@ -21,30 +21,48 @@ class Pi05WorkerServer(socketserver.TCPServer):
 
 class Pi05WorkerHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
-        line = self.rfile.readline()
-        if not line:
-            return
-        request = json.loads(line.decode("utf-8"))
-        if request.get("op") == "health":
-            self._write({"status": "ok", "backend": "pi05_worker"})
-            return
-        artifact_dir = Path(str(request["artifact_dir"]))
-        prompt = str(request.get("prompt") or "perform the task")
-        observation = _observation_from_artifact(artifact_dir, prompt)
-        result = self.server.backend.build_action_chunk(  # type: ignore[attr-defined]
-            motion_goal=None,
-            world_state=None,
-            observation=observation,
-            request={
-                "prompt": prompt,
-                "num_steps": request.get("num_steps"),
-                "horizon": request.get("horizon"),
-            },
-        )
-        self._write(result.to_dict())
+        try:
+            line = self.rfile.readline()
+            if not line:
+                return
+            request = json.loads(line.decode("utf-8"))
+            if request.get("op") == "health":
+                self._write({"status": "ok", "backend": "pi05_worker"})
+                return
+            artifact_dir = Path(str(request["artifact_dir"]))
+            motion_plan = request.get("motion_plan")
+            prompt = _worker_prompt(motion_plan)
+            observation = _observation_from_artifact(artifact_dir, prompt)
+            result = self.server.backend.build_action_chunk(  # type: ignore[attr-defined]
+                motion_goal=None,
+                world_state=None,
+                observation=observation,
+                request={
+                    "motion_plan": motion_plan,
+                    "num_steps": request.get("num_steps"),
+                    "horizon": request.get("horizon"),
+                },
+            )
+            self._write(result.to_dict())
+        except Exception as exc:
+            self._write(
+                {
+                    "success": False,
+                    "status": "pi05_worker_exception",
+                    "action_chunk": None,
+                    "metadata": {"exception_type": type(exc).__name__},
+                    "errors": [f"{type(exc).__name__}: {exc}"],
+                }
+            )
 
     def _write(self, payload: dict) -> None:
         self.wfile.write((json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8"))
+
+
+def _worker_prompt(motion_plan: object) -> str:
+    if isinstance(motion_plan, dict) and motion_plan.get("vla_prompt"):
+        return str(motion_plan["vla_prompt"])
+    raise ValueError("motion_plan.vla_prompt is required by pi05_worker; request must come from motion.plan_motion.")
 
 
 def parse_args() -> argparse.Namespace:

@@ -218,8 +218,8 @@ PYTHONPATH=src python -m compileall -q src/clawvla
 
 ## 当前注意点
 
-- `preflight` 仍是轻量 placeholder，会显式写出 placeholder 状态；当前重点是跑通整体闭环，不加复杂安全拒绝逻辑。
-- `ground_task_objects` 必须显式产出 `source_candidate_id` 和 `target_candidate_id`，不会根据 label 暗中补。
+- `preflight` 是正式执行前检查；不可用或检查失败必须显式返回失败，不写 placeholder 成功状态。
+- `localize_task_objects` 必须显式产出顶层 `source_candidate_id` 和 `target_candidate_id`，不会根据 label 暗中补。
 - `build_task_plan` 在模型输出空 subgoals 时会返回 `task_plan_invalid_model_output`，不会偷偷生成模板计划。
-- vLLM profile 的 `--max-model-len` 当前为 `16384`，避免 verifier 长上下文直接 400。
-- `tmp_runs/`、`tmp_artifacts/`、`__pycache__/`、`.deps/` 都是本地生成物，不提交。
+- vLLM profile 的 `--max-model-len` 当前为 `32768`，用于容纳四视角图像和较长 agent 上下文。
+- `tmp_runs/`、`tmp_artifacts/`、`runs/`、`outputs/`、`checkpoints/`、`ray_results/`、`__pycache__/`、`.deps/` 和本地模型权重文件都是生成物或本机产物，不提交。

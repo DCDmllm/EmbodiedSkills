@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import math
+from typing import Any
+
 from ..blackboard import Blackboard
 from ..blackboard_utils import (
     current_observation_id,
     mark_action_chunk_consumed,
     mark_grounding_overlay_stale,
     mark_motion_artifacts_stale,
+    metadata_value,
 )
 from ..notices import emit_human_trace
 from ..schema import ActionChunk, MotionGoal, SkillRequest, SkillResult
@@ -17,6 +21,7 @@ def register_motion_skills(registry: SkillRegistry) -> None:
     register_skill(registry, "motion", "build_motion_goal", "Build a motion goal from scheduler/subgoal payload.", build_motion_goal)
     register_skill(registry, "motion", "plan_motion", "Plan or select a bounded motion from the motion goal.", plan_motion)
     register_skill(registry, "motion", "emit_action_chunk", "Convert a motion plan to an action chunk.", emit_action_chunk)
+    register_skill(registry, "motion", "validate_action_chunk", "Validate an action chunk before execution.", validate_action_chunk)
     register_skill(registry, "motion", "execute_action", "Execute or hand off an action chunk.", execute_action)
 
 
@@ -38,11 +43,27 @@ def build_motion_goal(request: SkillRequest, context: SkillContext) -> SkillResu
     source = world_state.candidate_by_id(source_candidate_id) if world_state is not None else None
     target = world_state.candidate_by_id(target_candidate_id) if world_state is not None else None
     target_handle = _target_handle(source, target)
-    status = (
-        "motion_goal_placeholder_missing_target"
-        if target_handle.get("target_type") == "missing_visual_target"
-        else "motion_goal_built"
-    )
+    if target_handle.get("target_type") == "missing_visual_target":
+        blackboard.write(
+            "last_motion_error",
+            {
+                "reason": "missing_source_and_target_candidates",
+                "source_candidate_id": source_candidate_id,
+                "target_candidate_id": target_candidate_id,
+                "current_subgoal": to_dict(current_subgoal),
+            },
+            event_type="motion.build_motion_goal_unavailable",
+        )
+        return unavailable(
+            "motion_goal_unavailable",
+            "missing_source_and_target_candidates",
+            {
+                "target_handle": target_handle,
+                "source_candidate_id": source_candidate_id,
+                "target_candidate_id": target_candidate_id,
+                "current_subgoal": to_dict(current_subgoal),
+            },
+        )
     goal = MotionGoal(
         skill=str(payload.get("skill") or get_attr(current_subgoal, "type") or "approach"),
         source_candidate_id=source_candidate_id,
@@ -62,7 +83,7 @@ def build_motion_goal(request: SkillRequest, context: SkillContext) -> SkillResu
     )
     mark_motion_artifacts_stale(blackboard, "new_motion_goal_built")
     blackboard.write("motion_goal", goal, event_type="motion.build_motion_goal")
-    return ok(status, {"motion_goal": goal.to_dict()})
+    return ok("motion_goal_built", {"motion_goal": goal.to_dict()})
 
 
 def plan_motion(request: SkillRequest, context: SkillContext) -> SkillResult:
@@ -75,6 +96,9 @@ def plan_motion(request: SkillRequest, context: SkillContext) -> SkillResult:
         plan = _image_grounded_plan(blackboard, motion_goal, target_handle, request.payload)
         mark_motion_artifacts_stale(blackboard, "new_motion_plan_built")
         blackboard.write("motion_plan", plan, event_type="motion.plan_motion")
+        if plan.get("status") == "motion_plan_unavailable":
+            reason = str(plan.get("reason", "motion_plan_unavailable"))
+            return unavailable("motion_plan_unavailable", reason, {"motion_plan": plan})
         return ok("image_grounded_motion_plan_built", {"motion_plan": plan})
     plan = {
         "status": "motion_plan_unavailable",
@@ -149,10 +173,24 @@ def emit_action_chunk(request: SkillRequest, context: SkillContext) -> SkillResu
     return unavailable("action_chunk_unavailable", "missing_action_backend", {"action_chunk": chunk.to_dict()})
 
 
+def validate_action_chunk(request: SkillRequest, context: SkillContext) -> SkillResult:
+    blackboard = context.blackboard
+    report = _validate_action_chunk_report(blackboard)
+    blackboard.write("last_action_validation_report", report, event_type="motion.validate_action_chunk")
+    output = {"action_validation_report": report}
+    if report["allowed"]:
+        return ok("action_chunk_validated", output)
+    return unavailable("action_chunk_validation_failed", str(report["blocking_errors"][0]), output)
+
+
 def execute_action(request: SkillRequest, context: SkillContext) -> SkillResult:
     blackboard = context.blackboard
     env = blackboard.read("env_adapter")
     action_chunk = blackboard.read("action_chunk")
+    validation = _validate_action_chunk_report(blackboard)
+    blackboard.write("last_action_validation_report", validation, event_type="motion.execute_action_preflight")
+    if not validation["allowed"]:
+        return unavailable("action_chunk_validation_failed", str(validation["blocking_errors"][0]), {"action_validation_report": validation})
     if env is not None and hasattr(env, "execute_action"):
         report = env.execute_action(action_chunk)
     else:
@@ -180,6 +218,93 @@ def execute_action(request: SkillRequest, context: SkillContext) -> SkillResult:
     return ok(str(status), output)
 
 
+def _validate_action_chunk_report(blackboard: Blackboard) -> dict[str, Any]:
+    chunk = blackboard.read("action_chunk")
+    current_subgoal = blackboard.read("current_subgoal")
+    obs_id = current_observation_id(blackboard)
+    errors: list[str] = []
+    checks: dict[str, Any] = {}
+
+    if chunk is None:
+        errors.append("missing_action_chunk")
+        return _action_validation_report(False, errors, checks, obs_id, current_subgoal)
+    if getattr(chunk, "action_type", None) in {None, "unavailable", "noop"}:
+        errors.append(f"invalid_action_type:{getattr(chunk, 'action_type', None)}")
+    if metadata_value(chunk, "stale", False):
+        errors.append("stale_action_chunk")
+    if metadata_value(chunk, "consumed", False):
+        errors.append("consumed_action_chunk")
+
+    expected_subgoal_id = get_attr(current_subgoal, "subgoal_id")
+    chunk_subgoal_id = metadata_value(chunk, "subgoal_id")
+    if expected_subgoal_id != chunk_subgoal_id:
+        errors.append(f"action_chunk_subgoal_mismatch:{chunk_subgoal_id}->{expected_subgoal_id}")
+    chunk_obs_id = metadata_value(chunk, "observation_id")
+    if obs_id != chunk_obs_id:
+        errors.append(f"action_chunk_observation_mismatch:{chunk_obs_id}->{obs_id}")
+
+    commands = getattr(chunk, "commands", None)
+    if not isinstance(commands, list) or not commands:
+        errors.append("empty_action_commands")
+        commands = []
+    expected_dim = _expected_action_dim(getattr(chunk, "action_type", None))
+    if expected_dim is None:
+        errors.append(f"unsupported_action_type:{getattr(chunk, 'action_type', None)}")
+
+    bad_command_indexes: list[int] = []
+    for index, command in enumerate(commands):
+        if not isinstance(command, list):
+            bad_command_indexes.append(index)
+            continue
+        if expected_dim is not None and len(command) != expected_dim:
+            bad_command_indexes.append(index)
+            continue
+        if not all(_finite(item) for item in command):
+            bad_command_indexes.append(index)
+    if bad_command_indexes:
+        errors.append(f"invalid_action_command_indexes:{bad_command_indexes[:5]}")
+
+    checks["action_chunk"] = {
+        "action_type": getattr(chunk, "action_type", None),
+        "command_count": len(commands),
+        "expected_command_dim": expected_dim,
+        "subgoal_id": chunk_subgoal_id,
+        "expected_subgoal_id": expected_subgoal_id,
+        "observation_id": chunk_obs_id,
+        "expected_observation_id": obs_id,
+        "bad_command_indexes": bad_command_indexes[:20],
+    }
+    return _action_validation_report(not errors, errors, checks, obs_id, current_subgoal)
+
+
+def _action_validation_report(
+    allowed: bool,
+    errors: list[str],
+    checks: dict[str, Any],
+    obs_id: str | None,
+    current_subgoal: object | None,
+) -> dict[str, Any]:
+    return {
+        "allowed": allowed,
+        "status": "action_chunk_validated" if allowed else "action_chunk_validation_failed",
+        "blocking_errors": list(errors),
+        "checks": checks,
+        "metadata": {
+            "source": "motion.validate_action_chunk",
+            "observation_id": obs_id,
+            "current_subgoal_id": get_attr(current_subgoal, "subgoal_id"),
+        },
+    }
+
+
+def _expected_action_dim(action_type: object | None) -> int | None:
+    if action_type == "qpos":
+        return 14
+    if action_type == "ee":
+        return 16
+    return None
+
+
 def _target_handle(source: object | None, target: object | None) -> dict[str, object]:
     candidates = [candidate for candidate in (source, target) if candidate is not None]
     metric_candidates = [candidate for candidate in candidates if _has_metric_position(candidate)]
@@ -197,7 +322,7 @@ def _target_handle(source: object | None, target: object | None) -> dict[str, ob
     if primary is None:
         return {
             "target_type": "missing_visual_target",
-            "status": "target_handle_placeholder_missing_target",
+            "status": "target_handle_unavailable_missing_target",
             "reason": "missing_source_and_target_candidates",
             "requires_perception_grounding": True,
         }
@@ -235,12 +360,25 @@ def _image_grounded_plan(
     world_state = blackboard.read("world_state")
     current_subgoal = blackboard.read("current_subgoal")
     observation_id = current_observation_id(blackboard)
-    vla_prompt = _vla_prompt(blackboard, motion_goal, world_state)
+    vla_prompt = _vla_prompt(blackboard)
+    if not vla_prompt:
+        return {
+            "status": "motion_plan_unavailable",
+            "reason": "missing_current_subgoal_instruction",
+            "retryable": False,
+            "motion_goal": to_dict(motion_goal),
+            "current_subgoal": to_dict(current_subgoal),
+            "metadata": {
+                "source": "motion.plan_motion",
+                "subgoal_id": get_attr(current_subgoal, "subgoal_id"),
+                "observation_id": observation_id,
+                "stale": False,
+            },
+        }
     return {
         "status": "image_grounded_motion_plan_built",
         "backend": str(payload.get("backend", "pi05")),
         "motion_goal": to_dict(motion_goal),
-        "task_instruction": blackboard.task_instruction,
         "vla_prompt": vla_prompt,
         "current_subgoal": to_dict(current_subgoal),
         "source_candidate_id": get_attr(motion_goal, "source_candidate_id"),
@@ -260,39 +398,26 @@ def _image_grounded_plan(
     }
 
 
-def _vla_prompt(blackboard: Blackboard, motion_goal: object | None, world_state: object | None) -> str:
-    task = blackboard.task_instruction or get_attr(world_state, "task_instruction") or "perform the task"
-    source_id = get_attr(motion_goal, "source_candidate_id")
-    target_id = get_attr(motion_goal, "target_candidate_id")
+def _vla_prompt(blackboard: Blackboard) -> str | None:
     current_subgoal = blackboard.read("current_subgoal")
-    source = world_state.candidate_by_id(source_id) if world_state is not None and source_id else None
-    target = world_state.candidate_by_id(target_id) if world_state is not None and target_id else None
-    parts = [f"Task: {task}."]
-    if current_subgoal is not None:
-        parts.append(
-            "Current subgoal: "
-            f"id={get_attr(current_subgoal, 'subgoal_id')}, "
-            f"type={get_attr(current_subgoal, 'type')}, "
-            f"criteria={get_attr(current_subgoal, 'completion_criteria', {})}."
-        )
-    if source is not None:
-        parts.append(f"Source object: {_candidate_prompt(source)}.")
-    if target is not None:
-        parts.append(f"Target object: {_candidate_prompt(target)}.")
-    if source is not None and target is not None and get_attr(current_subgoal, "type") in {"transport", "place", "release"}:
-        parts.append("Execute the manipulation using the source object and place it on the target object.")
-    elif source is not None:
-        parts.append("Execute only the current short-horizon subgoal; do not assume the full task is completed by one chunk.")
-    return " ".join(parts)
+    instruction = str(get_attr(current_subgoal, "instruction", "") or "").strip()
+    return _sentence(instruction) if instruction else None
 
 
-def _candidate_prompt(candidate: object) -> str:
-    return (
-        f"id={getattr(candidate, 'candidate_id', None)}, "
-        f"label={getattr(candidate, 'label', None)}, "
-        f"visibility={getattr(candidate, 'visibility', None)}, "
-        f"bboxes={dict(getattr(candidate, 'bbox_by_view', {}))}"
-    )
+def _sentence(value: object) -> str:
+    text = str(value).strip()
+    if not text:
+        return "."
+    if text[-1] in ".!?":
+        return text
+    return f"{text}."
+
+
+def _finite(value: object) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _backend_request(motion_plan: object | None, payload: dict[str, object]) -> dict[str, object]:
