@@ -124,101 +124,85 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
-def build_response_mask_from_calls(
-    policy_calls: list[PolicyCallTrace],
-    separator_ids: list[int] | None = None,
-) -> dict[str, list[int]]:
-    if not policy_calls:
-        raise ValueError("Cannot build response mask without policy calls.")
-    separator_ids = list(separator_ids or [])
-    prompt_ids = list(policy_calls[0].prompt_ids)
-    response_ids: list[int] = []
-    response_mask: list[int] = []
-    response_logprobs: list[float] = []
-    for index, call in enumerate(policy_calls):
-        if index > 0:
-            context_ids = separator_ids + list(call.prompt_ids)
-            response_ids.extend(context_ids)
-            response_mask.extend([0] * len(context_ids))
-            response_logprobs.extend([0.0] * len(context_ids))
-        response_ids.extend(call.response_ids)
-        response_mask.extend([1] * len(call.response_ids))
-        if call.response_logprobs:
-            response_logprobs.extend(call.response_logprobs)
-        else:
-            response_logprobs.extend([0.0] * len(call.response_ids))
-    return {
-        "prompt_ids": prompt_ids,
-        "response_ids": response_ids,
-        "response_mask": response_mask,
-        "response_logprobs": response_logprobs,
-    }
-
-
-def build_agent_loop_adapter_from_calls(
-    policy_calls: list[PolicyCallTrace],
-    separator_ids: list[int] | None = None,
+def build_policy_call_adapter(
+    policy_call: PolicyCallTrace,
     *,
     require_multimodal_payload: bool = True,
 ) -> dict[str, Any]:
-    adapter: dict[str, Any] = build_response_mask_from_calls(policy_calls, separator_ids)
-    adapter["multi_modal_data"] = _merge_multi_modal_data(
-        policy_calls,
+    if not policy_call.prompt_ids:
+        raise ValueError(
+            "policy call cannot be used for training without prompt_ids: "
+            f"call_id={policy_call.call_id} role={policy_call.role}"
+        )
+    if not policy_call.response_ids:
+        raise ValueError(
+            "policy call cannot be used for training without response_ids: "
+            f"call_id={policy_call.call_id} role={policy_call.role} status={policy_call.status}"
+        )
+
+    response_logprobs = list(policy_call.response_logprobs)
+    if not response_logprobs:
+        response_logprobs = [0.0] * len(policy_call.response_ids)
+
+    multi_modal_data = _single_multi_modal_data(
+        policy_call,
         require_payload=require_multimodal_payload,
     )
-    adapter["mm_processor_kwargs"] = _merge_mm_processor_kwargs(policy_calls)
-    return adapter
+    mm_processor_kwargs = _single_mm_processor_kwargs(policy_call)
+    return {
+        "prompt_ids": list(policy_call.prompt_ids),
+        "response_ids": list(policy_call.response_ids),
+        "response_mask": [1] * len(policy_call.response_ids),
+        "response_logprobs": response_logprobs,
+        "multi_modal_data": multi_modal_data,
+        "mm_processor_kwargs": mm_processor_kwargs,
+    }
 
 
-def _merge_multi_modal_data(
+def build_policy_call_adapters(
     policy_calls: list[PolicyCallTrace],
     *,
+    require_multimodal_payload: bool = True,
+) -> list[dict[str, Any]]:
+    if not policy_calls:
+        raise ValueError("Cannot build policy-call adapters without policy calls.")
+    return [
+        build_policy_call_adapter(call, require_multimodal_payload=require_multimodal_payload)
+        for call in policy_calls
+    ]
+
+
+def _single_multi_modal_data(
+    policy_call: PolicyCallTrace,
+    *,
     require_payload: bool,
-) -> dict[str, list[Any]]:
-    merged: dict[str, list[Any]] = {}
-    for call in policy_calls:
-        multi_modal_data = getattr(call, "_clawvla_multi_modal_data", None)
-        if call.image_refs and not multi_modal_data and require_payload:
-            raise ValueError(
-                "policy call used image refs but did not carry training multi_modal_data: "
-                f"call_id={call.call_id} role={call.role} image_refs={len(call.image_refs)}"
-            )
-        if not isinstance(multi_modal_data, dict):
-            continue
-        for key, value in multi_modal_data.items():
-            if value is None:
-                continue
-            if isinstance(value, list):
-                items = value
-            elif isinstance(value, tuple):
-                items = list(value)
-            else:
-                items = [value]
-            if not items:
-                continue
-            merged.setdefault(str(key), []).extend(items)
-    return merged
+) -> dict[str, Any]:
+    multi_modal_data = getattr(policy_call, "_clawvla_multi_modal_data", None)
+    if policy_call.image_refs and not multi_modal_data and require_payload:
+        raise ValueError(
+            "policy call used image refs but did not carry training multi_modal_data: "
+            f"call_id={policy_call.call_id} role={policy_call.role} image_refs={len(policy_call.image_refs)}"
+        )
+    if multi_modal_data is None:
+        return {}
+    if not isinstance(multi_modal_data, dict):
+        raise ValueError(
+            "policy call carried invalid multi_modal_data: "
+            f"call_id={policy_call.call_id} role={policy_call.role} type={type(multi_modal_data).__name__}"
+        )
+    return {str(key): value for key, value in multi_modal_data.items() if value is not None}
 
 
-def _merge_mm_processor_kwargs(policy_calls: list[PolicyCallTrace]) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for call in policy_calls:
-        kwargs = getattr(call, "_clawvla_mm_processor_kwargs", None)
-        if not kwargs:
-            continue
-        if not isinstance(kwargs, dict):
-            raise ValueError(
-                "policy call carried invalid mm_processor_kwargs: "
-                f"call_id={call.call_id} role={call.role} type={type(kwargs).__name__}"
-            )
-        for key, value in kwargs.items():
-            if key in merged and merged[key] != value:
-                raise ValueError(
-                    "inconsistent mm_processor_kwargs across policy calls: "
-                    f"key={key} left={merged[key]!r} right={value!r} call_id={call.call_id}"
-                )
-            merged[key] = value
-    return merged
+def _single_mm_processor_kwargs(policy_call: PolicyCallTrace) -> dict[str, Any]:
+    kwargs = getattr(policy_call, "_clawvla_mm_processor_kwargs", None)
+    if kwargs is None:
+        return {}
+    if not isinstance(kwargs, dict):
+        raise ValueError(
+            "policy call carried invalid mm_processor_kwargs: "
+            f"call_id={policy_call.call_id} role={policy_call.role} type={type(kwargs).__name__}"
+        )
+    return dict(kwargs)
 
 
 def _jsonable(value: Any) -> Any:

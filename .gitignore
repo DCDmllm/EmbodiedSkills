@@ -45,6 +45,8 @@ slurm-*.out
 
 # Local dependency scratch space
 .deps/
+.venv-openrlhf-py310/
+.venv-openrlhf-py310-cu128/
 
 # Editor/system files
 .DS_Store

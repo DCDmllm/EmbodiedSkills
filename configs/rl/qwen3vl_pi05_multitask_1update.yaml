@@ -1,19 +1,21 @@
 extends:
   - qwen3vl_pi05_grpo.yaml
+  - rewards/robotwin.yaml
+  - tasks/robotwin_all.yaml
 
-name: qwen3vl_pi05_real_5step_1update
+name: qwen3vl_pi05_multitask_1update
 
 rollout:
-  max_steps: 5
+  max_steps: 20
   run_robotwin: true
   start_openpi_worker: true
   episodes: 1
   group_size: 1
-  artifact_prefix: clawvla_rl_real5_1update
   seeds:
     - 0
+  artifact_prefix: clawvla_rl_multitask
   episode_timeout_s: 1800.0
-  openpi_port_base: 9265
+  openpi_port_base: 9365
 
 verl:
   train_mode: full
@@ -55,4 +57,4 @@ checkpoint:
   keep_last: 1
 
 metadata:
-  notes: Real RoboTwin/OpenPI five-step multimodal GRPO startup check with one optimizer update.
+  notes: Real RoboTwin/OpenPI multitask OpenRLHF GRPO config. Each listed task becomes one prompt group; rollout_n controls samples per task prompt.

@@ -21,30 +21,38 @@ tests/test_rl_framework.py
 The training stack intentionally uses separate Python environments:
 
 ```text
-verl-0.8-py310       verl / torch / vLLM / flash-attn training process
+.venv-openrlhf-py310-cu128
+                      OpenRLHF / torch / vLLM / DeepSpeed / flash-attn training process
 robotwin-py312       ClawVLA runtime and RoboTwin rollout process
 openpi-torch-py312   OpenPI/pi0.5 worker process
 ```
 
-The processes communicate through subprocesses, HTTP-compatible policy calls, and archived trajectory files. The environments are not mixed into one Python runtime.
+The old VERL backend is archived under `src/clawvla/rl/legacy_verl/` and can still be run through
+`scripts/run_clawvla_verl_legacy.sh` for reproduction. New training work should use OpenRLHF.
+
+The processes communicate through subprocesses, HTTP-compatible policy calls, and archived trajectory files. The
+environments are not mixed into one Python runtime.
 
 ## Data Path
 
-During training, verl calls `ClawVLAAgentLoop`. One verl sample corresponds to one RoboTwin episode.
+During training, OpenRLHF calls `clawvla.rl.openrlhf_agent.AgentExecutor`. One OpenRLHF prompt corresponds to one
+RoboTwin episode.
 
 For each episode:
 
 1. ClawVLA rollout runs the normal agent loop.
-2. VLM calls are routed through the RL policy proxy or verl rollout backend.
+2. VLM calls are routed through the RL policy proxy and OpenRLHF rollout backend.
 3. Each policy call records messages, image references, parsed JSON, token IDs, multimodal payload, and failure state.
-4. The adapter returns `prompt_ids`, `response_ids`, `response_mask`, optional `multi_modal_data`, and reward score to verl.
+4. The adapter returns one training sample per policy call, with the real call prompt/images, response token range, and
+   the episode reward.
 
 Training keeps the important invariants:
 
-- Model-generated tokens have `response_mask=1`.
-- Tool results, environment state, prompts, and skill outputs have `response_mask=0`.
+- `action_ranges` covers only model-generated response tokens.
+- Tool results, environment state, prompts, and skill outputs are context only; they are not trained as action tokens.
 - Image references used by the model must carry real training multimodal payload.
 - Prompt/response overflow raises an error; silent truncation is not allowed.
+- GRPO grouping is by task/instruction/seed, not across unrelated RoboTwin tasks.
 
 ## Reward
 
@@ -66,7 +74,8 @@ grab_roller
 blocks_ranking_rgb
 ```
 
-All other RoboTwin tasks are not fully registered yet. They should not be mapped as complete until a task-specific or family-specific dense spec exists. Unknown configured tasks fail in preflight through the reward registry.
+All 50 RoboTwin training tasks are mapped to the `robotwin` reward handler. Tasks without a dedicated dense spec currently
+use the terminal/task-status baseline plus episode penalties.
 
 Episode-level penalties are also explicit:
 
@@ -74,6 +83,7 @@ Episode-level penalties are also explicit:
 incomplete_episode_penalty
 invalid_decision_penalty
 skill_failure_penalty
+recoverable_preflight_penalty
 infra_failure_reward
 ```
 
@@ -81,7 +91,13 @@ Infrastructure failures are separated from bad trajectories. Bad model decisions
 
 ## Configs
 
-Main config:
+Main current OpenRLHF config:
+
+```text
+configs/rl/qwen3vl_pi05_multitask_1update.yaml
+```
+
+Legacy VERL base config:
 
 ```text
 configs/rl/qwen3vl_pi05_grpo.yaml
@@ -112,43 +128,22 @@ Dry run:
 
 ```bash
 cd /mnt/wangwai/vla/clawvla
-./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_grpo.yaml --mode dry-run
+./scripts/run_clawvla_rl.sh --mode dry-run
 ```
 
-Mock rollout:
+Legacy VERL dry run:
 
 ```bash
-./scripts/run_clawvla_rl.sh \
-  --config configs/rl/qwen3vl_pi05_rollout_smoke.yaml \
-  --mode rollout-only \
-  --policy-response '{"next_component":"vision","next_skill":"capture_views","stage":"observe","reason":"smoke"}'
+./scripts/run_clawvla_verl_legacy.sh --config configs/rl/qwen3vl_pi05_grpo.yaml --mode dry-run
 ```
 
 One-update real multimodal startup check:
 
 ```bash
 ./scripts/run_clawvla_rl.sh \
-  --config configs/rl/qwen3vl_pi05_real_5step_1update.yaml \
+  --config configs/rl/qwen3vl_pi05_multitask_1update.yaml \
   --mode train \
-  --run-id rl_real5_1update
-```
-
-Replay archived rewards:
-
-```bash
-./scripts/run_clawvla_rl.sh \
-  --config configs/rl/qwen3vl_pi05_grpo.yaml \
-  --mode replay-reward \
-  --replay-path runs/rl/<run_id>/events.jsonl
-```
-
-Replay adapter masks:
-
-```bash
-./scripts/run_clawvla_rl.sh \
-  --config configs/rl/qwen3vl_pi05_grpo.yaml \
-  --mode replay-adapter \
-  --replay-path runs/rl/<run_id>/events.jsonl
+  --run-id openrlhf_multitask_1update
 ```
 
 ## Run Archive

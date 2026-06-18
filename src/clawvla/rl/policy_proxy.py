@@ -287,8 +287,16 @@ def _extract_image_refs(messages: list[dict[str, Any]]) -> list[str]:
         for item in content:
             if not isinstance(item, dict) or item.get("type") != "image_url":
                 continue
-            refs.append(str(_compact_image_url(item.get("image_url")).get("url")))
+            url = _raw_image_url(item.get("image_url"))
+            if url:
+                refs.append(url)
     return refs
+
+
+def _raw_image_url(value: object) -> str:
+    if isinstance(value, dict):
+        return str(value.get("url") or "")
+    return ""
 
 
 def _compact_image_url(value: object) -> dict[str, str]:

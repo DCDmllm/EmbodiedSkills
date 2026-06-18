@@ -1,0 +1,102 @@
+rollout:
+  tasks:
+    - task_name: beat_block_hammer
+      instruction: Pick up the hammer and use it to beat the block on the table once.
+    - task_name: pick_dual_bottles
+      instruction: Use both arms to simultaneously pick up bottle1 and bottle2 and move them to the front target locations, with bottle1 on the left and bottle2 on the right.
+    - task_name: pick_diverse_bottles
+      instruction: Use both arms to simultaneously pick up the diverse bottles and move them to the front target locations, with the bottles placed left and right.
+    - task_name: handover_block
+      instruction: Use the left arm to grab the block and move it to the handover point, then use the right arm to receive it and place it into the target box.
+    - task_name: stack_blocks_two
+      instruction: Pick up block1 and move it to the target position, then pick up block2 and stack it on block1.
+    - task_name: stack_blocks_three
+      instruction: Pick up block1 and move it to the target position, then stack block2 on block1 and block3 on block2.
+    - task_name: place_container_plate
+      instruction: Use both arms to pick up the container and place it in the plate.
+    - task_name: place_empty_cup
+      instruction: Use both arms to pick up the empty cup and place it on the coaster.
+    - task_name: place_shoe
+      instruction: Pick up the shoe and place it on the target block with the head of the shoe toward the left side.
+    - task_name: place_dual_shoes
+      instruction: Use the left and right arms to pick up the left and right shoes and place them into the shoe box.
+    - task_name: adjust_bottle
+      instruction: Pick up the bottle on the table head-up with the correct arm, lift it upward, and place it back upright.
+    - task_name: blocks_ranking_rgb
+      instruction: Place the red, green, and blue blocks from left to right in the order red, green, blue.
+    - task_name: blocks_ranking_size
+      instruction: Move the blocks to the center of the table and arrange them from largest to smallest, left to right.
+    - task_name: click_bell
+      instruction: Click the top center of the bell on the table.
+    - task_name: grab_roller
+      instruction: Use both arms to grab the roller on the table at different contact points.
+    - task_name: lift_pot
+      instruction: Use both arms to lift the pot by grasping it at specified contact points.
+    - task_name: move_can_pot
+      instruction: Pick up the can and move it beside the pot.
+    - task_name: move_playingcard_away
+      instruction: Pick up the playing card and move it to the left or right.
+    - task_name: move_stapler_pad
+      instruction: Move the stapler to a colored mat.
+    - task_name: click_alarmclock
+      instruction: Click the center of the alarm clock top-side button on the table.
+    - task_name: dump_bin_bigbin
+      instruction: Grab the small bin and pour the balls into the big bin.
+    - task_name: handover_mic
+      instruction: Grasp the microphone on the table with one arm and hand it over to the other arm.
+    - task_name: hanging_mug
+      instruction: Pick up the mug, rotate it, put it down in the middle of the table, then pick it up and hang it onto the rack.
+    - task_name: move_pillbottle_pad
+      instruction: Pick up the pill bottle and place it onto the pad.
+    - task_name: place_a2b_left
+      instruction: Place the object on the left side of the target object.
+    - task_name: place_a2b_right
+      instruction: Place the object on the right side of the target object.
+    - task_name: place_bread_basket
+      instruction: Put the bread into the basket; if there are two breads, use both arms to place them into the basket.
+    - task_name: place_bread_skillet
+      instruction: Put the bread into the skillet.
+    - task_name: place_can_basket
+      instruction: Pick up the can and place it into the basket, then lift up the basket with the other arm.
+    - task_name: place_cans_plasticbox
+      instruction: Use both arms to pick and place cans into the plastic box.
+    - task_name: place_fan
+      instruction: Grab the fan and place it on a colored pad.
+    - task_name: place_burger_fries
+      instruction: Use both arms to pick the hamburger and french fries and put them onto the tray.
+    - task_name: place_mouse_pad
+      instruction: Grasp the mouse and place it on a colored pad.
+    - task_name: place_object_basket
+      instruction: Put the target object in the basket, then grab the basket and move it slightly away.
+    - task_name: place_object_scale
+      instruction: Grab the object and put it on the scale.
+    - task_name: place_object_stand
+      instruction: Place the object on the stand.
+    - task_name: place_phone_stand
+      instruction: Pick up the phone and put it on the phone stand.
+    - task_name: press_stapler
+      instruction: Press the stapler with one arm.
+    - task_name: rotate_qrcode
+      instruction: Pick up the QR code board and rotate it so the QR code faces toward you.
+    - task_name: scan_object
+      instruction: Pick up the scanner with one arm and the object with the other arm, then scan the object.
+    - task_name: stack_bowls_three
+      instruction: Stack the three bowls on top of each other.
+    - task_name: stack_bowls_two
+      instruction: Stack the two bowls on top of each other.
+    - task_name: stamp_seal
+      instruction: Pick up the stamp and place it on the target block.
+    - task_name: shake_bottle_horizontally
+      instruction: Grasp the bottle and shake it horizontally with the proper arm.
+    - task_name: shake_bottle
+      instruction: Grasp the bottle and shake it up and down with the proper arm.
+    - task_name: put_bottles_dustbin
+      instruction: Pick up the bottles and put them into the dustbin.
+    - task_name: turn_switch
+      instruction: Click the switch with one arm.
+    - task_name: open_laptop
+      instruction: Open the laptop with the proper arm.
+    - task_name: open_microwave
+      instruction: Open the microwave by grasping and pulling the handle with the proper arm.
+    - task_name: put_object_cabinet
+      instruction: Open the cabinet with one arm, then pick up the object with the other arm and put it into the cabinet.

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
+import sys
+import types
 from types import SimpleNamespace
 from urllib.request import Request, urlopen
 
@@ -29,9 +32,20 @@ from clawvla.notices import _collect_markers
 from clawvla.blackboard import Blackboard
 from clawvla.components.state import update_world_state
 from clawvla.phase_policy import PhasePolicy
-from clawvla.rl.config import load_rl_config
+from clawvla.rl.config import build_rollout_episode_specs, load_rl_config
+from clawvla.rl.openrlhf_runner import _openrlhf_env, _openrlhf_train_command, _write_prompt_dataset
+from clawvla.rl.openrlhf_runtime_patches import (
+    _flatten_agent_outputs,
+    _patch_samples_generator_preserve_clawvla_rollout_batches,
+    _shape_episode_rewards,
+)
 from clawvla.rl.rollout_worker import _append_episode_terminal_reward
-from clawvla.rl.verl_agent_loop import _episode_reward
+from clawvla.rl.runner import VERL_TRAINER_MODULE, _verl_train_command
+from clawvla.rl.verl_agent_loop import (
+    _build_policy_call_outputs,
+    _episode_reward,
+    _validate_single_generation_length,
+)
 from clawvla.rl.policy_proxy import PolicyProxy, StaticPolicyBackend
 from clawvla.rl.reward_registry import build_reward_registry
 from clawvla.scripts.run_loop import _apply_runtime_environment
@@ -56,9 +70,39 @@ from clawvla.rl.trajectory import (
     PolicyCallTrace,
     SkillCallTrace,
     TrajectoryWriter,
-    build_agent_loop_adapter_from_calls,
-    build_response_mask_from_calls,
+    build_policy_call_adapter,
 )
+
+
+class DummyAgentLoopMetrics:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class DummyAgentLoopOutput:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def _import_openrlhf_agent_with_fakes(monkeypatch):
+    openrlhf_module = types.ModuleType("openrlhf")
+    openrlhf_module.__path__ = []
+    utils_module = types.ModuleType("openrlhf.utils")
+    utils_module.__path__ = []
+    agent_module = types.ModuleType("openrlhf.utils.agent")
+    vlm_module = types.ModuleType("openrlhf.utils.vlm_utils")
+
+    class AgentExecutorBase:
+        pass
+
+    agent_module.AgentExecutorBase = AgentExecutorBase
+    vlm_module.process_prompt_with_images = lambda *args, **kwargs: ([1], None, [])
+    monkeypatch.setitem(sys.modules, "openrlhf", openrlhf_module)
+    monkeypatch.setitem(sys.modules, "openrlhf.utils", utils_module)
+    monkeypatch.setitem(sys.modules, "openrlhf.utils.agent", agent_module)
+    monkeypatch.setitem(sys.modules, "openrlhf.utils.vlm_utils", vlm_module)
+    sys.modules.pop("clawvla.rl.openrlhf_agent", None)
+    return importlib.import_module("clawvla.rl.openrlhf_agent")
 
 
 def test_load_default_rl_config() -> None:
@@ -114,51 +158,450 @@ def test_policy_proxy_static_backend(tmp_path) -> None:
     assert proxy.calls[0].parsed_json == {"ok": True}
 
 
-def test_response_mask_trains_only_model_tokens() -> None:
-    first = PolicyCallTrace.new(role="scheduler", model="m:scheduler", messages=[], image_refs=[])
-    first.prompt_ids = [1, 2]
-    first.response_ids = [3, 4]
-    second = PolicyCallTrace.new(role="vision", model="m:vision", messages=[], image_refs=[])
-    second.prompt_ids = [5]
-    second.response_ids = [6, 7]
-    adapter = build_response_mask_from_calls([first, second], separator_ids=[99])
-    assert adapter["prompt_ids"] == [1, 2]
-    assert adapter["response_ids"] == [3, 4, 99, 5, 6, 7]
-    assert adapter["response_mask"] == [1, 1, 0, 0, 1, 1]
+def test_policy_proxy_preserves_raw_image_refs_for_training(tmp_path) -> None:
+    data_url = "data:image/png;base64,iVBORw0KGgo="
+    writer = TrajectoryWriter(tmp_path / "events.jsonl")
+    proxy = PolicyProxy(
+        host="127.0.0.1",
+        port=0,
+        backend=StaticPolicyBackend('{"ok": true}'),
+        trajectory_writer=writer,
+    )
+    proxy.start()
+    try:
+        payload = {
+            "model": "clawvla-policy:vision",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "look"},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ],
+        }
+        request = Request(
+            f"{proxy.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer test"},
+        )
+        with urlopen(request, timeout=5) as response:
+            response.read()
+    finally:
+        proxy.stop()
+
+    call = proxy.calls[0]
+    assert call.image_refs == [data_url]
+    assert call.messages[0]["content"][1]["image_url"]["url"] == f"data_url:{len(data_url)}"
 
 
-def test_agent_loop_adapter_carries_multimodal_payloads_in_call_order() -> None:
-    first = PolicyCallTrace.new(role="vision", model="m:vision", messages=[], image_refs=["first.png"])
-    first.prompt_ids = [1, 2]
-    first.response_ids = [3]
-    first._clawvla_multi_modal_data = {"images": ["image-first"]}
-    first._clawvla_mm_processor_kwargs = {"max_pixels": 1024}
+def test_policy_call_adapter_keeps_single_call_context_only() -> None:
+    call = PolicyCallTrace.new(role="scheduler", model="m:scheduler", messages=[], image_refs=[])
+    call.prompt_ids = [10, 11]
+    call.response_ids = [12, 13]
+    call.response_logprobs = [-0.1, -0.2]
 
-    second = PolicyCallTrace.new(role="scheduler", model="m:scheduler", messages=[], image_refs=["second.png"])
-    second.prompt_ids = [4, 5]
-    second.response_ids = [6]
-    second._clawvla_multi_modal_data = {"images": ["image-second"]}
-    second._clawvla_mm_processor_kwargs = {"max_pixels": 1024}
+    adapter = build_policy_call_adapter(call)
 
-    adapter = build_agent_loop_adapter_from_calls([first, second], separator_ids=[99])
-
-    assert adapter["prompt_ids"] == [1, 2]
-    assert adapter["response_ids"] == [3, 99, 4, 5, 6]
-    assert adapter["response_mask"] == [1, 0, 0, 0, 1]
-    assert adapter["multi_modal_data"] == {"images": ["image-first", "image-second"]}
-    assert adapter["mm_processor_kwargs"] == {"max_pixels": 1024}
+    assert adapter["prompt_ids"] == [10, 11]
+    assert adapter["response_ids"] == [12, 13]
+    assert adapter["response_mask"] == [1, 1]
+    assert adapter["response_logprobs"] == [-0.1, -0.2]
 
 
-def test_agent_loop_adapter_rejects_image_refs_without_training_payload() -> None:
+def test_policy_call_adapter_requires_image_training_payload() -> None:
     call = PolicyCallTrace.new(role="vision", model="m:vision", messages=[], image_refs=["view.png"])
     call.prompt_ids = [1]
     call.response_ids = [2]
-    try:
-        build_agent_loop_adapter_from_calls([call])
-    except ValueError as exc:
-        assert "did not carry training multi_modal_data" in str(exc)
-    else:
-        raise AssertionError("expected missing multimodal payload to fail loudly")
+
+    with pytest.raises(ValueError, match="did not carry training multi_modal_data"):
+        build_policy_call_adapter(call)
+
+
+def test_verl_outputs_use_one_training_item_per_policy_call() -> None:
+    episode = EpisodeRecord.new(
+        task_name="place_container_plate",
+        instruction="place the container on the plate",
+        seed=123,
+    )
+    episode.status = "finished"
+
+    first = PolicyCallTrace.new(role="vision", model="m:vision", messages=[], image_refs=["first.png"])
+    first.prompt_ids = [1, 2]
+    first.response_ids = [3]
+    first.response_logprobs = [-0.3]
+    first._clawvla_multi_modal_data = {"images": ["image-first"]}
+    first._clawvla_mm_processor_kwargs = {"max_pixels": 1024}
+
+    second = PolicyCallTrace.new(role="scheduler", model="m:scheduler", messages=[], image_refs=[])
+    second.prompt_ids = [4, 5]
+    second.response_ids = [6, 7]
+    second.response_logprobs = [-0.6, -0.7]
+
+    episode.policy_calls = [first, second]
+
+    outputs = _build_policy_call_outputs(
+        episode=episode,
+        reward_score=1.5,
+        metrics={"generate_sequences": 0.0, "tool_calls": 1.0, "compute_score": 0.0, "num_preempted": -1},
+        prompt_length=16,
+        response_length=16,
+        agent_loop_output_cls=DummyAgentLoopOutput,
+        agent_loop_metrics_cls=DummyAgentLoopMetrics,
+        kwargs={"uid": "task-seed-group", "session_id": 2},
+    )
+
+    assert len(outputs) == 2
+    assert outputs[0].prompt_ids == [1, 2]
+    assert outputs[0].response_ids == [3]
+    assert outputs[0].response_mask == [1]
+    assert outputs[0].multi_modal_data == {"images": ["image-first"]}
+    assert outputs[0].mm_processor_kwargs == {"max_pixels": 1024}
+    assert outputs[1].prompt_ids == [4, 5]
+    assert outputs[1].response_ids == [6, 7]
+    assert outputs[1].response_mask == [1, 1]
+    assert outputs[1].multi_modal_data is None
+    assert outputs[1].reward_score == 1.5
+    assert outputs[1].extra_fields["trajectory_group_id"] == "task-seed-group"
+    assert outputs[1].extra_fields["traj_uid"] == episode.episode_id
+    assert outputs[1].extra_fields["call_index"] == 1
+
+
+def test_openrlhf_outputs_use_one_training_item_per_policy_call(monkeypatch) -> None:
+    openrlhf_agent = _import_openrlhf_agent_with_fakes(monkeypatch)
+    episode = EpisodeRecord.new(
+        task_name="place_container_plate",
+        instruction="place the container on the plate",
+        seed=123,
+    )
+    episode.status = "finished"
+
+    first = PolicyCallTrace.new(role="vision", model="m:vision", messages=[], image_refs=["first.png"])
+    first.prompt_ids = [10, 11]
+    first.response_ids = [12]
+    first.response_logprobs = [-0.12]
+    first._clawvla_multi_modal_data = {"images": ["image-first"]}
+    first._clawvla_openrlhf_mm_train_inputs = {"pixel_values": "first-mm"}
+
+    second = PolicyCallTrace.new(role="scheduler", model="m:scheduler", messages=[], image_refs=[])
+    second.prompt_ids = [20, 21, 22]
+    second.response_ids = [23, 24]
+
+    episode.policy_calls = [first, second]
+
+    samples = openrlhf_agent._episode_to_call_samples(
+        prompt="run episode",
+        label='{"index": 0}',
+        episode=episode,
+        reward_score=1.25,
+        group_uid=7,
+    )
+
+    assert len(samples) == 2
+    assert samples[0]["observation_tokens"] == [10, 11, 12]
+    assert samples[0]["action_ranges"] == [(2, 3)]
+    assert samples[0]["rollout_log_probs"] == [0.0, 0.0, -0.12]
+    assert samples[0]["images"] == ["first.png"]
+    assert samples[0]["mm_train_inputs"] == {"pixel_values": "first-mm"}
+    assert samples[0]["extra_logs"]["clawvla_group_uid"] == 7
+    assert samples[0]["extra_logs"]["clawvla_call_index"] == 0
+    assert samples[0]["extra_logs"]["clawvla_policy_calls"] == 2
+    assert samples[1]["observation_tokens"] == [20, 21, 22, 23, 24]
+    assert samples[1]["action_ranges"] == [(3, 5)]
+    assert samples[1]["rollout_log_probs"] is None
+    assert samples[1]["images"] is None
+    assert samples[1]["reward"] == 1.25
+    assert samples[1]["scores"] == 1.25
+
+
+def test_openrlhf_sample_builder_fails_on_untrainable_policy_call(monkeypatch) -> None:
+    openrlhf_agent = _import_openrlhf_agent_with_fakes(monkeypatch)
+    episode = EpisodeRecord.new(task_name="place_container_plate", instruction="place the container on the plate")
+    episode.status = "finished"
+    call = PolicyCallTrace.new(role="scheduler", model="m:scheduler", messages=[], image_refs=[])
+    call.response_ids = [2]
+    episode.policy_calls = [call]
+
+    with pytest.raises(ValueError, match="without prompt_ids"):
+        openrlhf_agent._episode_to_call_samples(
+            prompt="run episode",
+            label="{}",
+            episode=episode,
+            reward_score=0.0,
+            group_uid=1,
+        )
+
+
+def test_openrlhf_sample_builder_requires_image_mm_train_inputs(monkeypatch) -> None:
+    openrlhf_agent = _import_openrlhf_agent_with_fakes(monkeypatch)
+    episode = EpisodeRecord.new(task_name="place_container_plate", instruction="place the container on the plate")
+    episode.status = "finished"
+    call = PolicyCallTrace.new(role="vision", model="m:vision", messages=[], image_refs=["first.png"])
+    call.prompt_ids = [1]
+    call.response_ids = [2]
+    call._clawvla_multi_modal_data = {"images": ["image-first"]}
+    episode.policy_calls = [call]
+
+    with pytest.raises(ValueError, match="did not carry mm_train_inputs"):
+        openrlhf_agent._episode_to_call_samples(
+            prompt="run episode",
+            label="{}",
+            episode=episode,
+            reward_score=0.0,
+            group_uid=1,
+        )
+
+
+def test_openrlhf_label_parser_is_strict(monkeypatch) -> None:
+    openrlhf_agent = _import_openrlhf_agent_with_fakes(monkeypatch)
+
+    with pytest.raises(ValueError, match="label must be valid JSON"):
+        openrlhf_agent._parse_label("not-json")
+    with pytest.raises(ValueError, match="label is required"):
+        openrlhf_agent._parse_label("")
+
+
+def test_openrlhf_logprob_extraction_is_strict(monkeypatch) -> None:
+    openrlhf_agent = _import_openrlhf_agent_with_fakes(monkeypatch)
+    completion = SimpleNamespace(logprobs=[{11: SimpleNamespace(logprob=-0.5)}])
+
+    assert openrlhf_agent._extract_logprobs(completion, [11]) == [-0.5]
+    with pytest.raises(ValueError, match="unexpected length"):
+        openrlhf_agent._extract_logprobs(completion, [11, 12])
+    with pytest.raises(ValueError, match="missing sampled token"):
+        openrlhf_agent._extract_logprobs(completion, [12])
+
+
+def test_openrlhf_runtime_flattens_nested_agent_outputs() -> None:
+    assert _flatten_agent_outputs({"a": 1}) == [{"a": 1}]
+    assert _flatten_agent_outputs([[{"a": 1}], ({"b": 2}, [{"c": 3}])]) == [
+        {"a": 1},
+        {"b": 2},
+        {"c": 3},
+    ]
+    with pytest.raises(TypeError, match="dict or nested list"):
+        _flatten_agent_outputs("bad")
+
+
+def test_openrlhf_episode_group_advantage_is_copied_to_each_call() -> None:
+    torch = pytest.importorskip("torch")
+
+    shaped = _shape_episode_rewards(
+        raw_rewards=torch.tensor([1.0, 1.0, 3.0, 3.0]),
+        group_uids=torch.tensor([7, 7, 7, 7]),
+        episode_uids=torch.tensor([10, 10, 20, 20]),
+        estimator="group_norm",
+    )
+
+    assert shaped[0].item() == pytest.approx(shaped[1].item())
+    assert shaped[2].item() == pytest.approx(shaped[3].item())
+    assert shaped[0].item() == pytest.approx(-0.70710677, rel=1e-5)
+    assert shaped[2].item() == pytest.approx(0.70710677, rel=1e-5)
+
+
+def test_openrlhf_episode_group_advantage_rejects_mismatched_call_rewards() -> None:
+    torch = pytest.importorskip("torch")
+
+    with pytest.raises(ValueError, match="same episode disagree on reward"):
+        _shape_episode_rewards(
+            raw_rewards=torch.tensor([1.0, 2.0]),
+            group_uids=torch.tensor([7, 7]),
+            episode_uids=torch.tensor([10, 10]),
+            estimator="group_norm",
+        )
+
+
+def test_openrlhf_runtime_patch_does_not_split_generated_call_batch(monkeypatch) -> None:
+    samples_module = types.ModuleType("openrlhf.trainer.ppo_utils.samples_generator")
+    sleep_calls = []
+    log_messages = []
+
+    class SamplesGenerator:
+        def __init__(self):
+            self.prompts_dataloader = iter(["prompt"])
+            self.vllm_engines = ["engine"]
+            self.args = SimpleNamespace(
+                vllm=SimpleNamespace(enable_sleep=True),
+                rollout=SimpleNamespace(vllm_generate_batch_size=1, batch_size=1),
+                algo=SimpleNamespace(dynamic_filtering_enable=False),
+            )
+
+        def _generate_vllm(self, **kwargs):
+            assert kwargs["num_prompts"] == 1
+            return ["call-0", "call-1", "call-2"], 1, True
+
+    samples_module.SamplesGenerator = SamplesGenerator
+    samples_module.batch_vllm_engine_call = lambda engines, method: sleep_calls.append((engines, method))
+    samples_module.logger = SimpleNamespace(info=log_messages.append)
+    monkeypatch.setitem(sys.modules, "openrlhf.trainer.ppo_utils.samples_generator", samples_module)
+
+    _patch_samples_generator_preserve_clawvla_rollout_batches()
+
+    generator = SamplesGenerator()
+    batch, filter_pass_rate, prompts_consumed, exhausted = generator.generate_samples()
+    assert batch == ["call-0", "call-1", "call-2"]
+    assert filter_pass_rate is None
+    assert prompts_consumed == 1
+    assert exhausted is False
+    assert sleep_calls == [(["engine"], "wake_up"), (["engine"], "sleep")]
+    assert log_messages == ["Prompt dataloader is exhausted."]
+
+    batch, filter_pass_rate, prompts_consumed, exhausted = generator.generate_samples()
+    assert batch == []
+    assert filter_pass_rate is None
+    assert prompts_consumed == 0
+    assert exhausted is True
+
+
+def test_rollout_episode_specs_expand_multitask_config() -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_multitask_1update.yaml")
+    specs = build_rollout_episode_specs(config)
+
+    assert len(specs) == 50
+    assert specs[0].index == 0
+    assert specs[0].task_name == "beat_block_hammer"
+    assert specs[0].seed == 0
+    assert specs[-1].index == 49
+    assert specs[-1].task_name == "put_object_cabinet"
+
+
+def test_openrlhf_prompt_dataset_expands_multitask_tasks(tmp_path) -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_multitask_1update.yaml")
+
+    path = _write_prompt_dataset(config, tmp_path)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    assert len(rows) == 50
+    first_label = json.loads(rows[0]["label"])
+    last_label = json.loads(rows[-1]["label"])
+    assert first_label["task_name"] == "beat_block_hammer"
+    assert first_label["task_index"] == 0
+    assert first_label["seed"] == 0
+    assert "beat the block" in rows[0]["input"]
+    assert last_label["task_name"] == "put_object_cabinet"
+
+
+def test_openrlhf_train_command_uses_agent_entrypoint_and_full_zero3(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_ADAM_OFFLOAD", raising=False)
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_ATTN_IMPLEMENTATION", raising=False)
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_DS_TENSOR_PARALLEL_SIZE", raising=False)
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_ZERO_STAGE", raising=False)
+    config = load_rl_config("configs/rl/qwen3vl_pi05_train_smoke.yaml")
+    command = _openrlhf_train_command(
+        config,
+        python=tmp_path / "python",
+        run_dir=tmp_path,
+        train_file=tmp_path / "train.jsonl",
+    )
+
+    assert command[:3] == [str(tmp_path / "python"), "-m", "openrlhf.cli.train_ppo_ray"]
+    assert command[command.index("--train.agent_func_path") + 1].endswith("src/clawvla/rl/openrlhf_agent.py")
+    assert command[command.index("--ds.zero_stage") + 1] == "3"
+    assert command[command.index("--ds.attn_implementation") + 1] == "flash_attention_2"
+    assert command[command.index("--ds.tensor_parallel_size") + 1] == "1"
+    assert command[command.index("--train.max_tokens_per_gpu") + 1] == "12288"
+    assert "--vllm.enable_sleep" in command
+    assert "--ds.enable_sleep" in command
+    assert "--ds.adam_offload" in command
+    assert "--actor.gradient_checkpointing_enable" in command
+
+
+def test_openrlhf_train_command_uses_multitask_prompt_count(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_ADAM_OFFLOAD", raising=False)
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_ATTN_IMPLEMENTATION", raising=False)
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_DS_TENSOR_PARALLEL_SIZE", raising=False)
+    config = load_rl_config("configs/rl/qwen3vl_pi05_multitask_1update.yaml")
+    command = _openrlhf_train_command(
+        config,
+        python=tmp_path / "python",
+        run_dir=tmp_path,
+        train_file=tmp_path / "train.jsonl",
+    )
+
+    assert command[command.index("--data.max_samples") + 1] == "50"
+    assert command[command.index("--rollout.batch_size") + 1] == "1"
+    assert command[command.index("--rollout.n_samples_per_prompt") + 1] == "4"
+    assert command[command.index("--algo.advantage.estimator") + 1] == "group_norm"
+
+
+def test_openrlhf_train_command_allows_adam_offload_opt_out(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CLAWVLA_OPENRLHF_ADAM_OFFLOAD", "0")
+    config = load_rl_config("configs/rl/qwen3vl_pi05_train_smoke.yaml")
+    command = _openrlhf_train_command(
+        config,
+        python=tmp_path / "python",
+        run_dir=tmp_path,
+        train_file=tmp_path / "train.jsonl",
+    )
+
+    assert "--ds.adam_offload" not in command
+
+
+def test_openrlhf_train_command_allows_attention_override(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CLAWVLA_OPENRLHF_ATTN_IMPLEMENTATION", "sdpa")
+    config = load_rl_config("configs/rl/qwen3vl_pi05_train_smoke.yaml")
+    command = _openrlhf_train_command(
+        config,
+        python=tmp_path / "python",
+        run_dir=tmp_path,
+        train_file=tmp_path / "train.jsonl",
+    )
+
+    assert command[command.index("--ds.attn_implementation") + 1] == "sdpa"
+
+
+def test_openrlhf_real_5step_uses_single_gpu_vllm_engines(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_ADAM_OFFLOAD", raising=False)
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_ATTN_IMPLEMENTATION", raising=False)
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_DS_TENSOR_PARALLEL_SIZE", raising=False)
+    config = load_rl_config("configs/rl/qwen3vl_pi05_real_5step_1update.yaml")
+    command = _openrlhf_train_command(
+        config,
+        python=tmp_path / "python",
+        run_dir=tmp_path,
+        train_file=tmp_path / "train.jsonl",
+    )
+
+    assert command[command.index("--vllm.tensor_parallel_size") + 1] == "1"
+    assert command[command.index("--vllm.num_engines") + 1] == "4"
+    assert command[command.index("--vllm.gpu_memory_utilization") + 1] == "0.45"
+    assert command[command.index("--data.max_len") + 1] == "16384"
+    assert command[command.index("--actor.num_gpus_per_node") + 1] == "4"
+    assert command[command.index("--ds.zero_stage") + 1] == "3"
+    assert command[command.index("--ds.attn_implementation") + 1] == "flash_attention_2"
+    assert command[command.index("--ds.tensor_parallel_size") + 1] == "1"
+    assert command[command.index("--train.max_tokens_per_gpu") + 1] == "8192"
+    assert "--ds.adam_offload" in command
+    assert "--actor.gradient_checkpointing_enable" in command
+
+
+def test_openrlhf_env_removes_expandable_segments_when_vllm_sleep_is_enabled(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_VLLM_ENABLE_SLEEP", raising=False)
+    config = load_rl_config("configs/rl/qwen3vl_pi05_train_smoke.yaml")
+
+    env = _openrlhf_env(config, tmp_path, tmp_path / "resolved_config.yaml")
+
+    assert "PYTORCH_CUDA_ALLOC_CONF" not in env
+    assert env["CLAWVLA_ENABLE_OPENRLHF_RUNTIME_PATCHES"] == "1"
+    assert env["CLAWVLA_OPENRLHF_RL_CONFIG"] == str(tmp_path / "resolved_config.yaml")
+    assert env["RAY_CGRAPH_submit_timeout"] == "300"
+    assert env["RAY_CGRAPH_get_timeout"] == "300"
+
+
+def test_train_command_uses_multi_output_verl_entrypoint(tmp_path) -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_train_smoke.yaml")
+    command = _verl_train_command(
+        config,
+        tmp_path,
+        tmp_path / "train.jsonl",
+        tmp_path / "val.jsonl",
+        tmp_path / "agent_loop.yaml",
+        tmp_path / "resolved_config.yaml",
+    )
+
+    assert command[:3] == [config.trainer.python, "-m", VERL_TRAINER_MODULE]
 
 
 def test_max_steps_result_keeps_failure_visible() -> None:
@@ -241,6 +684,41 @@ def test_terminal_reward_penalizes_incomplete_episode_without_skill_failure(tmp_
     assert payload["reward"]["metrics"]["incomplete_episode"] == 1.0
 
 
+def test_terminal_reward_lightly_penalizes_recoverable_preflight_refresh(tmp_path) -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_grpo.yaml")
+    episode = EpisodeRecord.new(task_name="place_container_plate", instruction="place the container on the plate")
+    episode.status = "finished"
+    episode.skill_calls = [
+        SkillCallTrace(
+            step_index=0,
+            stage="preflight",
+            component="safety",
+            skill="preflight_action",
+            status="preflight_failed",
+            success=False,
+            errors=["stale_perception", "stale_world_state"],
+        ),
+        SkillCallTrace(
+            step_index=1,
+            stage="preflight",
+            component="vision",
+            skill="refresh_preflight_observation",
+            status="preflight_observation_refreshed",
+            success=True,
+        ),
+    ]
+    reward_path = tmp_path / "episode_reward.jsonl"
+
+    _append_episode_terminal_reward(episode, reward_path, config)
+
+    payload = json.loads(reward_path.read_text(encoding="utf-8"))
+    assert episode.reward_score == -0.1
+    assert payload["reward"]["reward"] == -0.1
+    assert payload["reward"]["metrics"]["failed_skills"] == 0.0
+    assert payload["reward"]["metrics"]["recoverable_preflight_failures"] == 1.0
+    assert payload["reward"]["events"]["recoverable_preflight_failure_seen"] is True
+
+
 def test_episode_reward_uses_archived_score_without_double_counting() -> None:
     episode = EpisodeRecord.new(task_name="place_container_plate", instruction="place the container on the plate")
     episode.status = "max_steps_reached_with_failures"
@@ -257,6 +735,12 @@ def test_episode_reward_uses_archived_score_without_double_counting() -> None:
     ]
 
     assert _episode_reward(episode, invalid_decision_penalty=-2.0, skill_failure_penalty=-1.0) == -3.0
+
+
+def test_single_policy_generation_over_response_length_errors() -> None:
+    _validate_single_generation_length(token_count=4, response_length=4)
+    with pytest.raises(ValueError, match="single policy generation exceeds configured verl response length"):
+        _validate_single_generation_length(token_count=5, response_length=4)
 
 
 def test_run_loop_applies_runtime_environment(monkeypatch) -> None:

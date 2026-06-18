@@ -18,8 +18,12 @@ def run_rollout_episode(
     episode_index: int,
     seed: int,
     policy_base_url: str,
+    task_name: str | None = None,
+    instruction: str | None = None,
 ) -> EpisodeRecord:
-    episode = EpisodeRecord.new(task_name=config.rollout.task_name, instruction=config.rollout.instruction, seed=seed)
+    task_name = task_name or config.rollout.task_name
+    instruction = instruction or config.rollout.instruction
+    episode = EpisodeRecord.new(task_name=task_name, instruction=instruction, seed=seed)
     episode.status = "running"
     writer = TrajectoryWriter(run_dir / "events.jsonl")
     writer.write_event(
@@ -40,6 +44,8 @@ def run_rollout_episode(
         seed=seed,
         policy_base_url=policy_base_url,
         openpi_port=openpi_port,
+        task_name=task_name,
+        instruction=instruction,
     )
     result_path = run_dir / "trajectories" / f"{episode.episode_id}_result.json"
     log_path = run_dir / "logs" / f"{episode.episode_id}_agent.log"
@@ -52,7 +58,7 @@ def run_rollout_episode(
         "--config",
         str(config_path),
         "--instruction",
-        config.rollout.instruction,
+        instruction,
         "--artifact-prefix",
         artifact_prefix,
         "--initial-stage",
@@ -68,7 +74,7 @@ def run_rollout_episode(
         "OPENAI_COMPATIBLE_API_KEY": config.policy.api_key,
         "OPENAI_COMPATIBLE_API_BASE_URL": policy_base_url,
         "CLAWVLA_RL_REWARD_JSONL": str(reward_path),
-        "CLAWVLA_RL_TASK_NAME": config.rollout.task_name,
+        "CLAWVLA_RL_TASK_NAME": task_name,
         "CLAWVLA_RL_STEP_COST": str(config.reward.step_cost),
     }
     if config.cluster.robotwin_gpus:
@@ -148,10 +154,12 @@ def _write_agent_config(
     seed: int,
     policy_base_url: str,
     openpi_port: int,
+    task_name: str,
+    instruction: str,
 ) -> Path:
     base = json.loads(Path(config.rollout.base_config).read_text(encoding="utf-8"))
-    base.setdefault("task", {})["instruction"] = config.rollout.instruction
-    base.setdefault("robotwin", {})["task_name"] = config.rollout.task_name
+    base.setdefault("task", {})["instruction"] = instruction
+    base.setdefault("robotwin", {})["task_name"] = task_name
     base["robotwin"]["seed"] = seed
     base["robotwin"]["artifact_dir"] = str(run_dir / "artifacts" / episode.episode_id)
     for role in config.policy.roles:
@@ -266,14 +274,29 @@ def _populate_episode_rewards(episode: EpisodeRecord, reward_path: Path) -> None
         episode.reward_score = float(sum(item.reward for item in episode.rewards))
 
 
+RECOVERABLE_PREFLIGHT_ERRORS = {
+    "stale_perception",
+    "stale_world_state",
+    "world_state_requires_reobserve",
+    "missing_observation",
+    "missing_observation_id",
+}
+
+
 def _append_episode_terminal_reward(episode: EpisodeRecord, reward_path: Path, config: RLConfig) -> None:
     invalid_decisions = sum(1 for skill in episode.skill_calls if skill.status == "invalid_decision")
-    failed_skills = sum(1 for skill in episode.skill_calls if skill.status != "invalid_decision" and not skill.success)
+    recoverable_preflight_failures = sum(1 for skill in episode.skill_calls if _is_recoverable_preflight_failure(skill))
+    failed_skills = sum(
+        1
+        for skill in episode.skill_calls
+        if skill.status != "invalid_decision" and not skill.success and not _is_recoverable_preflight_failure(skill)
+    )
     incomplete = episode.status != "finished"
     penalty = (
         (float(config.reward.incomplete_episode_penalty) if incomplete else 0.0)
         + invalid_decisions * float(config.reward.invalid_decision_penalty)
         + failed_skills * float(config.reward.skill_failure_penalty)
+        + recoverable_preflight_failures * float(config.reward.recoverable_preflight_penalty)
     )
     terminal_success = episode.status == "finished"
     reward = RewardRecord(
@@ -281,17 +304,24 @@ def _append_episode_terminal_reward(episode: EpisodeRecord, reward_path: Path, c
         task_name=episode.task_name,
         reward=float(penalty),
         family="episode_terminal",
-        reason=_terminal_reward_reason(episode.status, invalid_decisions, failed_skills),
+        reason=_terminal_reward_reason(
+            episode.status,
+            invalid_decisions,
+            failed_skills,
+            recoverable_preflight_failures,
+        ),
         events={
             "episode_finished": terminal_success,
             "episode_incomplete": incomplete,
             "invalid_decision_seen": invalid_decisions > 0,
             "skill_failure_seen": failed_skills > 0,
+            "recoverable_preflight_failure_seen": recoverable_preflight_failures > 0,
         },
         metrics={
             "incomplete_episode": 1.0 if incomplete else 0.0,
             "invalid_decisions": float(invalid_decisions),
             "failed_skills": float(failed_skills),
+            "recoverable_preflight_failures": float(recoverable_preflight_failures),
             "skill_calls": float(len(episode.skill_calls)),
         },
         metadata={"episode_status": episode.status, "errors": list(episode.errors)},
@@ -317,7 +347,21 @@ def _append_episode_terminal_reward(episode: EpisodeRecord, reward_path: Path, c
         handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
-def _terminal_reward_reason(status: str, invalid_decisions: int, failed_skills: int) -> str:
+def _is_recoverable_preflight_failure(skill: SkillCallTrace) -> bool:
+    if skill.success:
+        return False
+    if skill.component != "safety" or skill.skill != "preflight_action" or skill.status != "preflight_failed":
+        return False
+    errors = {str(error) for error in skill.errors}
+    return bool(errors) and errors.issubset(RECOVERABLE_PREFLIGHT_ERRORS)
+
+
+def _terminal_reward_reason(
+    status: str,
+    invalid_decisions: int,
+    failed_skills: int,
+    recoverable_preflight_failures: int = 0,
+) -> str:
     parts = [f"episode_status={status}"]
     if status != "finished":
         parts.append("incomplete_episode=1")
@@ -325,6 +369,8 @@ def _terminal_reward_reason(status: str, invalid_decisions: int, failed_skills: 
         parts.append(f"invalid_decisions={invalid_decisions}")
     if failed_skills:
         parts.append(f"failed_skills={failed_skills}")
+    if recoverable_preflight_failures:
+        parts.append(f"recoverable_preflight_failures={recoverable_preflight_failures}")
     return ";".join(parts)
 
 

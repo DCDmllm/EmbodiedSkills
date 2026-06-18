@@ -31,6 +31,22 @@ class PolicyConfig:
 
 
 @dataclass
+class RolloutTaskConfig:
+    task_name: str
+    instruction: str
+    seeds: list[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RolloutEpisodeSpec:
+    index: int
+    task_index: int
+    task_name: str
+    instruction: str
+    seed: int
+
+
+@dataclass
 class RolloutConfig:
     base_config: str
     instruction: str
@@ -42,6 +58,7 @@ class RolloutConfig:
     artifact_prefix: str = "clawvla_rl"
     task_name: str = "place_container_plate"
     seeds: list[int] = field(default_factory=lambda: [0])
+    tasks: list[RolloutTaskConfig] = field(default_factory=list)
     episode_timeout_s: float = 1800.0
     openpi_port_base: int = 8765
     start_openpi_worker: bool = True
@@ -55,6 +72,7 @@ class RewardConfig:
     incomplete_episode_penalty: float = -1.0
     invalid_decision_penalty: float = -2.0
     skill_failure_penalty: float = -1.0
+    recoverable_preflight_penalty: float = -0.1
     infra_failure_reward: float | None = None
 
 
@@ -200,6 +218,8 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 
 def _rl_config(payload: dict[str, Any]) -> RLConfig:
+    rollout = _dataclass_from_dict(RolloutConfig, payload.get("rollout"), RLConfig().rollout)
+    rollout.tasks = _normalize_rollout_tasks(rollout.tasks)
     return RLConfig(
         name=str(payload.get("name", "qwen3vl_pi05_grpo")),
         run_id=payload.get("run_id"),
@@ -207,7 +227,7 @@ def _rl_config(payload: dict[str, Any]) -> RLConfig:
         robotwin=_env_command(payload.get("robotwin"), RLConfig().robotwin),
         openpi=_env_command(payload.get("openpi"), RLConfig().openpi),
         policy=_dataclass_from_dict(PolicyConfig, payload.get("policy"), RLConfig().policy),
-        rollout=_dataclass_from_dict(RolloutConfig, payload.get("rollout"), RLConfig().rollout),
+        rollout=rollout,
         reward=_dataclass_from_dict(RewardConfig, payload.get("reward"), RLConfig().reward),
         verl=_dataclass_from_dict(VerlConfig, payload.get("verl"), RLConfig().verl),
         cluster=_dataclass_from_dict(ClusterConfig, payload.get("cluster"), RLConfig().cluster),
@@ -215,6 +235,79 @@ def _rl_config(payload: dict[str, Any]) -> RLConfig:
         checkpoint=_dataclass_from_dict(CheckpointConfig, payload.get("checkpoint"), RLConfig().checkpoint),
         metadata=dict(payload.get("metadata", {})) if isinstance(payload.get("metadata", {}), dict) else {},
     )
+
+
+def build_rollout_episode_specs(config: RLConfig) -> list[RolloutEpisodeSpec]:
+    specs: list[RolloutEpisodeSpec] = []
+    tasks = rollout_tasks(config)
+    for task_index, task in enumerate(tasks):
+        seeds = list(task.seeds or config.rollout.seeds or [0])
+        for seed in seeds:
+            specs.append(
+                RolloutEpisodeSpec(
+                    index=len(specs),
+                    task_index=task_index,
+                    task_name=task.task_name,
+                    instruction=task.instruction,
+                    seed=int(seed),
+                )
+            )
+    if config.rollout.tasks:
+        return specs
+
+    count = max(1, config.rollout.episodes)
+    seeds = list(config.rollout.seeds or [0])
+    return [
+        RolloutEpisodeSpec(
+            index=index,
+            task_index=0,
+            task_name=config.rollout.task_name,
+            instruction=config.rollout.instruction,
+            seed=int(seeds[index % len(seeds)]),
+        )
+        for index in range(count)
+    ]
+
+
+def rollout_tasks(config: RLConfig) -> list[RolloutTaskConfig]:
+    if config.rollout.tasks:
+        return list(config.rollout.tasks)
+    return [
+        RolloutTaskConfig(
+            task_name=config.rollout.task_name,
+            instruction=config.rollout.instruction,
+            seeds=list(config.rollout.seeds),
+        )
+    ]
+
+
+def _normalize_rollout_tasks(value: object) -> list[RolloutTaskConfig]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise TypeError(f"rollout.tasks must be a list, got {type(value).__name__}")
+    tasks = []
+    for index, item in enumerate(value):
+        if isinstance(item, RolloutTaskConfig):
+            tasks.append(item)
+            continue
+        if not isinstance(item, dict):
+            raise TypeError(f"rollout.tasks[{index}] must be an object, got {type(item).__name__}")
+        task_name = str(item.get("task_name") or "").strip()
+        instruction = str(item.get("instruction") or "").strip()
+        if not task_name:
+            raise ValueError(f"rollout.tasks[{index}] is missing task_name")
+        if not instruction:
+            raise ValueError(f"rollout.tasks[{index}] is missing instruction")
+        seeds_value = item.get("seeds", [])
+        if seeds_value is None:
+            seeds = []
+        elif isinstance(seeds_value, list):
+            seeds = [int(seed) for seed in seeds_value]
+        else:
+            raise TypeError(f"rollout.tasks[{index}].seeds must be a list, got {type(seeds_value).__name__}")
+        tasks.append(RolloutTaskConfig(task_name=task_name, instruction=instruction, seeds=seeds))
+    return tasks
 
 
 def _env_command(payload: object, default: EnvCommandConfig) -> EnvCommandConfig:

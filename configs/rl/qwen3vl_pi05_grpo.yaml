@@ -39,7 +39,7 @@ rollout:
   base_config: /mnt/wangwai/vla/clawvla/configs/robotwin_pi05_worker_probe.json
   instruction: place the container on the plate
   initial_stage: observe
-  max_steps: 25
+  max_steps: 150
   run_robotwin: true
   episodes: 4
   group_size: 4
@@ -72,6 +72,7 @@ reward:
   incomplete_episode_penalty: -1.0
   invalid_decision_penalty: -2.0
   skill_failure_penalty: -1.0
+  recoverable_preflight_penalty: -0.1
   infra_failure_reward: null
 
 verl:
