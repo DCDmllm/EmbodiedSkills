@@ -191,16 +191,16 @@ observe -> plan -> preflight -> execute -> verify -> recover
 
 ```bash
 cd /mnt/wangwai/vla/clawvla
-./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_grpo.yaml --mode dry-run
+./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_multitask_1update.yaml --mode dry-run
 ```
 
-真实 5-step 一次 update smoke：
+真实 50 任务一次 update smoke：
 
 ```bash
 ./scripts/run_clawvla_rl.sh \
-  --config configs/rl/qwen3vl_pi05_real_5step_1update.yaml \
+  --config configs/rl/qwen3vl_pi05_multitask_1update.yaml \
   --mode train \
-  --run-id rl_real5_1update
+  --run-id openrlhf_multitask_1update
 ```
 
 RL run 目录：
@@ -208,17 +208,12 @@ RL run 目录：
 ```text
 runs/rl/<run_id>/
   resolved_config.yaml
-  manifest.json
-  preflight_report.json
   events.jsonl
-  git_status.txt
-  git_diff.patch
   logs/
   trajectories/
   rewards/
   artifacts/
   checkpoints/
-  env/
 ```
 
 RL 细节见 [Agent RL 训练与奖励系统](handoff/rl_training_and_rewards.md)。

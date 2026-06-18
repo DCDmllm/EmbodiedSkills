@@ -143,17 +143,12 @@ Expected contents:
 
 ```text
 resolved_config.yaml
-manifest.json
-preflight_report.json
-events.jsonl
-git_status.txt
-git_diff.patch
 logs/
-trajectories/
-rewards/
 artifacts/
 checkpoints/
-env/
+events.jsonl                # train mode, written after episodes start
+trajectories/               # train mode episode result JSON
+rewards/                    # train mode reward JSONL
 ```
 
 Generated run directories, Hydra outputs, logs, checkpoints, W&B output, and pycache are ignored by git.
@@ -167,16 +162,17 @@ cd /mnt/wangwai/vla/clawvla
 PYTHONPATH=src /mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python -m pytest tests/test_rl_framework.py -q
 ```
 
-The current tests cover config loading, reward registry failure behavior, policy proxy tracing, multimodal adapter payloads, response masks, terminal penalties, runtime env setup, and state placeholder rejection.
+The current tests cover config loading, reward registry behavior, policy proxy tracing, multimodal adapter payloads, call-level OpenRLHF samples, terminal penalties, runtime env setup, and state placeholder rejection.
 
 ## Verified State
 
 Verified:
 
 - Real multimodal payload reaches the adapter.
-- Response mask trains only model output tokens.
+- `action_ranges` train only model output tokens.
 - Overflow is explicit, not silently truncated.
-- A real five-step, one-update run completed with nonzero actor gradient.
+- OpenRLHF dry-run generates the 50-task prompt dataset and command successfully.
+- A real five-step one-update run reached the trainer; that short smoke had uniform negative rewards, so it validated infrastructure rather than learning signal.
 - Generated files are archived into run directories and ignored by git.
 
 Not yet fully verified:

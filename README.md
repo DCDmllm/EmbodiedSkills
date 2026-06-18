@@ -157,16 +157,16 @@ scripts/run_clawvla_rl.sh
 - 训练一个统一 VLM policy；`vision/scheduler/verifier/recovery` 都走同一个 policy。
 - OpenPI/pi0.5 冻结，只作为动作 backend。
 - 训练样本保留真实图文输入；有 image ref 但没有 multimodal payload 会直接报错。
-- loss mask 只覆盖模型输出 token；工具返回、环境状态、skill 结果不进 loss。
+- `action_ranges` 只覆盖模型输出 token；工具返回、环境状态、skill 结果不作为 action token 训练。
 - 超长 prompt/response 不静默截断，配置不够会显式失败。
-- 未配置 reward 的任务会在 preflight 失败，不做未知任务静默 fallback。
+- 50 个 RoboTwin 任务已在 `configs/rl/rewards/robotwin.yaml` 映射到 reward handler。
 
 常用入口：
 
 ```bash
 cd /mnt/wangwai/vla/clawvla
-./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_grpo.yaml --mode dry-run
-./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_real_5step_1update.yaml --mode train --run-id rl_real5_1update
+./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_multitask_1update.yaml --mode dry-run
+./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_multitask_1update.yaml --mode train --run-id openrlhf_multitask_1update
 ```
 
 更完整说明见 [docs/agent_rl.md](docs/agent_rl.md)。

@@ -111,10 +111,11 @@ step_cost
 incomplete_episode_penalty
 invalid_decision_penalty
 skill_failure_penalty
+recoverable_preflight_penalty
 infra_failure_reward
 ```
 
-`task_map` 必须显式把 task name 映射到 reward handler。没有映射会在 RL preflight 阶段失败。
+`task_map` 必须显式把 task name 映射到 reward handler。当前 `configs/rl/rewards/robotwin.yaml` 已把 50 个 RoboTwin task 映射到 `robotwin` handler。
 
 ### OpenRLHFConfig
 
@@ -213,34 +214,35 @@ OpenRLHF 通过 `AgentExecutor` 回调真实 RoboTwin episode。
 
 ## Run Archive
 
-`create_run_archive()` 会创建：
+`openrlhf_runner` 会创建：
 
 ```text
 runs/rl/<run_id>/
   logs/
-  trajectories/
-  rewards/
-  checkpoints/
   artifacts/
-  env/
+  checkpoints/
   resolved_config.yaml
-  manifest.json
-  git_status.txt
-  git_diff.patch
-  preflight_report.json
-  events.jsonl
 ```
 
-`manifest.json` 保存：
+其中：
 
-- run_id
-- mode
-- created_at
-- command
-- cwd
-- config
+- `artifacts/openrlhf_prompts.jsonl` 是 OpenRLHF prompt dataset。
+- `logs/openrlhf_train.log` 是 OpenRLHF train 模式日志。
+- `checkpoints/` 是 OpenRLHF checkpoint 输出目录。
+- `resolved_config.yaml` 是合并 `extends` 后的训练配置。
 
-`events.jsonl` 是 RL 层统一事件流，包括 archive、preflight、policy proxy、episode start/finish、subprocess start/finish、episode records。
+train 模式里，每个真实 RoboTwin episode 还会由 rollout worker 写入：
+
+```text
+runs/rl/<run_id>/
+  events.jsonl
+  logs/<episode>_agent.log
+  trajectories/<episode>_result.json
+  rewards/<episode>_rewards.jsonl
+  artifacts/<episode>/
+```
+
+`events.jsonl` 是 RL 层统一事件流，包括 policy proxy、episode start/finish、subprocess start/finish 和 episode records。
 
 ## Policy Proxy
 
@@ -304,33 +306,34 @@ class AgentExecutor(AgentExecutorBase)
 6. 每条样本写入 `observation_tokens`、`action_ranges`、`mm_train_inputs`、`reward/scores` 和 group metadata。
 7. 返回 `list[dict]` 给 OpenRLHF。
 
-## 轨迹 Adapter 与 Mask
+## 轨迹 Adapter 与 Action Ranges
 
 `src/clawvla/rl/trajectory.py`
 
-`build_policy_call_adapter(policy_call)`：
+`build_policy_call_adapter(policy_call)` 是底层 helper：
 
 - 每次 policy call 单独保留自己的 `prompt_ids` 和 `response_ids`。
-- `response_mask` 长度等于该 call 的 response，全部为 1。
-- OpenRLHF 样本里的 `action_ranges` 只覆盖 `response_ids` 对应范围。
+- helper 内部的 `response_mask` 长度等于该 call 的 response，全部为 1。
+- OpenRLHF 正式训练样本使用 `action_ranges`，只覆盖 `response_ids` 对应范围。
 - OpenRLHF 路径没有 logprobs 时交给框架重新算。
 
-结果：
+OpenRLHF 训练样本实际由 `openrlhf_agent._episode_to_call_samples()` 生成，关键字段是：
 
 ```python
 {
-  "prompt_ids": [...],
-  "response_ids": [...],
-  "response_mask": [...],
-  "response_logprobs": [...]
+  "observation_tokens": prompt_ids + response_ids,
+  "action_ranges": [(len(prompt_ids), len(prompt_ids) + len(response_ids))],
+  "images": [...],
+  "mm_train_inputs": ...,
+  "reward": episode_reward,
+  "scores": episode_reward,
+  "extra_logs": {
+    "clawvla_group_uid": ...,
+    "clawvla_episode_uid": ...,
+    "clawvla_call_index": ...,
+    "clawvla_policy_calls": ...
+  }
 }
-```
-
-每条 call adapter 还会携带：
-
-```text
-multi_modal_data
-mm_processor_kwargs
 ```
 
 如果某次 call 有 `image_refs` 但没有训练所需的 multimodal payload，且 `require_multimodal_payload=True`，会直接抛错。也就是说，训练输入必须保留真实图像 tensor/payload，不允许只记录图片路径再做纯文本训练。
@@ -382,13 +385,14 @@ episode reward 来源：
    - incomplete episode penalty
    - invalid decision penalty
    - skill failure penalty
+   - recoverable preflight penalty
 3. 如果 episode.status 是 `finished` 且没有 step reward，初始 reward_score 会是 0.0；最终仍会追加 terminal reward。
 
-`ClawVLAAgentLoop._episode_reward()`：
+`openrlhf_agent._episode_reward()`：
 
 - 如果 episode 是 `infra_failure`，抛错并排除在 policy update 之外。
 - 如果 episode.reward_score 存在，直接用 archived score。
-- 否则根据 invalid decision / skill failure 计算 penalty。
+- 否则根据 invalid decision / skill failure 计算 fallback penalty。
 
 ## Reward Registry
 
@@ -423,7 +427,7 @@ clawvla.rl.reward_registry:register_builtin_robotwin
 
 RoboTwin 可用的任务环境、actor、gripper 和接触接口见 [RoboTwin 奖励接口速查](robotwin_reward_interfaces.md)。
 
-`RewardRegistry.handler_for_task(task_name)` 对未配置 task 抛 `KeyError`。RL preflight 会检查当前 rollout task 是否已配置。
+`RewardRegistry.handler_for_task(task_name)` 对未配置 task 抛 `KeyError`。当前 50 任务配置已经显式映射；新增 task 时必须同步更新 `configs/rl/rewards/robotwin.yaml`。
 
 ## RoboTwin Reward Families
 
@@ -572,7 +576,7 @@ task_success
 
 ### terminal_only
 
-`compute_robotwin_reward()` 内部保留 terminal-only 计算路径：step cost + task success bonus。RL preflight 当前要求 task_map 显式配置，未知任务会在训练入口报错。
+`compute_robotwin_reward()` 内部保留 terminal-only 计算路径：step cost + task success bonus。未知任务不会走隐式 fallback；新增 task 必须显式配置 reward handler。
 
 ## 添加新 RoboTwin 奖励
 
@@ -596,42 +600,15 @@ Dry run：
 
 ```bash
 ./scripts/run_clawvla_rl.sh \
-  --config configs/rl/qwen3vl_pi05_grpo.yaml \
+  --config configs/rl/qwen3vl_pi05_multitask_1update.yaml \
   --mode dry-run
 ```
 
-Rollout-only static smoke：
+真实 50 任务 one-update smoke：
 
 ```bash
 ./scripts/run_clawvla_rl.sh \
-  --config configs/rl/qwen3vl_pi05_rollout_smoke.yaml \
-  --mode rollout-only \
-  --policy-response '{"control":"finish_run","stage":null,"next_component":null,"next_skill":null,"reason":"smoke"}'
-```
-
-Real one-update smoke：
-
-```bash
-./scripts/run_clawvla_rl.sh \
-  --config configs/rl/qwen3vl_pi05_real_5step_1update.yaml \
+  --config configs/rl/qwen3vl_pi05_multitask_1update.yaml \
   --mode train \
-  --run-id rl_real5_1update
-```
-
-Replay adapter：
-
-```bash
-./scripts/run_clawvla_rl.sh \
-  --config configs/rl/qwen3vl_pi05_grpo.yaml \
-  --mode replay-adapter \
-  --replay-path runs/rl/<run_id>/events.jsonl
-```
-
-Replay reward：
-
-```bash
-./scripts/run_clawvla_rl.sh \
-  --config configs/rl/qwen3vl_pi05_grpo.yaml \
-  --mode replay-reward \
-  --replay-path runs/rl/<run_id>/events.jsonl
+  --run-id openrlhf_multitask_1update
 ```

@@ -384,7 +384,7 @@ tests/test_rl_framework.py
 - RL config load。
 - reward registry 未配置任务失败。
 - policy proxy tracing。
-- response mask 只训练模型输出 token。
+- OpenRLHF `action_ranges` 只训练模型输出 token。
 - multimodal payload 顺序和缺失报错。
 - terminal reward penalty。
 - runtime environment env 写入。

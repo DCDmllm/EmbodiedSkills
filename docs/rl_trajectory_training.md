@@ -18,18 +18,18 @@
 - [x] 去掉正式训练路径里的整局串联 adapter。
 - [x] 增加 per-call adapter：每个 `PolicyCallTrace` 独立转换为一个训练样本。
 - [x] 每个 per-call 样本使用真实 `prompt_ids`、`response_ids`、`response_logprobs`、`multi_modal_data`、`mm_processor_kwargs`。
-- [x] 每个 per-call 样本的 `response_mask` 全为 1，只训练模型真实输出。
+- [x] 每个 OpenRLHF per-call 样本的 `action_ranges` 只覆盖模型真实输出。
 - [x] 对 prompt 长度、response 长度、logprob 长度做显式校验。
 - [x] 对图片引用但缺少训练 payload 的情况显式报错。
-- [x] `ClawVLAAgentLoop.run()` 返回 `list[AgentLoopOutput]`，一条 output 对应一次模型调用。
-- [x] `extra_fields` 写入 `episode_id`、`episode_status`、`task_name`、`instruction`、`seed`、`uid`、`traj_uid`、`call_index`、`call_id`、`role`、`policy_calls`。
-- [x] episode 奖励写入每个 call 的 `reward_score`。
+- [x] `OpenRLHF AgentExecutor` 返回 `list[dict]`，一条 sample 对应一次模型调用。
+- [x] `extra_logs` 写入 `clawvla_group_uid`、`clawvla_episode_uid`、`clawvla_call_index`、`clawvla_policy_calls`。
+- [x] episode 奖励写入每个 call sample 的 `reward/scores`。
 - [x] 更新测试，覆盖 per-call 样本、图片 payload、长度校验、训练 loop 不再调用整局串联 adapter。
 - [x] 跑 `tests/test_rl_framework.py`。
 - [x] 跑 RL dry-run。
 
 ## 后续增强
 
-- 将 `uid` 进一步改成稳定的任务实例 id，确保同任务同 seed 的 8 条 rollout 共用同一个 GRPO group。
-- 如果当前 veRL postprocess 对 `list[AgentLoopOutput]` 有遗漏，再补齐 manager/postprocess，而不是退回整局串联。
+- 根据真实训练日志继续确认 `task_name + instruction + seed` 分组在长训里保持稳定。
+- 如果 OpenRLHF 后续版本改变 agent output schema，需要同步更新 `openrlhf_runtime_patches.py`，不能退回整局串联。
 - 评估是否引入 GiGPO 式 step-level credit assignment；默认先使用 episode-level GRPO。
