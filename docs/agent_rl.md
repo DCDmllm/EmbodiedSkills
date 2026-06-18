@@ -27,9 +27,6 @@ robotwin-py312       ClawVLA runtime and RoboTwin rollout process
 openpi-torch-py312   OpenPI/pi0.5 worker process
 ```
 
-The old VERL backend is archived under `src/clawvla/rl/legacy_verl/` and can still be run through
-`scripts/run_clawvla_verl_legacy.sh` for reproduction. New training work should use OpenRLHF.
-
 The processes communicate through subprocesses, HTTP-compatible policy calls, and archived trajectory files. The
 environments are not mixed into one Python runtime.
 
@@ -97,12 +94,6 @@ Main current OpenRLHF config:
 configs/rl/qwen3vl_pi05_multitask_1update.yaml
 ```
 
-Legacy VERL base config:
-
-```text
-configs/rl/qwen3vl_pi05_grpo.yaml
-```
-
 Useful smoke configs:
 
 ```text
@@ -129,12 +120,6 @@ Dry run:
 ```bash
 cd /mnt/wangwai/vla/clawvla
 ./scripts/run_clawvla_rl.sh --mode dry-run
-```
-
-Legacy VERL dry run:
-
-```bash
-./scripts/run_clawvla_verl_legacy.sh --config configs/rl/qwen3vl_pi05_grpo.yaml --mode dry-run
 ```
 
 One-update real multimodal startup check:

@@ -1,8 +1,8 @@
 # Agent RL 训练与奖励系统
 
-当前主训练路径是 OpenRLHF。旧 VERL 版本已归档到 `src/clawvla/rl/legacy_verl/`，回溯说明见 [Legacy VERL RL Backend](../archive/verl_legacy.md)。本文中仍保留的 `verl` 字段名来自历史配置结构，OpenRLHF runner 目前也复用这组 batch/rollout/长度参数。
+当前主训练路径是 OpenRLHF。本文说明当前 `src/clawvla/rl/`、`src/clawvla/rewards/` 和 `configs/rl/` 的结构。
 
-本文说明当前 `src/clawvla/rl/`、`src/clawvla/rewards/` 和 `configs/rl/` 的结构。普通 agent runtime 见 [Runtime 架构与执行循环](runtime_architecture.md)。
+普通 agent runtime 见 [Runtime 架构与执行循环](runtime_architecture.md)。
 
 ## 训练目标
 
@@ -33,7 +33,7 @@ RLConfig:
   policy: PolicyConfig
   rollout: RolloutConfig
   reward: RewardConfig
-  verl: VerlConfig
+  openrlhf: OpenRLHFConfig
   cluster: ClusterConfig
   logging: LoggingConfig
   checkpoint: CheckpointConfig
@@ -100,7 +100,7 @@ openpi_port_base
 start_openpi_worker
 ```
 
-如果配置了 `rollout.tasks`，每个 task/seed 会生成一行 OpenRLHF prompt dataset；否则沿用单任务 `task_name/instruction/episodes/seeds`。`group_size` 和 `verl.rollout_n` 共同决定每个 prompt 的 rollout samples 数；`max_steps` 是 agent loop 最大步数，action horizon 由 motion payload 控制。
+如果配置了 `rollout.tasks`，每个 task/seed 会生成一行 OpenRLHF prompt dataset；否则沿用单任务 `task_name/instruction/episodes/seeds`。`group_size` 和 `openrlhf.rollout_n` 共同决定每个 prompt 的 rollout samples 数；`max_steps` 是 agent loop 最大步数，action horizon 由 motion payload 控制。
 
 ### RewardConfig
 
@@ -116,7 +116,7 @@ infra_failure_reward
 
 `task_map` 必须显式把 task name 映射到 reward handler。没有映射会在 RL preflight 阶段失败。
 
-### VerlConfig
+### OpenRLHFConfig
 
 当前主要参数：
 
@@ -159,7 +159,7 @@ python -m openrlhf.cli.train_ppo_ray
 --actor.gradient_checkpointing_enable
 ```
 
-OpenRLHF runtime patches 会把一个 episode 返回的多条 call-level samples 展平，并按 `task_name + instruction + seed` 做组内 advantage。旧 `runner._verl_train_command()` 只保留在 legacy VERL 路径。
+OpenRLHF runtime patches 会把一个 episode 返回的多条 call-level samples 展平，并按 `task_name + instruction + seed` 做组内 advantage。
 
 ### ClusterConfig
 
@@ -210,14 +210,6 @@ python -m openrlhf.cli.train_ppo_ray ...
 ```
 
 OpenRLHF 通过 `AgentExecutor` 回调真实 RoboTwin episode。
-
-### replay-reward
-
-读取已有 `events.jsonl`，统计 reward record，用于检查归档 reward。
-
-### replay-adapter
-
-读取已有 `events.jsonl`，用 policy calls 重建 response mask，检查 adapter 逻辑。
 
 ## Run Archive
 
@@ -321,7 +313,7 @@ class AgentExecutor(AgentExecutorBase)
 - 每次 policy call 单独保留自己的 `prompt_ids` 和 `response_ids`。
 - `response_mask` 长度等于该 call 的 response，全部为 1。
 - OpenRLHF 样本里的 `action_ranges` 只覆盖 `response_ids` 对应范围。
-- 没有 logprobs 时在 legacy VERL adapter 中填 0.0；OpenRLHF 路径没有 logprobs 时交给框架重新算。
+- OpenRLHF 路径没有 logprobs 时交给框架重新算。
 
 结果：
 

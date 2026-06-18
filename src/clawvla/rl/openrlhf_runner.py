@@ -87,7 +87,7 @@ def _write_prompt_dataset(config: RLConfig, run_dir: Path) -> Path:
 
 def _openrlhf_train_command(config: RLConfig, *, python: Path, run_dir: Path, train_file: Path) -> list[str]:
     policy_gpus = list(config.cluster.policy_gpus)
-    tensor_parallel_size = max(1, int(config.verl.tensor_parallel_size))
+    tensor_parallel_size = max(1, int(config.openrlhf.tensor_parallel_size))
     if len(policy_gpus) % tensor_parallel_size != 0:
         raise ValueError(
             "OpenRLHF policy GPU count must divide tensor_parallel_size: "
@@ -100,11 +100,13 @@ def _openrlhf_train_command(config: RLConfig, *, python: Path, run_dir: Path, tr
             f"policy_gpus={policy_gpus} ds_tensor_parallel_size={ds_tensor_parallel_size}"
         )
     num_engines = max(1, len(policy_gpus) // tensor_parallel_size)
-    group_size = max(1, int(config.rollout.group_size), int(config.verl.rollout_n))
+    group_size = max(1, int(config.rollout.group_size), int(config.openrlhf.rollout_n))
     train_batch_size = group_size
     rollout_batch_size = max(1, config.rollout.episodes)
     prompt_count = len(build_rollout_episode_specs(config))
-    max_len = int(config.verl.max_model_len or config.verl.max_prompt_length + config.verl.max_response_length)
+    max_len = int(
+        config.openrlhf.max_model_len or config.openrlhf.max_prompt_length + config.openrlhf.max_response_length
+    )
     max_new_tokens = int(config.policy.max_new_tokens)
     zero_stage = _openrlhf_zero_stage(config)
     gpu_memory_utilization = _vllm_gpu_memory_utilization(config)
@@ -148,11 +150,11 @@ def _openrlhf_train_command(config: RLConfig, *, python: Path, run_dir: Path, tr
         "--train.micro_batch_size",
         "1",
         "--train.max_tokens_per_gpu",
-        str(int(config.verl.actor_ppo_max_token_len_per_gpu)),
+        str(int(config.openrlhf.actor_ppo_max_token_len_per_gpu)),
         "--train.max_epochs",
         "1",
         "--train.num_episodes",
-        str(max(1, config.verl.total_epochs)),
+        str(max(1, config.openrlhf.total_epochs)),
         "--algo.advantage.estimator",
         "group_norm" if group_size > 1 else "reinforce",
         "--algo.kl.init_coef",
@@ -173,13 +175,13 @@ def _openrlhf_train_command(config: RLConfig, *, python: Path, run_dir: Path, tr
         "--ds.zero_stage",
         "2",
         "--ds.param_dtype",
-        str(config.verl.dtype).replace("bfloat16", "bf16"),
+        str(config.openrlhf.dtype).replace("bfloat16", "bf16"),
         "--ds.attn_implementation",
         attn_implementation,
         "--ds.tensor_parallel_size",
         str(ds_tensor_parallel_size),
         "--actor.adam.lr",
-        str(config.verl.learning_rate),
+        str(config.openrlhf.learning_rate),
         "--ckpt.output_dir",
         str(run_dir / "checkpoints"),
         "--ckpt.path",
@@ -195,11 +197,11 @@ def _openrlhf_train_command(config: RLConfig, *, python: Path, run_dir: Path, tr
     ]
     if _env_bool("CLAWVLA_OPENRLHF_VLLM_ENABLE_SLEEP", default=True):
         command.append("--vllm.enable_sleep")
-    if _env_bool("CLAWVLA_OPENRLHF_DS_ENABLE_SLEEP", default=bool(config.verl.fsdp_param_offload)):
+    if _env_bool("CLAWVLA_OPENRLHF_DS_ENABLE_SLEEP", default=bool(config.openrlhf.fsdp_param_offload)):
         command.append("--ds.enable_sleep")
-    if _env_bool("CLAWVLA_OPENRLHF_ADAM_OFFLOAD", default=bool(config.verl.fsdp_optimizer_offload)):
+    if _env_bool("CLAWVLA_OPENRLHF_ADAM_OFFLOAD", default=bool(config.openrlhf.fsdp_optimizer_offload)):
         command.append("--ds.adam_offload")
-    if _env_bool("CLAWVLA_OPENRLHF_GRADIENT_CHECKPOINTING", default=bool(config.verl.gradient_checkpointing)):
+    if _env_bool("CLAWVLA_OPENRLHF_GRADIENT_CHECKPOINTING", default=bool(config.openrlhf.gradient_checkpointing)):
         command.append("--actor.gradient_checkpointing_enable")
     grad_accum_dtype = os.environ.get("CLAWVLA_OPENRLHF_GRAD_ACCUM_DTYPE")
     if grad_accum_dtype:
@@ -212,8 +214,8 @@ def _openrlhf_train_command(config: RLConfig, *, python: Path, run_dir: Path, tr
     zero_stage_index = command.index("--ds.zero_stage") + 1
     command[zero_stage_index] = str(zero_stage)
 
-    if config.verl.train_mode == "lora":
-        target_modules = _lora_target_modules(config.verl.lora_target_modules)
+    if config.openrlhf.train_mode == "lora":
+        target_modules = _lora_target_modules(config.openrlhf.lora_target_modules)
         command.extend(
             [
                 "--ds.lora.rank",
@@ -235,7 +237,7 @@ def _openrlhf_zero_stage(config: RLConfig) -> int:
     override = os.environ.get("CLAWVLA_OPENRLHF_ZERO_STAGE")
     if override is not None:
         return int(override)
-    return 3 if config.verl.train_mode == "full" else 2
+    return 3 if config.openrlhf.train_mode == "full" else 2
 
 
 def _openrlhf_ds_tensor_parallel_size(config: RLConfig) -> int:
@@ -250,7 +252,7 @@ def _openrlhf_attn_implementation(config: RLConfig) -> str:
     override = os.environ.get("CLAWVLA_OPENRLHF_ATTN_IMPLEMENTATION")
     if override:
         return override
-    return "flash_attention_2" if config.verl.flash_attention else "eager"
+    return "flash_attention_2" if config.openrlhf.flash_attention else "eager"
 
 
 def _env_bool(name: str, *, default: bool) -> bool:
@@ -264,8 +266,8 @@ def _vllm_gpu_memory_utilization(config: RLConfig) -> float:
     override = os.environ.get("CLAWVLA_OPENRLHF_VLLM_GPU_MEMORY_UTILIZATION")
     if override is not None:
         return float(override)
-    cap = 0.5 if int(config.verl.tensor_parallel_size) == 1 else 0.25
-    return min(float(config.verl.gpu_memory_utilization), cap)
+    cap = 0.5 if int(config.openrlhf.tensor_parallel_size) == 1 else 0.25
+    return min(float(config.openrlhf.gpu_memory_utilization), cap)
 
 
 def _openrlhf_env(config: RLConfig, run_dir: Path, resolved_config_path: Path) -> dict[str, str]:

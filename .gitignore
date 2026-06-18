@@ -45,6 +45,7 @@ slurm-*.out
 
 # Local dependency scratch space
 .deps/
+.local_archive/
 .venv-openrlhf-py310/
 .venv-openrlhf-py310-cu128/
 

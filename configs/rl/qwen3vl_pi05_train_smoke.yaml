@@ -14,7 +14,7 @@ rollout:
   episode_timeout_s: 600.0
   start_openpi_worker: false
 
-verl:
+openrlhf:
   train_mode: full
   lora_merge_for_rollout: false
   force_full_gpu_workers: false
@@ -50,4 +50,4 @@ checkpoint:
   keep_last: 1
 
 metadata:
-  notes: Minimal real verl train smoke. RoboTwin/OpenPI disabled; validates training loop wiring.
+  notes: Minimal real OpenRLHF train smoke. RoboTwin/OpenPI disabled; validates training loop wiring.

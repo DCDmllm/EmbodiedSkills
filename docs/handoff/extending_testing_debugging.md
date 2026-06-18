@@ -617,11 +617,9 @@ worker health 请求是 socket JSON：
 
 ```text
 OpenRLHF policy prompt exceeds configured max_length
-agent adapter response exceeds configured verl response length
-agent adapter prompt exceeds configured verl prompt length
 ```
 
-说明单次 policy call 或 legacy VERL adapter 超过配置长度。当前代码把超长样本视为配置错误，因为截断会破坏训练数据。处理方式：
+说明单次 policy call 超过配置长度。当前代码把超长样本视为配置错误，因为截断会破坏训练数据。处理方式：
 
 - 提高对应长度。
 - 减少 rollout max_steps。

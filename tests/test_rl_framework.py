@@ -40,12 +40,6 @@ from clawvla.rl.openrlhf_runtime_patches import (
     _shape_episode_rewards,
 )
 from clawvla.rl.rollout_worker import _append_episode_terminal_reward
-from clawvla.rl.runner import VERL_TRAINER_MODULE, _verl_train_command
-from clawvla.rl.verl_agent_loop import (
-    _build_policy_call_outputs,
-    _episode_reward,
-    _validate_single_generation_length,
-)
 from clawvla.rl.policy_proxy import PolicyProxy, StaticPolicyBackend
 from clawvla.rl.reward_registry import build_reward_registry
 from clawvla.scripts.run_loop import _apply_runtime_environment
@@ -74,16 +68,6 @@ from clawvla.rl.trajectory import (
 )
 
 
-class DummyAgentLoopMetrics:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-class DummyAgentLoopOutput:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
 def _import_openrlhf_agent_with_fakes(monkeypatch):
     openrlhf_module = types.ModuleType("openrlhf")
     openrlhf_module.__path__ = []
@@ -109,11 +93,11 @@ def test_load_default_rl_config() -> None:
     config = load_rl_config("configs/rl/qwen3vl_pi05_grpo.yaml")
     assert config.policy.model_path.endswith("Qwen3-VL-8B-Instruct")
     assert config.reward.task_map["place_container_plate"] == "robotwin"
-    assert config.verl.algorithm == "grpo"
-    assert config.verl.train_mode == "full"
-    assert config.verl.lora_merge_for_rollout is False
-    assert config.verl.force_full_gpu_workers is False
-    assert config.verl.lora_target_modules == [
+    assert config.openrlhf.algorithm == "grpo"
+    assert config.openrlhf.train_mode == "full"
+    assert config.openrlhf.lora_merge_for_rollout is False
+    assert config.openrlhf.force_full_gpu_workers is False
+    assert config.openrlhf.lora_target_modules == [
         "q_proj",
         "k_proj",
         "v_proj",
@@ -217,55 +201,6 @@ def test_policy_call_adapter_requires_image_training_payload() -> None:
 
     with pytest.raises(ValueError, match="did not carry training multi_modal_data"):
         build_policy_call_adapter(call)
-
-
-def test_verl_outputs_use_one_training_item_per_policy_call() -> None:
-    episode = EpisodeRecord.new(
-        task_name="place_container_plate",
-        instruction="place the container on the plate",
-        seed=123,
-    )
-    episode.status = "finished"
-
-    first = PolicyCallTrace.new(role="vision", model="m:vision", messages=[], image_refs=["first.png"])
-    first.prompt_ids = [1, 2]
-    first.response_ids = [3]
-    first.response_logprobs = [-0.3]
-    first._clawvla_multi_modal_data = {"images": ["image-first"]}
-    first._clawvla_mm_processor_kwargs = {"max_pixels": 1024}
-
-    second = PolicyCallTrace.new(role="scheduler", model="m:scheduler", messages=[], image_refs=[])
-    second.prompt_ids = [4, 5]
-    second.response_ids = [6, 7]
-    second.response_logprobs = [-0.6, -0.7]
-
-    episode.policy_calls = [first, second]
-
-    outputs = _build_policy_call_outputs(
-        episode=episode,
-        reward_score=1.5,
-        metrics={"generate_sequences": 0.0, "tool_calls": 1.0, "compute_score": 0.0, "num_preempted": -1},
-        prompt_length=16,
-        response_length=16,
-        agent_loop_output_cls=DummyAgentLoopOutput,
-        agent_loop_metrics_cls=DummyAgentLoopMetrics,
-        kwargs={"uid": "task-seed-group", "session_id": 2},
-    )
-
-    assert len(outputs) == 2
-    assert outputs[0].prompt_ids == [1, 2]
-    assert outputs[0].response_ids == [3]
-    assert outputs[0].response_mask == [1]
-    assert outputs[0].multi_modal_data == {"images": ["image-first"]}
-    assert outputs[0].mm_processor_kwargs == {"max_pixels": 1024}
-    assert outputs[1].prompt_ids == [4, 5]
-    assert outputs[1].response_ids == [6, 7]
-    assert outputs[1].response_mask == [1, 1]
-    assert outputs[1].multi_modal_data is None
-    assert outputs[1].reward_score == 1.5
-    assert outputs[1].extra_fields["trajectory_group_id"] == "task-seed-group"
-    assert outputs[1].extra_fields["traj_uid"] == episode.episode_id
-    assert outputs[1].extra_fields["call_index"] == 1
 
 
 def test_openrlhf_outputs_use_one_training_item_per_policy_call(monkeypatch) -> None:
@@ -590,20 +525,6 @@ def test_openrlhf_env_removes_expandable_segments_when_vllm_sleep_is_enabled(tmp
     assert env["RAY_CGRAPH_get_timeout"] == "300"
 
 
-def test_train_command_uses_multi_output_verl_entrypoint(tmp_path) -> None:
-    config = load_rl_config("configs/rl/qwen3vl_pi05_train_smoke.yaml")
-    command = _verl_train_command(
-        config,
-        tmp_path,
-        tmp_path / "train.jsonl",
-        tmp_path / "val.jsonl",
-        tmp_path / "agent_loop.yaml",
-        tmp_path / "resolved_config.yaml",
-    )
-
-    assert command[:3] == [config.trainer.python, "-m", VERL_TRAINER_MODULE]
-
-
 def test_max_steps_result_keeps_failure_visible() -> None:
     loop = AgentLoop.__new__(AgentLoop)
     loop.config = AgentLoopConfig(max_steps=1)
@@ -717,30 +638,6 @@ def test_terminal_reward_lightly_penalizes_recoverable_preflight_refresh(tmp_pat
     assert payload["reward"]["metrics"]["failed_skills"] == 0.0
     assert payload["reward"]["metrics"]["recoverable_preflight_failures"] == 1.0
     assert payload["reward"]["events"]["recoverable_preflight_failure_seen"] is True
-
-
-def test_episode_reward_uses_archived_score_without_double_counting() -> None:
-    episode = EpisodeRecord.new(task_name="place_container_plate", instruction="place the container on the plate")
-    episode.status = "max_steps_reached_with_failures"
-    episode.reward_score = -3.0
-    episode.skill_calls = [
-        SkillCallTrace(
-            step_index=0,
-            stage="observe",
-            component="scheduler",
-            skill="choose_next_skill",
-            status="invalid_decision",
-            success=False,
-        )
-    ]
-
-    assert _episode_reward(episode, invalid_decision_penalty=-2.0, skill_failure_penalty=-1.0) == -3.0
-
-
-def test_single_policy_generation_over_response_length_errors() -> None:
-    _validate_single_generation_length(token_count=4, response_length=4)
-    with pytest.raises(ValueError, match="single policy generation exceeds configured verl response length"):
-        _validate_single_generation_length(token_count=5, response_length=4)
 
 
 def test_run_loop_applies_runtime_environment(monkeypatch) -> None:

@@ -1,7 +1,7 @@
 name: qwen3vl_pi05_grpo
 
 trainer:
-  python: /mnt/wangwai/miniconda3/envs/verl-0.8-py310/bin/python
+  python: /mnt/wangwai/vla/clawvla/.venv-openrlhf-py310-cu128/bin/python
   cwd: /mnt/wangwai/vla/clawvla
   env:
     PYTHONPATH: /mnt/wangwai/vla/clawvla/src
@@ -75,8 +75,8 @@ reward:
   recoverable_preflight_penalty: -0.1
   infra_failure_reward: null
 
-verl:
-  env: verl-0.8-py310
+openrlhf:
+  env: openrlhf-py310-cu128
   algorithm: grpo
   train_mode: full
   lora_merge_for_rollout: false

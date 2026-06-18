@@ -77,8 +77,8 @@ class RewardConfig:
 
 
 @dataclass
-class VerlConfig:
-    env: str = "verl-0.8-py310"
+class OpenRLHFConfig:
+    env: str = "openrlhf-py310-cu128"
     algorithm: str = "grpo"
     train_mode: str = "full"
     lora_merge_for_rollout: bool = False
@@ -148,7 +148,9 @@ class RLConfig:
     name: str = "qwen3vl_pi05_grpo"
     run_id: str | None = None
     trainer: EnvCommandConfig = field(
-        default_factory=lambda: EnvCommandConfig(python="/mnt/wangwai/miniconda3/envs/verl-0.8-py310/bin/python")
+        default_factory=lambda: EnvCommandConfig(
+            python="/mnt/wangwai/vla/clawvla/.venv-openrlhf-py310-cu128/bin/python"
+        )
     )
     robotwin: EnvCommandConfig = field(
         default_factory=lambda: EnvCommandConfig(
@@ -173,7 +175,7 @@ class RLConfig:
         )
     )
     reward: RewardConfig = field(default_factory=RewardConfig)
-    verl: VerlConfig = field(default_factory=VerlConfig)
+    openrlhf: OpenRLHFConfig = field(default_factory=OpenRLHFConfig)
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
@@ -229,7 +231,7 @@ def _rl_config(payload: dict[str, Any]) -> RLConfig:
         policy=_dataclass_from_dict(PolicyConfig, payload.get("policy"), RLConfig().policy),
         rollout=rollout,
         reward=_dataclass_from_dict(RewardConfig, payload.get("reward"), RLConfig().reward),
-        verl=_dataclass_from_dict(VerlConfig, payload.get("verl"), RLConfig().verl),
+        openrlhf=_dataclass_from_dict(OpenRLHFConfig, payload.get("openrlhf"), RLConfig().openrlhf),
         cluster=_dataclass_from_dict(ClusterConfig, payload.get("cluster"), RLConfig().cluster),
         logging=_dataclass_from_dict(LoggingConfig, payload.get("logging"), RLConfig().logging),
         checkpoint=_dataclass_from_dict(CheckpointConfig, payload.get("checkpoint"), RLConfig().checkpoint),

@@ -42,7 +42,7 @@ src/clawvla/
   envs/                      # RoboTwin session 和 observation/action adapter
   action_backends/           # pi0.5/OpenPI action backend
   scripts/                   # 普通 agent、vLLM、OpenPI worker、smoke/probe 脚本
-  rl/                        # OpenRLHF GRPO runner、policy proxy、trajectory adapter；旧 VERL 在 legacy_verl/
+  rl/                        # OpenRLHF GRPO runner、policy proxy、trajectory adapter
   rewards/                   # RoboTwin reward snapshot / dense reward families
 ```
 
@@ -79,9 +79,6 @@ openpi-torch-py312
 
 .venv-openrlhf-py310-cu128
   当前 Agent RL 训练环境，使用 OpenRLHF + vLLM + DeepSpeed + flash-attn。
-
-verl-0.8-py310
-  旧 VERL 训练环境，仅用于 legacy 复现。旧代码已归档到 `src/clawvla/rl/legacy_verl/`。
 ```
 
 普通 agent 运行通常是 `robotwin-py312 + vllm + openpi-torch-py312` 三个进程族配合。RL 训练当前由 OpenRLHF 环境启动，再通过子进程跑 `robotwin-py312` rollout 和 `openpi-torch-py312` worker。

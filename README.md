@@ -146,7 +146,7 @@ terminal 只显示 Rich trace 和关键事件；完整 JSON 写入文件。
 RL 训练代码是项目的一部分，位于：
 
 ```text
-src/clawvla/rl/          # verl GRPO runner、agent loop adapter、policy proxy、trajectory archive
+src/clawvla/rl/          # OpenRLHF GRPO runner、agent executor、policy proxy、trajectory archive
 src/clawvla/rewards/     # RoboTwin reward snapshot / dense reward
 configs/rl/              # 训练、smoke、reward、cluster 配置
 scripts/run_clawvla_rl.sh

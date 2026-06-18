@@ -21,7 +21,7 @@ cluster:
     - 7
   ray_num_workers: 4
 
-verl:
+openrlhf:
   tensor_parallel_size: 2
   max_model_len: 32768
   max_num_batched_tokens: 32768

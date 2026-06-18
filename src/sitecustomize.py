@@ -94,23 +94,6 @@ def _install_transformers_tokenizer_compat() -> None:
         Qwen3VLTextConfig.tie_word_embeddings = False
 
 
-def _apply_loaded_verl_patches() -> None:
-    global _PATCHING
-    if _PATCHING:
-        return
-    _PATCHING = True
-    try:
-        from clawvla.rl.verl_runtime_patches import apply_verl_runtime_patches
-
-        apply_verl_runtime_patches()
-    except Exception as exc:
-        if os.environ.get("CLAWVLA_VERL_RUNTIME_PATCHES_STRICT") == "1":
-            raise
-        print(f"clawvla verl runtime patch unavailable: {type(exc).__name__}: {exc}")
-    finally:
-        _PATCHING = False
-
-
 def _apply_loaded_openrlhf_patches() -> None:
     global _PATCHING
     if _PATCHING:
@@ -132,12 +115,6 @@ def _clawvla_import_hook(name, globals=None, locals=None, fromlist=(), level=0):
     module = _ORIGINAL_IMPORT(name, globals, locals, fromlist, level)
     if (
         level == 0
-        and os.environ.get("CLAWVLA_ENABLE_VERL_RUNTIME_PATCHES") == "1"
-        and (name == "verl" or name.startswith("verl."))
-    ):
-        _apply_loaded_verl_patches()
-    if (
-        level == 0
         and os.environ.get("CLAWVLA_ENABLE_OPENRLHF_RUNTIME_PATCHES") == "1"
         and (name == "openrlhf" or name.startswith("openrlhf."))
     ):
@@ -145,17 +122,10 @@ def _clawvla_import_hook(name, globals=None, locals=None, fromlist=(), level=0):
     return module
 
 
-if (
-    os.environ.get("CLAWVLA_ENABLE_VERL_RUNTIME_PATCHES") == "1"
-    or os.environ.get("CLAWVLA_ENABLE_OPENRLHF_RUNTIME_PATCHES") == "1"
-):
+if os.environ.get("CLAWVLA_ENABLE_OPENRLHF_RUNTIME_PATCHES") == "1":
     _install_flash_attn_padding_fallback()
     _install_transformers_tokenizer_compat()
     builtins.__import__ = _clawvla_import_hook
-    if os.environ.get("CLAWVLA_ENABLE_VERL_RUNTIME_PATCHES") == "1" and any(
-        name == "verl" or name.startswith("verl.") for name in sys.modules
-    ):
-        _apply_loaded_verl_patches()
     if os.environ.get("CLAWVLA_ENABLE_OPENRLHF_RUNTIME_PATCHES") == "1" and any(
         name == "openrlhf" or name.startswith("openrlhf.") for name in sys.modules
     ):

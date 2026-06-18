@@ -15,7 +15,7 @@ rollout:
   episode_timeout_s: 900.0
   openpi_port_base: 9165
 
-verl:
+openrlhf:
   train_mode: full
   lora_merge_for_rollout: false
   force_full_gpu_workers: false
