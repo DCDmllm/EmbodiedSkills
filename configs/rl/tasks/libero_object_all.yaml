@@ -1,0 +1,52 @@
+rollout:
+  tasks:
+    - task_name: libero_object_0
+      instruction: pick up the alphabet soup and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 0
+    - task_name: libero_object_1
+      instruction: pick up the cream cheese and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 1
+    - task_name: libero_object_2
+      instruction: pick up the salad dressing and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 2
+    - task_name: libero_object_3
+      instruction: pick up the bbq sauce and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 3
+    - task_name: libero_object_4
+      instruction: pick up the ketchup and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 4
+    - task_name: libero_object_5
+      instruction: pick up the tomato sauce and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 5
+    - task_name: libero_object_6
+      instruction: pick up the butter and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 6
+    - task_name: libero_object_7
+      instruction: pick up the milk and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 7
+    - task_name: libero_object_8
+      instruction: pick up the chocolate pudding and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 8
+    - task_name: libero_object_9
+      instruction: pick up the orange juice and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 9

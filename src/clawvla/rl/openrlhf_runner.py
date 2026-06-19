@@ -13,17 +13,44 @@ from .service_pool import run_logged_subprocess
 
 OPENRLHF_TRAINER_MODULE = "openrlhf.cli.train_ppo_ray"
 DEFAULT_OPENRLHF_PYTHON = Path("/mnt/wangwai/vla/clawvla/.venv-openrlhf-py310-cu128/bin/python")
+RL_CONFIG_PRESETS = {
+    "robotwin-multitask": "configs/rl/qwen3vl_pi05_multitask_1update.yaml",
+    "robotwin-real5": "configs/rl/qwen3vl_pi05_real_5step_1update.yaml",
+    "robotwin-real1": "configs/rl/qwen3vl_pi05_real_1update.yaml",
+    "libero-multitask": "configs/rl/qwen3vl_pi05_libero_multitask_1update.yaml",
+    "libero-single": "configs/rl/qwen3vl_pi05_libero_multitask_1update_single_gpu.yaml",
+    "train-smoke": "configs/rl/qwen3vl_pi05_train_smoke.yaml",
+    "rollout-smoke": "configs/rl/qwen3vl_pi05_rollout_smoke.yaml",
+}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run ClawVLA agent RL through OpenRLHF.")
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--mode", choices=["dry-run", "train"], default="dry-run")
-    parser.add_argument("--run-id", default=None)
-    parser.add_argument("--python", default=os.environ.get("CLAWVLA_OPENRLHF_PYTHON", str(DEFAULT_OPENRLHF_PYTHON)))
+    parser = argparse.ArgumentParser(
+        description="Run ClawVLA agent RL through OpenRLHF.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--config", default=os.environ.get("CLAWVLA_RL_CONFIG"), help="RL config YAML path.")
+    parser.add_argument(
+        "--preset",
+        choices=sorted(RL_CONFIG_PRESETS),
+        default=os.environ.get("CLAWVLA_RL_PRESET"),
+        help="Named RL config preset. --config takes precedence when both are set.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["dry-run", "train"],
+        default="dry-run",
+        help="Print command or run training.",
+    )
+    parser.add_argument("--run-id", default=None, help="Run directory name under logging.run_root.")
+    parser.add_argument(
+        "--python",
+        default=os.environ.get("CLAWVLA_OPENRLHF_PYTHON", str(DEFAULT_OPENRLHF_PYTHON)),
+        help="Python executable used to launch OpenRLHF.",
+    )
     args = parser.parse_args()
 
-    config = load_rl_config(args.config)
+    config = load_rl_config(_resolve_config_path(args.config, args.preset))
     run_id = args.run_id or f"{config.resolved_run_id()}_openrlhf"
     run_dir = Path(config.logging.run_root) / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -60,6 +87,25 @@ def main() -> None:
         raise SystemExit(completed.returncode)
 
 
+def _resolve_config_path(config: str | None, preset: str | None) -> Path:
+    if config:
+        return _repo_relative_path(config)
+    if preset:
+        return _repo_relative_path(RL_CONFIG_PRESETS[preset])
+    return _repo_relative_path(RL_CONFIG_PRESETS["robotwin-multitask"])
+
+
+def _repo_relative_path(value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return _repo_root() / path
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
 def _write_prompt_dataset(config: RLConfig, run_dir: Path) -> Path:
     path = run_dir / "artifacts" / "openrlhf_prompts.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,14 +118,15 @@ def _write_prompt_dataset(config: RLConfig, run_dir: Path) -> Path:
                 "seed": spec.seed,
                 "task_name": spec.task_name,
                 "instruction": spec.instruction,
+                "params": dict(spec.params),
             }
             row = {
                 "input": (
-                    "Run one ClawVLA RoboTwin episode. The policy must choose model outputs for "
+                    "Run one ClawVLA embodied-agent episode. The policy must choose model outputs for "
                     f"the task: {spec.instruction}"
                 ),
                 "label": json.dumps(label, ensure_ascii=True),
-                "datasource": "clawvla_robotwin",
+                "datasource": "clawvla_environment",
             }
             handle.write(json.dumps(row, ensure_ascii=True) + "\n")
     return path

@@ -76,6 +76,54 @@ def register_builtin_robotwin(registry: RewardRegistry) -> None:
     registry.register(RewardHandler("robotwin", snapshot=snapshot, compute=compute))
 
 
+def register_builtin_libero(registry: RewardRegistry) -> None:
+    from clawvla.rewards.robotwin_reward import RewardResult, RewardSnapshot
+
+    def snapshot(env: Any, blackboard: Any) -> RewardSnapshot:
+        _ = blackboard
+        if env is None or not hasattr(env, "task_status"):
+            raise RuntimeError("LIBERO reward snapshot requires env.task_status().")
+        status = env.task_status()
+        if not isinstance(status, dict):
+            raise RuntimeError("LIBERO env.task_status() must return a dict.")
+        return RewardSnapshot(
+            task_name=str(status.get("task_name") or status.get("task_language") or "libero"),
+            success=status.get("success") if isinstance(status.get("success"), bool) else None,
+            metadata=dict(status),
+        )
+
+    def compute(before: RewardSnapshot, after: RewardSnapshot, context: dict[str, Any]) -> RewardResult:
+        step_cost = float(context.get("step_cost", 0.05))
+        task_name = str(context.get("task_name") or after.task_name or before.task_name or "libero")
+        success = bool(after.success)
+        newly_successful = success and not bool(before.success)
+        reward = -step_cost
+        if newly_successful:
+            reward += 10.0
+        elif success:
+            reward += 2.0
+        return RewardResult(
+            reward=reward,
+            events={
+                "task_success": success,
+                "new_success": newly_successful,
+                "episode_done": bool(after.metadata.get("done")),
+            },
+            metrics={
+                "step_count": float(after.metadata.get("step_count") or 0.0),
+                "env_reward": float(after.metadata.get("reward") or 0.0)
+                if after.metadata.get("reward") is not None
+                else None,
+            },
+            milestones={"task_success": success},
+            reason="libero_success_delta" if newly_successful else "libero_step",
+            family="libero_terminal",
+            task_name=task_name,
+        )
+
+    registry.register(RewardHandler("libero", snapshot=snapshot, compute=compute))
+
+
 def reward_record_from_result(step_index: int | None, result: Any) -> RewardRecord:
     payload = result.to_dict() if hasattr(result, "to_dict") else dict(result)
     return RewardRecord(

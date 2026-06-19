@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 from clawvla.notices import emit_runtime_event, emit_status_notice
-from clawvla.rewards.robotwin_reward import compute_robotwin_reward, snapshot_robotwin_task
+from clawvla.rl.reward_registry import build_reward_registry
 
 
 class RuntimeRewardTracker:
@@ -17,10 +17,21 @@ class RuntimeRewardTracker:
     events and written to JSONL; they are not converted into successful rewards.
     """
 
-    def __init__(self, *, task_name: str, output_path: str | Path, step_cost: float = 0.05):
+    def __init__(
+        self,
+        *,
+        task_name: str,
+        output_path: str | Path,
+        step_cost: float = 0.05,
+        registry_imports: list[str] | None = None,
+        task_map: dict[str, str] | None = None,
+    ):
         self.task_name = task_name
         self.output_path = Path(output_path)
         self.step_cost = step_cost
+        imports = registry_imports or ["clawvla.rl.reward_registry:register_builtin_robotwin"]
+        mapping = dict(task_map or {task_name: "robotwin"})
+        self.registry = build_reward_registry(imports, mapping)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         self.output_path.touch(exist_ok=True)
         self._before: dict[int, Any] = {}
@@ -66,7 +77,12 @@ class RuntimeRewardTracker:
             return
         try:
             after = self._snapshot(blackboard)
-            reward = compute_robotwin_reward(before, after, task_name=self.task_name, step_cost=self.step_cost)
+            handler = self.registry.handler_for_task(self.task_name)
+            reward = handler.compute(
+                before,
+                after,
+                {"task_name": self.task_name, "step_cost": self.step_cost, "blackboard": blackboard},
+            )
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
             self._write("reward_compute_failed", {"step_index": step_index, "reason": reason})
@@ -78,10 +94,11 @@ class RuntimeRewardTracker:
                 always=True,
             )
             return
-        self._milestones.update(reward.milestones)
+        reward_payload = reward.to_dict() if hasattr(reward, "to_dict") else dict(reward)
+        self._milestones.update(dict(reward_payload.get("milestones") or {}))
         payload = {
             "step_index": step_index,
-            "reward": reward.to_dict(),
+            "reward": reward_payload,
             "skill_status": getattr(result, "status", None),
         }
         self._write("reward_record", payload)
@@ -89,16 +106,10 @@ class RuntimeRewardTracker:
 
     def _snapshot(self, blackboard: Any) -> Any:
         env = blackboard.read("env_adapter")
-        task_env = None
-        session = getattr(env, "session", None)
-        if session is not None:
-            task_env = getattr(session, "task_env", None)
-        if task_env is None:
-            task_env = getattr(env, "bound_task_env", None)
-        if task_env is None:
-            raise RuntimeError("missing_robotwin_task_env_for_reward")
-        snapshot = snapshot_robotwin_task(task_env, task_name=self.task_name)
-        snapshot.metadata["reward_milestones"] = dict(self._milestones)
+        handler = self.registry.handler_for_task(self.task_name)
+        snapshot = handler.snapshot(env, blackboard)
+        if hasattr(snapshot, "metadata") and isinstance(snapshot.metadata, dict):
+            snapshot.metadata["reward_milestones"] = dict(self._milestones)
         return snapshot
 
     def _write(self, event: str, payload: dict[str, Any]) -> None:

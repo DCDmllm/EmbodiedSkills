@@ -247,7 +247,7 @@ def _validate_action_chunk_report(blackboard: Blackboard) -> dict[str, Any]:
     if not isinstance(commands, list) or not commands:
         errors.append("empty_action_commands")
         commands = []
-    expected_dim = _expected_action_dim(getattr(chunk, "action_type", None))
+    expected_dim = _expected_action_dim(getattr(chunk, "action_type", None), blackboard.read("action_backend"))
     if expected_dim is None:
         errors.append(f"unsupported_action_type:{getattr(chunk, 'action_type', None)}")
 
@@ -297,11 +297,18 @@ def _action_validation_report(
     }
 
 
-def _expected_action_dim(action_type: object | None) -> int | None:
+def _expected_action_dim(action_type: object | None, backend: object | None = None) -> int | None:
+    if backend is not None and hasattr(backend, "action_spec"):
+        spec = backend.action_spec()
+        types = spec.get("types") if isinstance(spec, dict) else None
+        if isinstance(types, dict) and action_type in types:
+            return int(types[action_type])
     if action_type == "qpos":
         return 14
     if action_type == "ee":
         return 16
+    if action_type == "libero_ee_delta":
+        return 7
     return None
 
 

@@ -35,6 +35,7 @@ class RolloutTaskConfig:
     task_name: str
     instruction: str
     seeds: list[int] = field(default_factory=list)
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class RolloutEpisodeSpec:
     task_name: str
     instruction: str
     seed: int
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -53,6 +55,7 @@ class RolloutConfig:
     initial_stage: str = "observe"
     max_steps: int = 25
     run_robotwin: bool = True
+    run_environment: bool | None = None
     episodes: int = 1
     group_size: int = 4
     artifact_prefix: str = "clawvla_rl"
@@ -159,6 +162,13 @@ class RLConfig:
             unset_env=["PYTHONPATH"],
         )
     )
+    environment: EnvCommandConfig = field(
+        default_factory=lambda: EnvCommandConfig(
+            python="/mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python",
+            env={"PYTHONPATH": "/mnt/wangwai/tmp_pytorch3d_target:/mnt/wangwai/vla/clawvla/src"},
+            unset_env=["PYTHONPATH"],
+        )
+    )
     openpi: EnvCommandConfig = field(
         default_factory=lambda: EnvCommandConfig(
             python="/mnt/wangwai/miniconda3/envs/openpi-torch-py312/bin/python",
@@ -227,6 +237,7 @@ def _rl_config(payload: dict[str, Any]) -> RLConfig:
         run_id=payload.get("run_id"),
         trainer=_env_command(payload.get("trainer"), RLConfig().trainer),
         robotwin=_env_command(payload.get("robotwin"), RLConfig().robotwin),
+        environment=_env_command(payload.get("environment"), _env_command(payload.get("robotwin"), RLConfig().environment)),
         openpi=_env_command(payload.get("openpi"), RLConfig().openpi),
         policy=_dataclass_from_dict(PolicyConfig, payload.get("policy"), RLConfig().policy),
         rollout=rollout,
@@ -252,6 +263,7 @@ def build_rollout_episode_specs(config: RLConfig) -> list[RolloutEpisodeSpec]:
                     task_name=task.task_name,
                     instruction=task.instruction,
                     seed=int(seed),
+                    params=dict(task.params),
                 )
             )
     if config.rollout.tasks:
@@ -266,6 +278,7 @@ def build_rollout_episode_specs(config: RLConfig) -> list[RolloutEpisodeSpec]:
             task_name=config.rollout.task_name,
             instruction=config.rollout.instruction,
             seed=int(seeds[index % len(seeds)]),
+            params={},
         )
         for index in range(count)
     ]
@@ -279,6 +292,7 @@ def rollout_tasks(config: RLConfig) -> list[RolloutTaskConfig]:
             task_name=config.rollout.task_name,
             instruction=config.rollout.instruction,
             seeds=list(config.rollout.seeds),
+            params={},
         )
     ]
 
@@ -308,7 +322,14 @@ def _normalize_rollout_tasks(value: object) -> list[RolloutTaskConfig]:
             seeds = [int(seed) for seed in seeds_value]
         else:
             raise TypeError(f"rollout.tasks[{index}].seeds must be a list, got {type(seeds_value).__name__}")
-        tasks.append(RolloutTaskConfig(task_name=task_name, instruction=instruction, seeds=seeds))
+        params_value = item.get("params", {})
+        if params_value is None:
+            params = {}
+        elif isinstance(params_value, dict):
+            params = dict(params_value)
+        else:
+            raise TypeError(f"rollout.tasks[{index}].params must be an object, got {type(params_value).__name__}")
+        tasks.append(RolloutTaskConfig(task_name=task_name, instruction=instruction, seeds=seeds, params=params))
     return tasks
 
 

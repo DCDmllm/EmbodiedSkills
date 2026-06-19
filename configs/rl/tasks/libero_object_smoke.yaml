@@ -1,0 +1,12 @@
+rollout:
+  tasks:
+    - task_name: libero_object_0
+      instruction: pick up the alphabet soup and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 0
+    - task_name: libero_object_1
+      instruction: pick up the cream cheese and place it in the basket
+      params:
+        suite: libero_object
+        task_id: 1

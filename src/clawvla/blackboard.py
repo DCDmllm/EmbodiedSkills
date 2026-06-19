@@ -299,7 +299,7 @@ def _compact_safety_report(value: Any) -> Any:
             "object_binding": _compact_object_binding_check(checks.get("object_binding")),
             "camera_inputs": _compact_camera_check(checks.get("camera_inputs")),
             "robot_state": _compact_named_check(checks.get("robot_state")),
-            "robotwin_env": _compact_named_check(checks.get("robotwin_env")),
+            "environment": _compact_named_check(checks.get("environment") or checks.get("robotwin_env")),
             "action_backend": _compact_action_backend_check(checks.get("action_backend")),
         },
         "metadata": {

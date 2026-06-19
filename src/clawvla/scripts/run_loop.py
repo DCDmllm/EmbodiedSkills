@@ -15,7 +15,7 @@ from typing import Iterator
 from clawvla.artifacts import _jsonable
 from clawvla.config import AgentConfig
 from clawvla.config import load_config
-from clawvla.envs import RoboTwinAdapter
+from clawvla.envs import build_env_adapter, environment_artifact_dir
 from clawvla.notices import emit_status_notice
 from clawvla.runtime import AgentRuntime
 
@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--artifact-prefix", default="agent_loop")
     parser.add_argument("--initial-stage", default="observe")
     parser.add_argument("--max-steps", type=int, default=12)
-    parser.add_argument("--run", action="store_true", help="Instantiate RoboTwin and capture a real initial observation.")
+    parser.add_argument("--run", action="store_true", help="Instantiate the configured environment and capture a real initial observation.")
     parser.add_argument("--initial-observe", action="store_true", help="Run the fixed bootstrap observation before scheduler loop.")
     parser.add_argument("--no-initial-observe", action="store_true", help="Deprecated compatibility flag; bootstrap is off by default.")
     parser.add_argument("--result-output", default=None, help="Path for the final loop JSON. Defaults to tmp_runs/<prefix>_result.json.")
@@ -41,8 +41,9 @@ def main() -> None:
     result_output = Path(args.result_output) if args.result_output else _default_run_path(config, args.artifact_prefix, "result.json")
     with _openpi_worker_lifecycle(config, args.config, args.artifact_prefix):
         runtime = AgentRuntime(config)
-        adapter = RoboTwinAdapter(config.robotwin)
+        adapter = build_env_adapter(config)
         runtime.blackboard.write("env_adapter", adapter)
+        runtime.blackboard.write("run_environment", bool(args.run))
         runtime.blackboard.write("run_robotwin", bool(args.run))
         runtime.blackboard.write("artifact_prefix", args.artifact_prefix)
         runtime.blackboard.task_instruction = args.instruction
@@ -196,7 +197,7 @@ def _parent_death_preexec() -> None:
 
 
 def _default_run_path(config: AgentConfig, artifact_prefix: str, suffix: str) -> Path:
-    run_dir = Path(config.robotwin.artifact_dir).parent / "tmp_runs"
+    run_dir = Path(environment_artifact_dir(config)).parent / "tmp_runs"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir / f"{artifact_prefix}_{suffix}"
 
@@ -229,9 +230,9 @@ def _print_result(runtime: AgentRuntime, loop_payload: dict[str, object], output
     )
 
 
-def _bootstrap_observe(runtime: AgentRuntime, instruction: str, artifact_prefix: str, run_robotwin: bool):
+def _bootstrap_observe(runtime: AgentRuntime, instruction: str, artifact_prefix: str, run_environment: bool):
     payload = {"instruction": instruction, "artifact_prefix": artifact_prefix}
-    if run_robotwin:
+    if run_environment:
         payload["setup"] = True
     capture = runtime.run_skill("vision", "capture_views", payload, stage="observe")
     if not capture.success:
@@ -273,9 +274,16 @@ def _install_rl_reward_tracker(runtime: AgentRuntime, config: AgentConfig) -> No
         return
     from clawvla.rl.reward_tracker import RuntimeRewardTracker
 
-    task_name = os.environ.get("CLAWVLA_RL_TASK_NAME") or config.robotwin.task_name
+    task_name = os.environ.get("CLAWVLA_RL_TASK_NAME") or config.environment.task_name or config.robotwin.task_name
     step_cost = float(os.environ.get("CLAWVLA_RL_STEP_COST") or 0.05)
-    tracker = RuntimeRewardTracker(task_name=task_name, output_path=output_path, step_cost=step_cost)
+    registry_imports, task_map = _reward_registry_from_env() or _reward_registry_defaults(config, task_name)
+    tracker = RuntimeRewardTracker(
+        task_name=task_name,
+        output_path=output_path,
+        step_cost=step_cost,
+        registry_imports=registry_imports,
+        task_map=task_map,
+    )
     runtime.blackboard.write("rl_reward_tracker", tracker, event_type="rl.reward_tracker_installed")
     emit_status_notice(
         "rl_reward_tracker_installed",
@@ -284,6 +292,29 @@ def _install_rl_reward_tracker(runtime: AgentRuntime, config: AgentConfig) -> No
         reason=f"task={task_name} output={output_path}",
         always=True,
     )
+
+
+def _reward_registry_defaults(config: AgentConfig, task_name: str) -> tuple[list[str], dict[str, str]]:
+    env_type = str(config.environment.type or "robotwin").lower()
+    if env_type == "libero":
+        return ["clawvla.rl.reward_registry:register_builtin_libero"], {task_name: "libero"}
+    return ["clawvla.rl.reward_registry:register_builtin_robotwin"], {task_name: "robotwin"}
+
+
+def _reward_registry_from_env() -> tuple[list[str], dict[str, str]] | None:
+    registry_raw = os.environ.get("CLAWVLA_RL_REWARD_REGISTRY")
+    task_map_raw = os.environ.get("CLAWVLA_RL_REWARD_TASK_MAP")
+    if registry_raw is None and task_map_raw is None:
+        return None
+    if registry_raw is None or task_map_raw is None:
+        raise ValueError("CLAWVLA_RL_REWARD_REGISTRY and CLAWVLA_RL_REWARD_TASK_MAP must be set together.")
+    registry = json.loads(registry_raw)
+    task_map = json.loads(task_map_raw)
+    if not isinstance(registry, list) or not all(isinstance(item, str) for item in registry):
+        raise TypeError("CLAWVLA_RL_REWARD_REGISTRY must be a JSON list of import strings.")
+    if not isinstance(task_map, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in task_map.items()):
+        raise TypeError("CLAWVLA_RL_REWARD_TASK_MAP must be a JSON object mapping task names to handler names.")
+    return list(registry), dict(task_map)
 
 
 if __name__ == "__main__":

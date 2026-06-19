@@ -307,7 +307,7 @@ class AgentLoop:
         payload = dict(decision.payload)
         if decision.next_component == "vision" and decision.next_skill == "capture_views":
             payload.setdefault("artifact_prefix", self.runtime.blackboard.read("artifact_prefix") or "agent_loop")
-            if self.runtime.blackboard.read("run_robotwin") and self._robotwin_needs_setup():
+            if self.runtime.blackboard.read("run_environment") and self._environment_needs_setup():
                 payload.setdefault("setup", True)
                 payload.setdefault("instruction", self.runtime.blackboard.task_instruction)
         if decision.next_component == "vision" and decision.next_skill == "refresh_preflight_observation":
@@ -355,12 +355,12 @@ class AgentLoop:
                 result=result,
             )
 
-    def _robotwin_needs_setup(self) -> bool:
+    def _environment_needs_setup(self) -> bool:
         env = self.runtime.blackboard.read("env_adapter")
-        session = getattr(env, "session", None)
-        if session is None:
-            return True
-        return getattr(session, "task_env", None) is None
+        status = env.status() if env is not None and hasattr(env, "status") else {}
+        if isinstance(status, dict) and "needs_setup" in status:
+            return bool(status["needs_setup"])
+        return env is None
 
     def _current_image_paths(self) -> list[str]:
         observation = self.runtime.blackboard.read("observation")
@@ -855,11 +855,11 @@ class AgentLoop:
         if any(error.startswith("missing_target_candidate") or error.startswith("target_") for error in preflight_errors):
             targets.add("plan")
         if preflight_errors & {
-            "robotwin_env_unavailable",
+            "env_unavailable",
             "action_backend_missing",
             "action_backend_disabled",
             "action_backend_pretrained_path_missing",
-        } or any(error.startswith("openpi_worker_") for error in preflight_errors):
+        } or any(error.startswith(("openpi_worker_", "action_backend_")) for error in preflight_errors):
             targets.add("recover")
 
         verification = blackboard.read("last_verification_report")

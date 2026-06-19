@@ -1,10 +1,10 @@
 # ClawVLA Agent RL
 
-This document describes the current RL training scaffold in this repository. It is intentionally explicit about what is verified and what is still incomplete, so uploaded code does not look more finished than it is.
+This document describes the current RL training scaffold in this repository. It records the verified paths, the intended entrypoints, and the remaining validation work.
 
 ## Scope
 
-The RL path trains one unified VLM policy for `vision`, `scheduler`, `verifier`, and `recovery`. RoboTwin supplies the environment, and OpenPI/pi0.5 remains frozen as the low-level action backend.
+The RL path trains one unified VLM policy for `vision`, `scheduler`, `verifier`, and `recovery`. RoboTwin and LIBERO can supply environment rollouts. OpenPI/pi0.5 remains frozen as the low-level action backend.
 
 The implementation is under:
 
@@ -23,7 +23,7 @@ The training stack intentionally uses separate Python environments:
 ```text
 .venv-openrlhf-py310-cu128
                       OpenRLHF / torch / vLLM / DeepSpeed / flash-attn training process
-robotwin-py312       ClawVLA runtime and RoboTwin rollout process
+robotwin-py312       ClawVLA runtime, RoboTwin rollout, and LIBERO rollout process
 openpi-torch-py312   OpenPI/pi0.5 worker process
 ```
 
@@ -33,11 +33,11 @@ environments are not mixed into one Python runtime.
 ## Data Path
 
 During training, OpenRLHF calls `clawvla.rl.openrlhf_agent.AgentExecutor`. One OpenRLHF prompt corresponds to one
-RoboTwin episode.
+environment episode.
 
 For each episode:
 
-1. ClawVLA rollout runs the normal agent loop.
+1. ClawVLA rollout runs the normal agent loop against the configured environment adapter.
 2. VLM calls are routed through the RL policy proxy and OpenRLHF rollout backend.
 3. Each policy call records messages, image references, parsed JSON, token IDs, multimodal payload, and failure state.
 4. The adapter returns one training sample per policy call, with the real call prompt/images, response token range, and
@@ -49,11 +49,17 @@ Training keeps the important invariants:
 - Tool results, environment state, prompts, and skill outputs are context only; they are not trained as action tokens.
 - Image references used by the model must carry real training multimodal payload.
 - Prompt/response overflow raises an error; silent truncation is not allowed.
-- GRPO grouping is by task/instruction/seed, not across unrelated RoboTwin tasks.
+- GRPO grouping is by task/instruction/seed.
+- Mixed text/multimodal training samples are aligned across data-parallel ranks before actor replay-buffer append.
 
 ## Reward
 
-Reward registration is configured in `configs/rl/rewards/robotwin.yaml`.
+Reward registration is configured in:
+
+```text
+configs/rl/rewards/robotwin.yaml
+configs/rl/rewards/libero.yaml
+```
 
 Current dense RoboTwin specs cover these tasks:
 
@@ -72,7 +78,7 @@ blocks_ranking_rgb
 ```
 
 All 50 RoboTwin training tasks are mapped to the `robotwin` reward handler. Tasks without a dedicated dense spec currently
-use the terminal/task-status baseline plus episode penalties.
+use the terminal/task-status baseline plus episode penalties. LIBERO object tasks use the same terminal penalty path plus the LIBERO reward registry hook.
 
 Episode-level penalties are also explicit:
 
@@ -92,6 +98,7 @@ Main current OpenRLHF config:
 
 ```text
 configs/rl/qwen3vl_pi05_multitask_1update.yaml
+configs/rl/qwen3vl_pi05_libero_multitask_1update.yaml
 ```
 
 Useful smoke configs:
@@ -103,6 +110,7 @@ configs/rl/qwen3vl_pi05_rollout_vllm_smoke.yaml
 configs/rl/qwen3vl_pi05_rollout_real_smoke.yaml
 configs/rl/qwen3vl_pi05_real_1update.yaml
 configs/rl/qwen3vl_pi05_real_5step_1update.yaml
+configs/rl/qwen3vl_pi05_libero_multitask_1update_single_gpu.yaml
 ```
 
 Cluster and task overlays:
@@ -110,7 +118,10 @@ Cluster and task overlays:
 ```text
 configs/rl/cluster/a100_8gpus.yaml
 configs/rl/tasks/robotwin_train_small.yaml
+configs/rl/tasks/libero_object_smoke.yaml
+configs/rl/tasks/libero_object_all.yaml
 configs/rl/rewards/robotwin.yaml
+configs/rl/rewards/libero.yaml
 ```
 
 ## Commands
@@ -120,15 +131,22 @@ Dry run:
 ```bash
 cd /mnt/wangwai/vla/clawvla
 ./scripts/run_clawvla_rl.sh --mode dry-run
+./scripts/run_clawvla_rl.sh --preset libero-multitask --mode dry-run
+clawvla-rl --preset robotwin-multitask --mode dry-run
 ```
 
-One-update real multimodal startup check:
+One-update real multimodal startup checks:
 
 ```bash
 ./scripts/run_clawvla_rl.sh \
-  --config configs/rl/qwen3vl_pi05_multitask_1update.yaml \
+  --preset robotwin-real5 \
   --mode train \
-  --run-id openrlhf_multitask_1update
+  --run-id robotwin_rl_real5
+
+./scripts/run_clawvla_rl.sh \
+  --preset libero-multitask \
+  --mode train \
+  --run-id libero_rl_multitask
 ```
 
 ## Run Archive
@@ -162,7 +180,7 @@ cd /mnt/wangwai/vla/clawvla
 PYTHONPATH=src /mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python -m pytest tests/test_rl_framework.py -q
 ```
 
-The current tests cover config loading, reward registry behavior, policy proxy tracing, multimodal adapter payloads, call-level OpenRLHF samples, terminal penalties, runtime env setup, and state placeholder rejection.
+The current tests cover config loading, reward registry behavior, policy proxy tracing, multimodal adapter payloads, call-level OpenRLHF samples, terminal penalties, runtime env setup, state placeholder rejection, LIBERO config wiring, and OpenRLHF mixed-modality alignment.
 
 ## Verified State
 
@@ -172,10 +190,13 @@ Verified:
 - `action_ranges` train only model output tokens.
 - Overflow is explicit, not silently truncated.
 - OpenRLHF dry-run generates the 50-task prompt dataset and command successfully.
-- A real five-step one-update run reached the trainer; that short smoke had uniform negative rewards, so it validated infrastructure rather than learning signal.
+- LIBERO `qwen3vl_pi05_libero_multitask_1update.yaml` completed one ZeRO-3 two-policy-GPU update with mixed text/multimodal samples.
+- RobotWin `qwen3vl_pi05_real_5step_1update.yaml` completed one ZeRO-3 four-policy-GPU update with mixed text/multimodal samples.
+- OpenRLHF runtime patches keep modality-compatible actor/ref forward batches and data-parallel replay-buffer order.
+- The RobotWin five-step smoke had uniform negative rewards, so it validated infrastructure and synchronization only.
 - Generated files are archived into run directories and ignored by git.
 
-Not yet fully verified:
+Remaining validation:
 
 - Full 25-step task completion through `motion.execute_action`.
 - Dense reward coverage for all RoboTwin 2.0 tasks.

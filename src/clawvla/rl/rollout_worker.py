@@ -20,9 +20,11 @@ def run_rollout_episode(
     policy_base_url: str,
     task_name: str | None = None,
     instruction: str | None = None,
+    task_params: dict[str, Any] | None = None,
 ) -> EpisodeRecord:
     task_name = task_name or config.rollout.task_name
     instruction = instruction or config.rollout.instruction
+    task_params = dict(task_params or {})
     episode = EpisodeRecord.new(task_name=task_name, instruction=instruction, seed=seed)
     episode.status = "running"
     writer = TrajectoryWriter(run_dir / "events.jsonl")
@@ -46,13 +48,15 @@ def run_rollout_episode(
         openpi_port=openpi_port,
         task_name=task_name,
         instruction=instruction,
+        task_params=task_params,
     )
     result_path = run_dir / "trajectories" / f"{episode.episode_id}_result.json"
     log_path = run_dir / "logs" / f"{episode.episode_id}_agent.log"
     reward_path = run_dir / "rewards" / f"{episode.episode_id}_reward.jsonl"
     artifact_prefix = f"{config.rollout.artifact_prefix}_{episode_index}_{episode.episode_id}"
+    environment_cmd = config.environment
     command = [
-        config.robotwin.python,
+        environment_cmd.python,
         "-m",
         "clawvla.scripts.run_loop",
         "--config",
@@ -68,7 +72,7 @@ def run_rollout_episode(
         "--result-output",
         str(result_path),
     ]
-    if config.rollout.run_robotwin:
+    if _should_run_environment(config):
         command.append("--run")
     env_extra = {
         "OPENAI_COMPATIBLE_API_KEY": config.policy.api_key,
@@ -76,13 +80,15 @@ def run_rollout_episode(
         "CLAWVLA_RL_REWARD_JSONL": str(reward_path),
         "CLAWVLA_RL_TASK_NAME": task_name,
         "CLAWVLA_RL_STEP_COST": str(config.reward.step_cost),
+        "CLAWVLA_RL_REWARD_REGISTRY": json.dumps(config.reward.registry, ensure_ascii=True),
+        "CLAWVLA_RL_REWARD_TASK_MAP": json.dumps(config.reward.task_map, ensure_ascii=True),
     }
     if config.cluster.robotwin_gpus:
         env_extra["CUDA_VISIBLE_DEVICES"] = ",".join(str(item) for item in config.cluster.robotwin_gpus)
-    env = command_env(config.robotwin, env_extra)
+    env = command_env(environment_cmd, env_extra)
     completed = run_logged_subprocess(
         command,
-        cwd=config.robotwin.cwd,
+        cwd=environment_cmd.cwd,
         log_path=log_path,
         env=env,
         timeout=config.rollout.episode_timeout_s,
@@ -121,7 +127,7 @@ def run_rollout_episode(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run one ClawVLA RL rollout episode in the RoboTwin environment.")
+    parser = argparse.ArgumentParser(description="Run one ClawVLA RL rollout episode in the configured environment.")
     parser.add_argument("--rl-config", required=True)
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--episode-index", type=int, required=True)
@@ -156,12 +162,25 @@ def _write_agent_config(
     openpi_port: int,
     task_name: str,
     instruction: str,
+    task_params: dict[str, Any] | None = None,
 ) -> Path:
     base = json.loads(Path(config.rollout.base_config).read_text(encoding="utf-8"))
     base.setdefault("task", {})["instruction"] = instruction
-    base.setdefault("robotwin", {})["task_name"] = task_name
-    base["robotwin"]["seed"] = seed
-    base["robotwin"]["artifact_dir"] = str(run_dir / "artifacts" / episode.episode_id)
+    environment = base.setdefault("environment", {})
+    if not isinstance(environment, dict):
+        raise TypeError("agent config environment must be an object when present")
+    environment["task_name"] = task_name
+    environment["seed"] = seed
+    environment["artifact_dir"] = str(run_dir / "artifacts" / episode.episode_id)
+    if task_params:
+        params = environment.setdefault("params", {})
+        if not isinstance(params, dict):
+            raise TypeError("agent config environment.params must be an object when present")
+        params.update(dict(task_params))
+    if str(environment.get("type") or "robotwin").lower() == "robotwin" or "robotwin" in base:
+        base.setdefault("robotwin", {})["task_name"] = task_name
+        base["robotwin"]["seed"] = seed
+        base["robotwin"]["artifact_dir"] = str(run_dir / "artifacts" / episode.episode_id)
     for role in config.policy.roles:
         base.setdefault("models", {})[role] = {
             **dict(base.get("models", {}).get(role, {})),
@@ -181,6 +200,12 @@ def _write_agent_config(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(base, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     return path
+
+
+def _should_run_environment(config: RLConfig) -> bool:
+    if config.rollout.run_environment is not None:
+        return bool(config.rollout.run_environment)
+    return bool(config.rollout.run_robotwin)
 
 
 def _allocate_openpi_port(config: RLConfig, run_dir: Path) -> int:

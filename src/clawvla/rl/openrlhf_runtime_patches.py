@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import functools
+import logging
 import sys
 from typing import Any
+
+_PATCH_LOGGER: Any | None = None
 
 
 def apply_openrlhf_runtime_patches() -> None:
@@ -10,7 +13,24 @@ def apply_openrlhf_runtime_patches() -> None:
     _patch_rollout_actor_flatten_agent_outputs()
     _patch_samples_generator_flatten_agent_outputs()
     _patch_samples_generator_preserve_clawvla_rollout_batches()
+    _patch_clawvla_modality_bucketed_experience_forward()
+    _patch_clawvla_training_modality_alignment()
+    _patch_clawvla_actor_training_shuffle()
     _patch_clawvla_group_advantages()
+
+
+def _patch_logger() -> Any:
+    global _PATCH_LOGGER
+    if _PATCH_LOGGER is not None:
+        return _PATCH_LOGGER
+    try:
+        from openrlhf.utils.logging_utils import init_logger
+
+        _PATCH_LOGGER = init_logger(__name__)
+    except Exception:
+        logging.basicConfig(level=logging.INFO)
+        _PATCH_LOGGER = logging.getLogger(__name__)
+    return _PATCH_LOGGER
 
 
 def _flatten_agent_outputs(value: Any) -> list[dict[str, Any]]:
@@ -173,6 +193,464 @@ def _patch_samples_generator_preserve_clawvla_rollout_batches() -> None:
 
     cls.generate_samples = generate_samples
     cls._clawvla_preserve_rollout_batches = True
+
+
+def _patch_clawvla_modality_bucketed_experience_forward() -> None:
+    module = sys.modules.get("openrlhf.trainer.ppo_utils.experience_maker")
+    if module is None:
+        return
+
+    cls = getattr(module, "RemoteExperienceMaker", None)
+    if cls is None or getattr(cls, "_clawvla_modality_bucketed_forward_patch", False):
+        return
+
+    original_make_experience = cls.make_experience
+
+    @functools.wraps(original_make_experience)
+    def make_experience(self, samples_list):
+        buckets = _split_indices_by_modality(samples_list)
+        non_empty_buckets = [indices for indices in buckets.values() if indices]
+        if len(non_empty_buckets) <= 1:
+            return original_make_experience(self, samples_list)
+        return _make_experience_with_modality_buckets(self, samples_list, buckets, module)
+
+    cls.make_experience = make_experience
+    cls._clawvla_modality_bucketed_forward_patch = True
+
+
+def _make_experience_with_modality_buckets(self: Any, samples_list: list[Any], buckets: dict[str, list[int]], module: Any):
+    start_time = module.time.time()
+    module.logger.info(
+        "ClawVLA bucketed mixed-modality experience forward: "
+        f"text={len(buckets['text'])} multimodal={len(buckets['multimodal'])}"
+    )
+    module.logger.info(f"Starting experience making with {sum([len(s.sequences) for s in samples_list])} samples")
+
+    args = self.strategy.args
+    device = "cpu"
+    duplicate_factor = args.ds.ring_attn_size * args.ds.tensor_parallel_size
+    dummy_ref = module.ray.put([[None]] * (len(samples_list) * duplicate_factor))
+
+    sequences_list = [s.sequences for s in samples_list]
+    attention_mask_list = [s.attention_mask for s in samples_list]
+    action_mask_list = [s.action_mask for s in samples_list]
+    forward_kwargs = dict(sequences=sequences_list, action_mask=action_mask_list, attention_mask=attention_mask_list)
+
+    use_reward_model = samples_list[0].rewards is None
+    if use_reward_model:
+        if self.reward_model_group is None:
+            raise ValueError("reward_model_group is required when rewards are not precomputed")
+        r_refs = self._dispatch_forward(
+            self.reward_model_group,
+            args.train.colocate_all,
+            sequences=sequences_list,
+            attention_mask=attention_mask_list,
+            pad_sequence=[True] * len(samples_list),
+        )
+    else:
+        r_refs = None
+
+    action_log_probs_list = _dispatch_forward_by_modality(
+        self,
+        module=module,
+        group=self.actor_model_group,
+        sync_condition=args.train.colocate_all or args.train.colocate_actor_ref,
+        samples_list=samples_list,
+        buckets=buckets,
+        duplicate_factor=duplicate_factor,
+        base_forward_kwargs=forward_kwargs,
+        result_name="actor_action_log_probs",
+    )
+
+    if self.critic_model_group is not None:
+        if args.train.colocate_critic_reward and r_refs is not None:
+            module.ray.get(r_refs)
+            module.ray.get(self.reward_model_group.async_run_method(method_name="empty_cache"))
+
+        value_ref = self._dispatch_forward(
+            self.critic_model_group,
+            args.train.colocate_all or args.train.colocate_critic_reward,
+            **forward_kwargs,
+        )
+    else:
+        value_ref = dummy_ref
+
+    if self.initial_model_group is not None:
+        base_action_log_probs_list = _dispatch_forward_by_modality(
+            self,
+            module=module,
+            group=self.initial_model_group,
+            sync_condition=args.train.colocate_all or args.train.colocate_actor_ref,
+            samples_list=samples_list,
+            buckets=buckets,
+            duplicate_factor=duplicate_factor,
+            base_forward_kwargs=forward_kwargs,
+            result_name="reference_action_log_probs",
+        )
+    else:
+        base_action_log_probs_ref = dummy_ref
+        base_action_log_probs_list = self._flatten_results(base_action_log_probs_ref, duplicate_factor)
+
+    value_list = self._flatten_results(value_ref, duplicate_factor)
+
+    if use_reward_model:
+        rewards_list = self._flatten_results(r_refs, duplicate_factor)
+        for i, samples in enumerate(samples_list):
+            samples.rewards = rewards_list[i]
+            samples.info["reward"] = rewards_list[i]
+
+    if not (
+        len(samples_list) == len(action_log_probs_list) == len(base_action_log_probs_list) == len(value_list)
+    ):
+        raise RuntimeError(
+            "OpenRLHF ClawVLA bucketed forward result length mismatch: "
+            f"samples={len(samples_list)} action={len(action_log_probs_list)} "
+            f"reference={len(base_action_log_probs_list)} value={len(value_list)}"
+        )
+
+    for samples, action_log_probs, base_action_log_probs, value in zip(
+        samples_list, action_log_probs_list, base_action_log_probs_list, value_list, strict=True
+    ):
+        if (self.initial_model_group is not None) and (not args.algo.kl.use_loss):
+            kl = module.compute_approx_kl(
+                action_log_probs,
+                base_action_log_probs,
+                kl_estimator=self.strategy.args.algo.kl.estimator,
+            )
+            logprobs_diff = action_log_probs.float() - base_action_log_probs.float()
+        else:
+            kl = module.torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=device)
+            logprobs_diff = module.torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=device)
+        kl_mean = module.masked_mean(kl, samples.action_mask, dim=-1)
+        logprobs_diff_mean = module.masked_mean(logprobs_diff, samples.action_mask, dim=-1)
+
+        if not args.algo.kl.use_loss:
+            base_action_log_probs = None
+
+        samples.action_log_probs = action_log_probs
+        samples.base_action_log_probs = base_action_log_probs
+        samples.values = value
+        samples.kl = kl
+        samples.info["kl"] = kl_mean
+        samples.info["logprobs_diff"] = logprobs_diff_mean
+
+    duration = module.time.time() - start_time
+    time_str = str(module.timedelta(seconds=duration)).split(".")[0]
+    module.logger.info(f"Experience making completed in {time_str}")
+    return samples_list
+
+
+def _dispatch_forward_by_modality(
+    self: Any,
+    *,
+    module: Any,
+    group: Any,
+    sync_condition: bool,
+    samples_list: list[Any],
+    buckets: dict[str, list[int]],
+    duplicate_factor: int,
+    base_forward_kwargs: dict[str, list[Any]],
+    result_name: str,
+) -> list[Any]:
+    results: list[Any] = [None] * len(samples_list)
+    for bucket_name in ("text", "multimodal"):
+        indices = buckets[bucket_name]
+        if not indices:
+            continue
+        if bucket_name == "multimodal":
+            _validate_multimodal_bucket_payload(samples_list, indices)
+        dispatch_indices = _pad_indices_for_actor_group(group, indices)
+        kwargs = _select_forward_kwargs(base_forward_kwargs, dispatch_indices)
+        if bucket_name == "multimodal":
+            kwargs["mm_train_inputs_list"] = [samples_list[index].mm_train_inputs for index in dispatch_indices]
+
+        refs = self._dispatch_forward(group, sync_condition, **kwargs)
+        bucket_results = self._flatten_results(refs, duplicate_factor)
+        if len(bucket_results) != len(dispatch_indices):
+            raise RuntimeError(
+                "OpenRLHF ClawVLA bucketed forward returned unexpected result count: "
+                f"name={result_name} bucket={bucket_name} results={len(bucket_results)} "
+                f"dispatched={len(dispatch_indices)} original={len(indices)}"
+            )
+        _scatter_by_indices(results, indices, bucket_results[: len(indices)], result_name)
+
+    missing = [index for index, value in enumerate(results) if value is None]
+    if missing:
+        raise RuntimeError(f"OpenRLHF ClawVLA bucketed forward left missing {result_name}: indices={missing}")
+    return results
+
+
+def _select_forward_kwargs(base_forward_kwargs: dict[str, list[Any]], indices: list[int]) -> dict[str, list[Any]]:
+    return {key: [value[index] for index in indices] for key, value in base_forward_kwargs.items()}
+
+
+def _scatter_by_indices(results: list[Any], indices: list[int], values: list[Any], result_name: str) -> None:
+    if len(indices) != len(values):
+        raise RuntimeError(
+            "OpenRLHF ClawVLA bucketed scatter length mismatch: "
+            f"name={result_name} indices={len(indices)} values={len(values)}"
+        )
+    for index, value in zip(indices, values, strict=True):
+        if results[index] is not None:
+            raise RuntimeError(f"OpenRLHF ClawVLA duplicate bucket result for {result_name}: index={index}")
+        results[index] = value
+
+
+def _pad_indices_for_actor_group(group: Any, indices: list[int]) -> list[int]:
+    min_size = _minimum_batch_size_for_actor_group(group)
+    if len(indices) >= min_size:
+        return list(indices)
+    if not indices:
+        raise ValueError("OpenRLHF ClawVLA cannot pad an empty modality bucket.")
+    return list(indices) + [indices[-1]] * (min_size - len(indices))
+
+
+def _minimum_batch_size_for_actor_group(group: Any) -> int:
+    actor_handlers = getattr(group, "_actor_handlers", None)
+    duplicate_actors = int(getattr(group, "duplicate_actors", 1) or 1)
+    if not actor_handlers:
+        return 1
+    return max(1, len(actor_handlers) // duplicate_actors)
+
+
+def _validate_multimodal_bucket_payload(samples_list: list[Any], indices: list[int]) -> None:
+    missing = [
+        index
+        for index in indices
+        if not _contains_multimodal_train_inputs(getattr(samples_list[index], "mm_train_inputs", None))
+    ]
+    if missing:
+        raise ValueError(
+            "OpenRLHF ClawVLA multimodal call samples are missing mm_train_inputs: "
+            f"indices={missing}"
+        )
+
+
+def _split_indices_by_modality(samples_list: list[Any]) -> dict[str, list[int]]:
+    buckets: dict[str, list[int]] = {"text": [], "multimodal": []}
+    for index, sample in enumerate(samples_list):
+        key = "multimodal" if _experience_has_multimodal_payload(sample) else "text"
+        buckets[key].append(index)
+    return buckets
+
+
+def _experience_has_multimodal_payload(experience: Any) -> bool:
+    info = getattr(experience, "info", None)
+    if isinstance(info, dict) and "clawvla_has_images" in info:
+        return _tensor_like_truthy(info["clawvla_has_images"])
+    if _contains_multimodal_train_inputs(getattr(experience, "mm_train_inputs", None)):
+        return True
+    return _contains_images(getattr(experience, "images", None))
+
+
+def _contains_multimodal_train_inputs(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        return bool(value)
+    if isinstance(value, (list, tuple)):
+        return any(_contains_multimodal_train_inputs(item) for item in value)
+    return True
+
+
+def _contains_images(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, dict):
+        return bool(value)
+    if isinstance(value, (list, tuple)):
+        return any(_contains_images(item) for item in value)
+    return bool(value)
+
+
+def _tensor_like_truthy(value: Any) -> bool:
+    if hasattr(value, "detach"):
+        tensor = value.detach()
+        if hasattr(tensor, "cpu"):
+            tensor = tensor.cpu()
+        if hasattr(tensor, "reshape"):
+            tensor = tensor.reshape(-1)
+        if hasattr(tensor, "numel") and int(tensor.numel()) == 0:
+            return False
+        if hasattr(tensor, "any"):
+            return bool(tensor.bool().any().item())
+    return bool(value)
+
+
+def _patch_clawvla_training_modality_alignment() -> None:
+    module = sys.modules.get("openrlhf.trainer.ray.launcher")
+    if module is None:
+        return
+
+    cls = getattr(module, "RayActorGroup", None)
+    if cls is None or getattr(cls, "_clawvla_training_modality_alignment_patch", False):
+        return
+
+    original_async_run_method_batch = cls.async_run_method_batch
+
+    @functools.wraps(original_async_run_method_batch)
+    def async_run_method_batch(self, method_name, **kwargs):
+        if method_name == "append" and "experience" in kwargs:
+            effective_actors = _effective_actor_count(self)
+            aligned_kwargs, stats = _align_batched_kwargs_by_modality(kwargs, effective_actors)
+            if stats is not None:
+                _patch_logger().info(
+                    "ClawVLA training modality alignment: "
+                    f"dp={stats['dp']} text={stats['text']} multimodal={stats['multimodal']} "
+                    f"local_steps={stats['local_steps']}"
+                )
+                kwargs = aligned_kwargs
+        return original_async_run_method_batch(self, method_name, **kwargs)
+
+    cls.async_run_method_batch = async_run_method_batch
+    cls._clawvla_training_modality_alignment_patch = True
+
+
+def _patch_clawvla_actor_training_shuffle() -> None:
+    module = sys.modules.get("openrlhf.trainer.ray.ppo_actor")
+    if module is None:
+        return
+
+    cls = getattr(module, "ActorPPOTrainer", None)
+    if cls is None or getattr(cls, "_clawvla_disable_mixed_modality_shuffle_patch", False):
+        return
+
+    original_ppo_train = cls.ppo_train
+
+    @functools.wraps(original_ppo_train)
+    def ppo_train(self, kl_ctl: float):
+        replay_buffer = getattr(self, "replay_buffer", None)
+        if not _replay_buffer_has_mixed_modalities(replay_buffer):
+            return original_ppo_train(self, kl_ctl)
+
+        original_dataloader = module.DataLoader
+
+        def data_loader(dataset, *args, **kwargs):
+            if dataset is replay_buffer and kwargs.get("shuffle"):
+                kwargs["shuffle"] = False
+            return original_dataloader(dataset, *args, **kwargs)
+
+        _patch_logger().info("ClawVLA disabled actor replay-buffer shuffle for mixed modalities.")
+        module.DataLoader = data_loader
+        try:
+            return original_ppo_train(self, kl_ctl)
+        finally:
+            module.DataLoader = original_dataloader
+
+    cls.ppo_train = ppo_train
+    cls._clawvla_disable_mixed_modality_shuffle_patch = True
+
+
+def _align_batched_kwargs_by_modality(
+    kwargs: dict[str, Any], effective_actors: int
+) -> tuple[dict[str, Any], dict[str, int] | None]:
+    experiences = kwargs.get("experience")
+    if not isinstance(experiences, list):
+        return kwargs, None
+
+    aligned_indices, stats = _align_experience_indices_by_modality(experiences, effective_actors)
+    if stats is None:
+        return kwargs, None
+
+    aligned_kwargs: dict[str, Any] = {}
+    for key, value in kwargs.items():
+        if isinstance(value, list) and len(value) == len(experiences):
+            aligned_kwargs[key] = [value[index] for index in aligned_indices]
+        elif isinstance(value, tuple) and len(value) == len(experiences):
+            aligned_kwargs[key] = tuple(value[index] for index in aligned_indices)
+        else:
+            aligned_kwargs[key] = value
+    return aligned_kwargs, stats
+
+
+def _align_experience_indices_by_modality(
+    experiences: list[Any], effective_actors: int
+) -> tuple[list[int], dict[str, int] | None]:
+    if effective_actors <= 1 or not experiences:
+        return list(range(len(experiences))), None
+
+    buckets = _split_indices_by_modality(experiences)
+    if not buckets["text"] or not buckets["multimodal"]:
+        return list(range(len(experiences))), None
+
+    total = len(experiences)
+    if total % effective_actors != 0:
+        raise RuntimeError(
+            "OpenRLHF ClawVLA mixed-modality training batch cannot be evenly split across actor ranks: "
+            f"total={total} effective_actors={effective_actors}. "
+            "Increase rollout samples or change task mix so every actor rank receives the same number of samples."
+        )
+
+    uneven = {
+        name: len(indices)
+        for name, indices in buckets.items()
+        if indices and len(indices) % effective_actors != 0
+    }
+    if uneven:
+        raise RuntimeError(
+            "OpenRLHF ClawVLA mixed-modality training batch cannot align modalities across actor ranks: "
+            f"effective_actors={effective_actors} counts={uneven}. "
+            "Each non-empty modality bucket must be divisible by the actor data-parallel size."
+        )
+
+    rank_indices: list[list[int]] = [[] for _ in range(effective_actors)]
+    for bucket_name in ("text", "multimodal"):
+        indices = buckets[bucket_name]
+        for start in range(0, len(indices), effective_actors):
+            column = indices[start : start + effective_actors]
+            for rank, index in enumerate(column):
+                rank_indices[rank].append(index)
+
+    local_steps = total // effective_actors
+    if any(len(chunk) != local_steps for chunk in rank_indices):
+        raise RuntimeError(
+            "OpenRLHF ClawVLA modality alignment produced uneven actor chunks: "
+            f"local_steps={local_steps} chunk_lengths={[len(chunk) for chunk in rank_indices]}"
+        )
+
+    for local_step in range(local_steps):
+        modalities = {
+            _experience_modality(experiences[rank_indices[rank][local_step]]) for rank in range(effective_actors)
+        }
+        if len(modalities) != 1:
+            raise RuntimeError(
+                "OpenRLHF ClawVLA modality alignment failed internal consistency check: "
+                f"local_step={local_step} modalities={sorted(modalities)}"
+            )
+
+    aligned_indices = [index for chunk in rank_indices for index in chunk]
+    if sorted(aligned_indices) != list(range(total)):
+        raise RuntimeError("OpenRLHF ClawVLA modality alignment lost or duplicated training samples.")
+
+    stats = {
+        "dp": effective_actors,
+        "text": len(buckets["text"]),
+        "multimodal": len(buckets["multimodal"]),
+        "local_steps": local_steps,
+    }
+    return aligned_indices, stats
+
+
+def _effective_actor_count(group: Any) -> int:
+    actor_handlers = getattr(group, "_actor_handlers", None)
+    duplicate_actors = int(getattr(group, "duplicate_actors", 1) or 1)
+    if not actor_handlers:
+        return 1
+    return max(1, len(actor_handlers) // duplicate_actors)
+
+
+def _replay_buffer_has_mixed_modalities(replay_buffer: Any) -> bool:
+    items = getattr(replay_buffer, "items", None)
+    if not isinstance(items, list) or len(items) < 2:
+        return False
+    modalities = {_experience_modality(item) for item in items}
+    return "text" in modalities and "multimodal" in modalities
+
+
+def _experience_modality(experience: Any) -> str:
+    return "multimodal" if _experience_has_multimodal_payload(experience) else "text"
 
 
 def _patch_clawvla_group_advantages() -> None:

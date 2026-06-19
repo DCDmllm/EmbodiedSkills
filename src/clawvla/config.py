@@ -70,6 +70,17 @@ class RobotwinConfig:
 
 
 @dataclass
+class EnvironmentConfig:
+    type: str = "robotwin"
+    artifact_dir: str | None = None
+    task_name: str | None = None
+    seed: int | None = None
+    params: dict[str, Any] = field(default_factory=dict)
+    runtime: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class RuntimeEnvironment:
     conda_env: str = "robotwin-py312"
     conda_bin: str = "/mnt/wangwai/miniconda3/bin/conda"
@@ -90,6 +101,7 @@ class AgentConfig:
     models: dict[str, ModelConfig] = field(default_factory=dict)
     components: dict[str, ComponentConfig] = field(default_factory=dict)
     stages: list[StageDefinition] = field(default_factory=list)
+    environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     robotwin: RobotwinConfig = field(default_factory=RobotwinConfig)
     runtime_environment: RuntimeEnvironment = field(default_factory=RuntimeEnvironment)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -112,13 +124,46 @@ def _stage_definition(payload: dict[str, Any]) -> StageDefinition:
 
 def load_config(path: str | Path) -> AgentConfig:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    robotwin = RobotwinConfig(**payload.get("robotwin", {}))
+    environment = _environment_config(payload.get("environment"), robotwin)
     return AgentConfig(
         name=str(payload.get("name", "clawvla")),
         task=dict(payload.get("task", {})),
         models={name: _model_config(cfg) for name, cfg in payload.get("models", {}).items()},
         components={name: _component_config(cfg) for name, cfg in payload.get("components", {}).items()},
         stages=[_stage_definition(item) for item in payload.get("stages", []) if isinstance(item, dict)],
-        robotwin=RobotwinConfig(**payload.get("robotwin", {})),
+        environment=environment,
+        robotwin=robotwin,
         runtime_environment=RuntimeEnvironment(**payload.get("runtime_environment", {})),
         metadata=dict(payload.get("metadata", {})),
+    )
+
+
+def _environment_config(payload: Any, robotwin: RobotwinConfig) -> EnvironmentConfig:
+    if not isinstance(payload, dict):
+        return EnvironmentConfig(
+            type="robotwin",
+            artifact_dir=robotwin.artifact_dir,
+            task_name=robotwin.task_name,
+            seed=robotwin.seed,
+            params={},
+            runtime={},
+            metadata={"source": "legacy_robotwin_config"},
+        )
+    merged = dict(payload)
+    env_type = str(merged.get("type") or "robotwin")
+    if not merged.get("artifact_dir") and env_type == "robotwin":
+        merged["artifact_dir"] = robotwin.artifact_dir
+    if not merged.get("task_name") and env_type == "robotwin":
+        merged["task_name"] = robotwin.task_name
+    if merged.get("seed") is None and env_type == "robotwin":
+        merged["seed"] = robotwin.seed
+    return EnvironmentConfig(
+        type=env_type,
+        artifact_dir=merged.get("artifact_dir"),
+        task_name=merged.get("task_name"),
+        seed=merged.get("seed"),
+        params=dict(merged.get("params", {})) if isinstance(merged.get("params"), dict) else {},
+        runtime=dict(merged.get("runtime", {})) if isinstance(merged.get("runtime"), dict) else {},
+        metadata=dict(merged.get("metadata", {})) if isinstance(merged.get("metadata"), dict) else {},
     )

@@ -1,12 +1,12 @@
 # ClawVLA
 
-ClawVLA 是一个 RoboTwin 操作 agent 运行时。当前主线是：
+ClawVLA 是一个面向 RoboTwin 和 LIBERO 的多组件 VLA agent 运行时。当前主线是：
 
 ```text
-RoboTwin observation -> VLM grounding -> scheduler subgoal loop -> OpenPI/pi0.5 action chunk -> RoboTwin execute -> verifier
+environment observation -> VLM grounding -> scheduler subgoal loop -> OpenPI/pi0.5 action chunk -> environment execute -> verifier
 ```
 
-它不是固定脚本顺序，而是 **scheduler 自由选 skill + runtime 检查前置条件**：
+运行时由 **scheduler 选择 skill + runtime 检查前置条件** 共同驱动：
 
 - scheduler 可以在当前阶段选择允许的 skill。
 - 关键 skill 有硬前置，例如 `execute_action` 必须已有 fresh `action_chunk`。
@@ -31,7 +31,7 @@ RoboTwin observation -> VLM grounding -> scheduler subgoal loop -> OpenPI/pi0.5 
 observe -> plan -> preflight -> execute -> verify -> recover
 ```
 
-阶段不是必须线性只走一遍。一次 action chunk 执行完成后会进入 `verify`，verifier 再决定 `advance_subgoal`、`continue_execute`、`reobserve`、`replan`、`recover` 或 `finish`。
+阶段可按反馈重复进入。一次 action chunk 执行完成后会进入 `verify`，verifier 再决定 `advance_subgoal`、`continue_execute`、`reobserve`、`replan`、`recover` 或 `finish`。
 
 ## 环境
 
@@ -87,7 +87,9 @@ worker 通过 `PYTHONPATH` 引入 RoboTwin 自带 OpenPI 源码：
 ```text
 configs/robotwin_default.json
 configs/robotwin_pi05_worker_probe.json
+configs/libero_pi05_enabled_probe.json
 configs/run_profiles/qwen3vl_pi05_vllm.json
+configs/run_profiles/qwen3vl_pi05_libero_vllm.json
 ```
 
 远程 OpenAI-compatible 配置不再写明文 key。需要远程模型时设置：
@@ -160,22 +162,33 @@ scripts/run_clawvla_rl.sh
 - `action_ranges` 只覆盖模型输出 token；工具返回、环境状态、skill 结果不作为 action token 训练。
 - 超长 prompt/response 不静默截断，配置不够会显式失败。
 - 50 个 RoboTwin 任务已在 `configs/rl/rewards/robotwin.yaml` 映射到 reward handler。
+- LIBERO object tasks 已通过 `configs/rl/tasks/libero_object_*.yaml` 和 `configs/rl/rewards/libero.yaml` 接入同一套 RL runner。
+- OpenRLHF 多卡训练会对 mixed text/multimodal samples 做 modality-aligned replay 排列，保持 ZeRO-3 collective 顺序一致。
 
 常用入口：
 
 ```bash
 cd /mnt/wangwai/vla/clawvla
-./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_multitask_1update.yaml --mode dry-run
-./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_multitask_1update.yaml --mode train --run-id openrlhf_multitask_1update
+./scripts/run_clawvla_rl.sh --help
+./scripts/run_clawvla_rl.sh --preset robotwin-multitask --mode dry-run
+./scripts/run_clawvla_rl.sh --preset robotwin-real5 --mode train --run-id robotwin_rl_real5
+./scripts/run_clawvla_rl.sh --preset libero-multitask --mode train --run-id libero_rl_multitask
+clawvla-rl --preset libero-multitask --mode dry-run
 ```
 
 更完整说明见 [docs/agent_rl.md](docs/agent_rl.md)。
+
+已验证的真实 smoke：
+
+- `configs/rl/qwen3vl_pi05_libero_multitask_1update.yaml`：2 张 policy GPU，LIBERO mixed text/multimodal GRPO 一次更新，checkpoint 正常写出。
+- `configs/rl/qwen3vl_pi05_real_5step_1update.yaml`：4 张 policy GPU，RobotWin/OpenPI 5-step rollout + 一次更新，mixed modality path 正常完成。
 
 ## 脚本说明
 
 主入口：
 
 - `scripts/run_qwen3vl_pi05_agent.sh`：推荐正式入口，读取 run profile。
+- `scripts/run_clawvla_rl.sh`：RL 入口，支持 `--preset robotwin-real5`、`--preset libero-multitask` 等短名。
 - `python -m clawvla.scripts.run_profile`：profile runner，可覆盖 instruction/max-steps/gpus 等。
 - `python -m clawvla.scripts.run_loop_with_vllm`：手动启动本地 vLLM 并跑 agent。
 - `python -m clawvla.scripts.run_loop`：只跑 agent loop，不负责启动 vLLM。
@@ -186,6 +199,8 @@ OpenPI/pi0.5：
 - `python -m clawvla.scripts.pi05_backend_probe`：诊断 pi0.5 checkpoint/schema/adapter。
 - `python -m clawvla.scripts.pi05_inference_smoke`：只跑 pi0.5 inference，不执行 RoboTwin。
 - `python -m clawvla.scripts.robotwin_pi05_execute_once`：采集、推理并执行一次，用于端到端诊断。
+- `python -m clawvla.scripts.libero_pi05_execute_once`：LIBERO 采集、pi0.5 推理、7D action 执行诊断。
+- `python -m clawvla.scripts.pi05_libero_action_smoke`：LIBERO action adapter 轻量 smoke。
 
 轻量 smoke/probe：
 
@@ -193,6 +208,7 @@ OpenPI/pi0.5：
 - `python -m clawvla.scripts.artifact_smoke`
 - `python -m clawvla.scripts.geometry_smoke`
 - `python -m clawvla.scripts.robotwin_capture_once`
+- `python -m clawvla.scripts.libero_capture_once`
 - `python -m clawvla.scripts.robotwin_execute_smoke`
 - `python -m clawvla.scripts.round_once`
 

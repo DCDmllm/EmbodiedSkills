@@ -1,0 +1,40 @@
+{
+  "name": "qwen3vl_pi05_libero_vllm_agent",
+  "cwd": "/mnt/wangwai/vla/clawvla",
+  "python": "/mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python",
+  "unset_env": [
+    "PYTHONPATH"
+  ],
+  "env": {
+    "PYTHONPATH": "/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/lerobot/src",
+    "MUJOCO_GL": "egl",
+    "PYOPENGL_PLATFORM": "egl",
+    "__EGL_VENDOR_LIBRARY_DIRS": "/usr/share/glvnd/egl_vendor.d",
+    "VK_ICD_FILENAMES": "/etc/vulkan/icd.d/nvidia_icd.json",
+    "CUDA_VISIBLE_DEVICES": "7"
+  },
+  "module": "clawvla.scripts.run_loop_with_vllm",
+  "args": {
+    "base-config": "/mnt/wangwai/vla/clawvla/configs/libero_pi05_enabled_probe.json",
+    "model": "/mnt/wangwai/weights/Qwen/Qwen3-VL-8B-Instruct",
+    "served-model-name": "local-scheduler",
+    "model-keys": "vision,scheduler,verifier,recovery",
+    "gpus": "3,4",
+    "tensor-parallel-size": 2,
+    "startup-timeout": 900,
+    "instruction": "pick up the alphabet soup and place it in the basket",
+    "artifact-prefix": "agent_qwen3vl_vllm_pi05_libero",
+    "initial-stage": "observe",
+    "max-steps": 20,
+    "run": true
+  },
+  "repeat_args": {
+    "vllm-arg": [
+      "--trust-remote-code",
+      "--dtype",
+      "bfloat16",
+      "--max-model-len",
+      "32768"
+    ]
+  }
+}

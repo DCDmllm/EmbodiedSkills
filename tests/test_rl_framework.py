@@ -25,6 +25,7 @@ from clawvla.components.scheduler import (
     repair_stage_transition,
 )
 from clawvla.components.verifier import _subgoal_verification_contract, _verifier_blackboard_context, verify_progress
+from clawvla.envs import build_env_adapter, normalize_libero_observation
 from clawvla.envs.robotwin_session import prepare_task_args
 from clawvla.components.vision import localize_task_objects
 from clawvla.loop_types import LoopDecision, LoopStepRecord
@@ -33,13 +34,24 @@ from clawvla.blackboard import Blackboard
 from clawvla.components.state import update_world_state
 from clawvla.phase_policy import PhasePolicy
 from clawvla.rl.config import build_rollout_episode_specs, load_rl_config
-from clawvla.rl.openrlhf_runner import _openrlhf_env, _openrlhf_train_command, _write_prompt_dataset
+from clawvla.rl.openrlhf_runner import (
+    _openrlhf_env,
+    _openrlhf_train_command,
+    _resolve_config_path,
+    _write_prompt_dataset,
+)
 from clawvla.rl.openrlhf_runtime_patches import (
+    _align_experience_indices_by_modality,
+    _dispatch_forward_by_modality,
+    _experience_modality,
     _flatten_agent_outputs,
+    _pad_indices_for_actor_group,
     _patch_samples_generator_preserve_clawvla_rollout_batches,
+    _replay_buffer_has_mixed_modalities,
+    _split_indices_by_modality,
     _shape_episode_rewards,
 )
-from clawvla.rl.rollout_worker import _append_episode_terminal_reward
+from clawvla.rl.rollout_worker import _append_episode_terminal_reward, _should_run_environment, _write_agent_config
 from clawvla.rl.policy_proxy import PolicyProxy, StaticPolicyBackend
 from clawvla.rl.reward_registry import build_reward_registry
 from clawvla.scripts.run_loop import _apply_runtime_environment
@@ -106,6 +118,103 @@ def test_load_default_rl_config() -> None:
         "up_proj",
         "down_proj",
     ]
+
+
+def test_load_legacy_robotwin_config_sets_environment() -> None:
+    config = load_config("configs/robotwin_default.json")
+
+    assert config.environment.type == "robotwin"
+    assert config.environment.task_name == config.robotwin.task_name
+    assert config.environment.artifact_dir == config.robotwin.artifact_dir
+
+
+def test_load_libero_config_and_env_factory() -> None:
+    config = load_config("configs/libero_pi05_enabled_probe.json")
+    adapter = build_env_adapter(config)
+
+    assert config.environment.type == "libero"
+    assert adapter.metadata()["backend"] == "libero"
+    assert adapter.preflight_spec()["action"]["types"]["libero_ee_delta"] == 7
+
+
+def test_libero_observation_normalization_fake_raw(tmp_path) -> None:
+    raw = {
+        "agentview_image": [
+            [[255, 0, 0], [0, 255, 0]],
+            [[0, 0, 255], [255, 255, 0]],
+        ],
+        "robot0_eye_in_hand_image": [
+            [[0, 255, 0], [255, 0, 0]],
+            [[255, 255, 0], [0, 0, 255]],
+        ],
+        "robot0_eef_pos": [0.1, 0.2, 0.3],
+        "robot0_eef_quat": [0.0, 0.0, 0.0, 1.0],
+        "robot0_gripper_qpos": [0.01, 0.02],
+        "robot0_joint_pos": [0.0] * 7,
+        "robot0_joint_vel": [0.0] * 7,
+    }
+    from clawvla.artifacts import ArtifactStore
+
+    observation = normalize_libero_observation(
+        raw,
+        task_instruction="pick up the alphabet soup",
+        artifacts=ArtifactStore(tmp_path),
+        artifact_prefix="fake",
+    )
+
+    assert sorted(observation.camera_views) == ["agentview", "wrist"]
+    assert len(observation.raw["libero_state8"]) == 8
+    assert observation.robot_arms["panda"].metadata["state8"] == observation.raw["libero_state8"]
+    assert observation.raw["image_orientation"] == "rotated_180"
+    assert observation.camera_views["agentview"].metadata["orientation"] == "rotated_180"
+
+    from PIL import Image
+
+    saved = Image.open(observation.camera_views["agentview"].rgb_path).convert("RGB")
+    assert saved.getpixel((0, 0)) == (255, 255, 0)
+
+
+def test_libero_action_validation_accepts_7d_backend() -> None:
+    class Backend:
+        def action_spec(self):
+            return {"types": {"libero_ee_delta": 7}}
+
+    blackboard = Blackboard()
+    blackboard.write("action_backend", Backend())
+    blackboard.write("observation", ObservationBundle(observation_id="obs"))
+    blackboard.write("current_subgoal", Subgoal(subgoal_id="S1", type="act", instruction="do it"))
+    blackboard.write(
+        "action_chunk",
+        ActionChunk(
+            action_type="libero_ee_delta",
+            commands=[[0.0] * 7],
+            metadata={"observation_id": "obs", "subgoal_id": "S1", "stale": False, "consumed": False},
+        ),
+    )
+
+    report = importlib.import_module("clawvla.components.motion")._validate_action_chunk_report(blackboard)
+
+    assert report["allowed"] is True
+    assert report["checks"]["action_chunk"]["expected_command_dim"] == 7
+
+
+def test_pi05_libero_checkpoint_diagnosis() -> None:
+    from clawvla.action_backends.pi05 import Pi05ActionBackend
+
+    backend = Pi05ActionBackend(
+        {
+            "type": "pi05",
+            "enabled": True,
+            "pretrained_path": "/mnt/wangwai/weights/lerobot/pi05_libero_finetuned_v044",
+            "environment_adapter": {"type": "libero"},
+            "lerobot_env": {"task": "libero_object"},
+        }
+    )
+    diagnosis = backend.diagnose()
+
+    assert diagnosis["policy_summary"]["checkpoint_format"] == "lerobot"
+    assert diagnosis["lerobot_adapter"]["compatible_for_execution"] is True
+    assert backend.action_spec()["types"]["libero_ee_delta"] == 7
 
 
 def test_reward_registry_requires_configured_task() -> None:
@@ -242,10 +351,14 @@ def test_openrlhf_outputs_use_one_training_item_per_policy_call(monkeypatch) -> 
     assert samples[0]["extra_logs"]["clawvla_group_uid"] == 7
     assert samples[0]["extra_logs"]["clawvla_call_index"] == 0
     assert samples[0]["extra_logs"]["clawvla_policy_calls"] == 2
+    assert samples[0]["extra_logs"]["clawvla_has_images"] == 1
+    assert samples[0]["extra_logs"]["clawvla_image_count"] == 1
     assert samples[1]["observation_tokens"] == [20, 21, 22, 23, 24]
     assert samples[1]["action_ranges"] == [(3, 5)]
     assert samples[1]["rollout_log_probs"] is None
     assert samples[1]["images"] is None
+    assert samples[1]["extra_logs"]["clawvla_has_images"] == 0
+    assert samples[1]["extra_logs"]["clawvla_image_count"] == 0
     assert samples[1]["reward"] == 1.25
     assert samples[1]["scores"] == 1.25
 
@@ -389,6 +502,148 @@ def test_openrlhf_runtime_patch_does_not_split_generated_call_batch(monkeypatch)
     assert exhausted is True
 
 
+def test_openrlhf_modality_bucket_helpers_detect_and_pad() -> None:
+    text = SimpleNamespace(images=[None], mm_train_inputs=[None], info={})
+    image = SimpleNamespace(
+        images=[["view.png"]],
+        mm_train_inputs=[{"pixel_values": [[1.0]]}],
+        info={"clawvla_has_images": 1},
+    )
+    meta_image = SimpleNamespace(images=[None], mm_train_inputs=[{"pixel_values": [[2.0]]}], info={})
+
+    buckets = _split_indices_by_modality([text, image, meta_image])
+
+    assert buckets == {"text": [0], "multimodal": [1, 2]}
+
+    group = SimpleNamespace(_actor_handlers=[object(), object(), object(), object()], duplicate_actors=2)
+    assert _pad_indices_for_actor_group(group, [1]) == [1, 1]
+    assert _pad_indices_for_actor_group(group, [1, 2]) == [1, 2]
+
+
+def test_openrlhf_training_modality_alignment_pairs_rank_steps() -> None:
+    samples = [
+        SimpleNamespace(images=[None], mm_train_inputs=[None], info={}),
+        SimpleNamespace(images=[["m0.png"]], mm_train_inputs=[{"pixel_values": [[0.0]]}], info={}),
+        SimpleNamespace(images=[["m1.png"]], mm_train_inputs=[{"pixel_values": [[1.0]]}], info={}),
+        SimpleNamespace(images=[None], mm_train_inputs=[None], info={}),
+        SimpleNamespace(images=[["m2.png"]], mm_train_inputs=[{"pixel_values": [[2.0]]}], info={}),
+        SimpleNamespace(images=[None], mm_train_inputs=[None], info={}),
+        SimpleNamespace(images=[["m3.png"]], mm_train_inputs=[{"pixel_values": [[3.0]]}], info={}),
+        SimpleNamespace(images=[["m4.png"]], mm_train_inputs=[{"pixel_values": [[4.0]]}], info={}),
+        SimpleNamespace(images=[None], mm_train_inputs=[None], info={}),
+        SimpleNamespace(images=[["m5.png"]], mm_train_inputs=[{"pixel_values": [[5.0]]}], info={}),
+    ]
+
+    aligned_indices, stats = _align_experience_indices_by_modality(samples, effective_actors=2)
+
+    assert stats == {"dp": 2, "text": 4, "multimodal": 6, "local_steps": 5}
+    assert sorted(aligned_indices) == list(range(len(samples)))
+    rank0 = aligned_indices[:5]
+    rank1 = aligned_indices[5:]
+    assert [
+        (_experience_modality(samples[left]), _experience_modality(samples[right]))
+        for left, right in zip(rank0, rank1, strict=True)
+    ] == [
+        ("text", "text"),
+        ("text", "text"),
+        ("multimodal", "multimodal"),
+        ("multimodal", "multimodal"),
+        ("multimodal", "multimodal"),
+    ]
+
+
+def test_openrlhf_training_modality_alignment_rejects_uneven_buckets() -> None:
+    samples = [
+        SimpleNamespace(images=[None], mm_train_inputs=[None], info={}),
+        SimpleNamespace(images=[None], mm_train_inputs=[None], info={}),
+        SimpleNamespace(images=[["m0.png"]], mm_train_inputs=[{"pixel_values": [[0.0]]}], info={}),
+        SimpleNamespace(images=[["m1.png"]], mm_train_inputs=[{"pixel_values": [[1.0]]}], info={}),
+        SimpleNamespace(images=[["m2.png"]], mm_train_inputs=[{"pixel_values": [[2.0]]}], info={}),
+        SimpleNamespace(images=[["m3.png"]], mm_train_inputs=[{"pixel_values": [[3.0]]}], info={}),
+        SimpleNamespace(images=[["m4.png"]], mm_train_inputs=[{"pixel_values": [[4.0]]}], info={}),
+        SimpleNamespace(images=[["m5.png"]], mm_train_inputs=[{"pixel_values": [[5.0]]}], info={}),
+    ]
+
+    with pytest.raises(RuntimeError, match="cannot align modalities"):
+        _align_experience_indices_by_modality(samples, effective_actors=4)
+
+
+def test_openrlhf_replay_buffer_detects_mixed_modalities() -> None:
+    replay_buffer = SimpleNamespace(
+        items=[
+            SimpleNamespace(images=[None], mm_train_inputs=[None], info={}),
+            SimpleNamespace(images=[["m0.png"]], mm_train_inputs=[{"pixel_values": [[0.0]]}], info={}),
+        ]
+    )
+
+    assert _replay_buffer_has_mixed_modalities(replay_buffer) is True
+
+
+def test_openrlhf_bucketed_forward_dispatches_text_and_images_separately() -> None:
+    torch = pytest.importorskip("torch")
+
+    samples = [
+        SimpleNamespace(
+            sequences=torch.tensor([[1, 2]]),
+            attention_mask=torch.tensor([[1, 1]]),
+            action_mask=torch.tensor([[1]]),
+            images=[None],
+            mm_train_inputs=[None],
+            info={},
+        ),
+        SimpleNamespace(
+            sequences=torch.tensor([[3, 4]]),
+            attention_mask=torch.tensor([[1, 1]]),
+            action_mask=torch.tensor([[1]]),
+            images=[["view.png"]],
+            mm_train_inputs=[{"pixel_values": torch.ones(1, 1)}],
+            info={"clawvla_has_images": torch.tensor([1])},
+        ),
+        SimpleNamespace(
+            sequences=torch.tensor([[5, 6]]),
+            attention_mask=torch.tensor([[1, 1]]),
+            action_mask=torch.tensor([[1]]),
+            images=[None],
+            mm_train_inputs=[None],
+            info={},
+        ),
+    ]
+    buckets = _split_indices_by_modality(samples)
+    group = SimpleNamespace(_actor_handlers=[object(), object()], duplicate_actors=1)
+    calls = []
+
+    class Maker:
+        def _dispatch_forward(self, group, sync_condition, **kwargs):
+            calls.append(kwargs)
+            return kwargs
+
+        def _flatten_results(self, refs, duplicate_factor):
+            return [f"seq-{int(item.reshape(-1)[0].item())}" for item in refs["sequences"]]
+
+    result = _dispatch_forward_by_modality(
+        Maker(),
+        module=SimpleNamespace(),
+        group=group,
+        sync_condition=False,
+        samples_list=samples,
+        buckets=buckets,
+        duplicate_factor=1,
+        base_forward_kwargs={
+            "sequences": [sample.sequences for sample in samples],
+            "action_mask": [sample.action_mask for sample in samples],
+            "attention_mask": [sample.attention_mask for sample in samples],
+        },
+        result_name="test",
+    )
+
+    assert result == ["seq-1", "seq-3", "seq-5"]
+    assert len(calls) == 2
+    assert "mm_train_inputs_list" not in calls[0]
+    assert [int(item.reshape(-1)[0].item()) for item in calls[0]["sequences"]] == [1, 5]
+    assert "mm_train_inputs_list" in calls[1]
+    assert [int(item.reshape(-1)[0].item()) for item in calls[1]["sequences"]] == [3, 3]
+
+
 def test_rollout_episode_specs_expand_multitask_config() -> None:
     config = load_rl_config("configs/rl/qwen3vl_pi05_multitask_1update.yaml")
     specs = build_rollout_episode_specs(config)
@@ -413,8 +668,66 @@ def test_openrlhf_prompt_dataset_expands_multitask_tasks(tmp_path) -> None:
     assert first_label["task_name"] == "beat_block_hammer"
     assert first_label["task_index"] == 0
     assert first_label["seed"] == 0
+    assert first_label["params"] == {}
+    assert rows[0]["datasource"] == "clawvla_environment"
     assert "beat the block" in rows[0]["input"]
     assert last_label["task_name"] == "put_object_cabinet"
+
+
+def test_libero_rl_config_expands_task_params_and_reward_map(tmp_path) -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_libero_multitask_1update.yaml")
+    specs = build_rollout_episode_specs(config)
+
+    assert len(specs) == 2
+    assert specs[0].task_name == "libero_object_0"
+    assert specs[0].params == {"suite": "libero_object", "task_id": 0}
+    assert specs[1].task_name == "libero_object_1"
+    assert specs[1].params == {"suite": "libero_object", "task_id": 1}
+    assert config.reward.task_map["libero_object_0"] == "libero"
+    assert _should_run_environment(config) is True
+
+    path = _write_prompt_dataset(config, tmp_path)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    label = json.loads(rows[1]["label"])
+    assert rows[1]["datasource"] == "clawvla_environment"
+    assert label["params"] == {"suite": "libero_object", "task_id": 1}
+
+
+def test_rl_write_agent_config_applies_libero_task_params(tmp_path) -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_libero_multitask_1update.yaml")
+    episode = EpisodeRecord.new(
+        task_name="libero_object_1",
+        instruction="pick up the cream cheese and place it in the basket",
+        seed=3,
+    )
+
+    path = _write_agent_config(
+        config,
+        run_dir=tmp_path,
+        episode=episode,
+        episode_index=1,
+        seed=3,
+        policy_base_url="http://127.0.0.1:18080/v1",
+        openpi_port=9465,
+        task_name=episode.task_name,
+        instruction=episode.instruction,
+        task_params={"suite": "libero_object", "task_id": 1, "episode_index": 3},
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["environment"]["type"] == "libero"
+    assert payload["environment"]["task_name"] == "libero_object_1"
+    assert payload["environment"]["seed"] == 3
+    assert payload["environment"]["params"]["suite"] == "libero_object"
+    assert payload["environment"]["params"]["task_id"] == 1
+    assert payload["environment"]["params"]["episode_index"] == 3
+
+
+def test_openrlhf_runner_resolves_preset_config() -> None:
+    path = _resolve_config_path(None, "libero-multitask")
+
+    assert path.name == "qwen3vl_pi05_libero_multitask_1update.yaml"
+    assert path.exists()
 
 
 def test_openrlhf_train_command_uses_agent_entrypoint_and_full_zero3(tmp_path, monkeypatch) -> None:

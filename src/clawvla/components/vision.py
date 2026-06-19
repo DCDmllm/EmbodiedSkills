@@ -78,11 +78,14 @@ def capture_views(request: SkillRequest, context: SkillContext) -> SkillResult:
             else request.payload.get("observation")
         )
     except Exception as exc:
+        metadata = env.metadata() if env is not None and hasattr(env, "metadata") else {}
+        status = env.status() if env is not None and hasattr(env, "status") else {}
         report = {
-            "backend": "robotwin" if env is not None else "none",
+            "backend": metadata.get("backend") or "none",
             "exception_type": type(exc).__name__,
             "message": str(exc),
-            "task_env_bound": bool(getattr(env, "session", None) and getattr(env.session, "task_env", None)),
+            "env_status": status,
+            "task_env_bound": bool(status.get("live_env_bound")) if isinstance(status, dict) else False,
         }
         blackboard.write("last_observation_error", report, event_type="vision.capture_views_unavailable")
         return unavailable("observation_unavailable", str(exc), {"capture_error": report})
@@ -114,11 +117,14 @@ def capture_verify_views(request: SkillRequest, context: SkillContext) -> SkillR
             instruction=request.payload.get("instruction") or blackboard.task_instruction,
         )
     except Exception as exc:
+        metadata = env.metadata() if env is not None and hasattr(env, "metadata") else {}
+        status = env.status() if env is not None and hasattr(env, "status") else {}
         report = {
-            "backend": "robotwin" if env is not None else "none",
+            "backend": metadata.get("backend") or "none",
             "exception_type": type(exc).__name__,
             "message": str(exc),
-            "task_env_bound": bool(getattr(env, "session", None) and getattr(env.session, "task_env", None)),
+            "env_status": status,
+            "task_env_bound": bool(status.get("live_env_bound")) if isinstance(status, dict) else False,
         }
         blackboard.write("last_verify_observation_error", report, event_type="vision.capture_verify_views_unavailable")
         return unavailable("verify_observation_unavailable", str(exc), {"capture_error": report})
@@ -403,8 +409,8 @@ def refresh_preflight_observation(request: SkillRequest, context: SkillContext) 
         "instruction": request.payload.get("instruction") or blackboard.task_instruction,
     }
     env = blackboard.read("env_adapter")
-    session = getattr(env, "session", None)
-    if session is None or getattr(session, "task_env", None) is None:
+    status = env.status() if env is not None and hasattr(env, "status") else {}
+    if not isinstance(status, dict) or status.get("needs_setup", True):
         capture_payload["setup"] = True
 
     capture = run_step("vision", "capture_views", capture_payload)

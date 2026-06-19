@@ -27,6 +27,10 @@ clawvla-artifact-smoke = "clawvla.scripts.artifact_smoke:main"
 clawvla-geometry-smoke = "clawvla.scripts.geometry_smoke:main"
 clawvla-robotwin-capture-once = "clawvla.scripts.robotwin_capture_once:main"
 clawvla-run-profile = "clawvla.scripts.run_profile:main"
+clawvla-rl = "clawvla.rl.openrlhf_runner:main"
+clawvla-libero-capture-once = "clawvla.scripts.libero_capture_once:main"
+clawvla-libero-pi05-execute-once = "clawvla.scripts.libero_pi05_execute_once:main"
+clawvla-pi05-libero-action-smoke = "clawvla.scripts.pi05_libero_action_smoke:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -7,6 +7,7 @@ import numpy as np
 
 from ..artifacts import ArtifactStore
 from ..config import RobotwinConfig, RuntimeEnvironment
+from ..notices import emit_status_notice
 from ..schema import ActionChunk, CameraView, ObservationBundle, RobotArmState
 from .base import RobotEnvAdapter
 from .robotwin_session import RoboTwinSession, robotwin_cwd
@@ -131,6 +132,45 @@ class RoboTwinAdapter(RobotEnvAdapter):
             "task_name": self.config.task_name,
             "task_config": self.config.task_config,
             "task_env_bound": self.bound_task_env is not None,
+        }
+
+    def status(self) -> dict[str, Any]:
+        session_task_env = getattr(self.session, "task_env", None) if self.session is not None else None
+        live_env_bound = self.bound_task_env is not None or session_task_env is not None
+        return {
+            "backend": "robotwin",
+            "ready": live_env_bound and self.last_observation is not None,
+            "needs_setup": not live_env_bound,
+            "last_observation_present": self.last_observation is not None,
+            "live_env_bound": live_env_bound,
+            "task_name": self.config.task_name,
+            "task_config": self.config.task_config,
+        }
+
+    def preflight_spec(self) -> dict[str, Any]:
+        return {
+            "backend": "robotwin",
+            "required_cameras": ["head_camera", "front_camera", "left_camera", "right_camera"],
+            "action_cameras": ["head_camera", "left_camera", "right_camera"],
+            "expected_resolution": [960, 540],
+            "state": {"required": True, "dim": 14, "source": "joint_action_vector"},
+            "action": {"required": True, "types": {"qpos": 14, "ee": 16}},
+        }
+
+    def task_status(self) -> dict[str, Any]:
+        task_env = None
+        if self.session is not None:
+            task_env = getattr(self.session, "task_env", None)
+        if task_env is None:
+            task_env = self.bound_task_env
+        success = task_env.check_success() if task_env is not None and hasattr(task_env, "check_success") else None
+        return {
+            "backend": "robotwin",
+            "task_name": self.config.task_name,
+            "task_config": self.config.task_config,
+            "success": success,
+            "done": success if isinstance(success, bool) else None,
+            "step_count": None,
         }
 
 

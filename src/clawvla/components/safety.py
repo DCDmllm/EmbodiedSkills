@@ -75,14 +75,16 @@ def _build_preflight_report(blackboard: Any) -> SafetyReport:
     world_state = blackboard.read("world_state")
     task_plan = blackboard.read("task_plan")
     current_subgoal = blackboard.read("current_subgoal")
+    env = blackboard.read("env_adapter")
+    preflight_spec = _preflight_spec(env)
     obs_id = current_observation_id(blackboard)
 
     _check_task_state(checks, errors, observation, perception, world_state, task_plan, current_subgoal)
     _check_observation_freshness(checks, errors, obs_id, perception, world_state)
     _check_object_binding(checks, errors, world_state, current_subgoal)
-    _check_camera_inputs(checks, errors, observation)
-    _check_robot_state(checks, errors, observation)
-    _check_robotwin_env(checks, errors, blackboard.read("env_adapter"))
+    _check_camera_inputs(checks, errors, observation, preflight_spec)
+    _check_robot_state(checks, errors, observation, preflight_spec)
+    _check_environment(checks, errors, env)
     _check_action_backend(checks, errors, blackboard.read("action_backend"))
 
     allowed = not errors
@@ -208,54 +210,86 @@ def _check_candidate(role: str, candidate: Any, errors: list[str], *, required: 
         errors.append(f"{role}_visibility_no")
 
 
-def _check_camera_inputs(checks: dict[str, Any], errors: list[str], observation: Any) -> None:
-    all_required = ("head_camera", "front_camera", "left_camera", "right_camera")
-    openpi_required = ("head_camera", "left_camera", "right_camera")
+def _check_camera_inputs(checks: dict[str, Any], errors: list[str], observation: Any, preflight_spec: dict[str, Any]) -> None:
+    all_required = tuple(str(item) for item in preflight_spec.get("required_cameras", []) or [])
+    action_required = tuple(str(item) for item in preflight_spec.get("action_cameras", []) or all_required)
+    expected_resolution = preflight_spec.get("expected_resolution")
     camera_views = get_attr(observation, "camera_views", {}) if observation is not None else {}
     cameras: dict[str, Any] = {}
     for name in all_required:
         view = camera_views.get(name) if isinstance(camera_views, dict) else None
-        status = _camera_status(view)
+        status = _camera_status(view, expected_resolution)
         cameras[name] = status
         if not status["ok"]:
             errors.append(f"camera_{name}_{status['reason']}")
     checks["camera_inputs"] = {
         "status": "passed" if all(item["ok"] for item in cameras.values()) else "failed",
         "required": list(all_required),
-        "openpi_required": list(openpi_required),
-        "expected_resolution": [960, 540],
+        "action_required": list(action_required),
+        "expected_resolution": expected_resolution,
         "cameras": cameras,
     }
 
 
-def _check_robot_state(checks: dict[str, Any], errors: list[str], observation: Any) -> None:
-    vector, source, read_error = _joint_action_vector(observation)
-    ok = len(vector) == 14 and all(_finite(item) for item in vector)
+def _check_robot_state(checks: dict[str, Any], errors: list[str], observation: Any, preflight_spec: dict[str, Any]) -> None:
+    state_spec = preflight_spec.get("state", {}) if isinstance(preflight_spec.get("state"), dict) else {}
+    required = bool(state_spec.get("required", False))
+    expected_dim = state_spec.get("dim")
+    if not required:
+        checks["robot_state"] = {"status": "passed", "required": False}
+        return
+    vector, source, read_error = _state_vector(observation, state_spec)
+    ok = (
+        isinstance(expected_dim, int)
+        and len(vector) == expected_dim
+        and all(_finite(item) for item in vector)
+    )
     if not ok:
-        errors.append(read_error or "missing_14d_robot_state")
+        errors.append(read_error or f"missing_{expected_dim}d_robot_state")
     checks["robot_state"] = {
         "status": "passed" if ok else "failed",
         "source": source,
         "vector_length": len(vector),
+        "expected_dim": expected_dim,
         "error": read_error,
     }
 
 
-def _check_robotwin_env(checks: dict[str, Any], errors: list[str], env: Any) -> None:
-    session = get_attr(env, "session")
-    task_env = get_attr(session, "task_env") if session is not None else get_attr(env, "bound_task_env")
-    ok = env is not None and task_env is not None and get_attr(env, "last_observation") is not None
+def _check_environment(checks: dict[str, Any], errors: list[str], env: Any) -> None:
+    status = env.status() if env is not None and hasattr(env, "status") else {}
+    if not isinstance(status, dict) or "ready" not in status:
+        session = get_attr(env, "session")
+        task_env = get_attr(session, "task_env") if session is not None else get_attr(env, "bound_task_env")
+        status = {
+            "backend": "legacy",
+            "ready": env is not None and task_env is not None and get_attr(env, "last_observation") is not None,
+            "live_env_bound": task_env is not None,
+            "last_observation_present": get_attr(env, "last_observation") is not None,
+        }
+    ok = bool(status.get("ready")) if isinstance(status, dict) else False
     if not ok:
-        errors.append("robotwin_env_unavailable")
-    checks["robotwin_env"] = {
+        errors.append("env_unavailable")
+    checks["environment"] = {
         "status": "passed" if ok else "failed",
         "env_adapter_present": env is not None,
-        "task_env_bound": task_env is not None,
-        "last_observation_present": get_attr(env, "last_observation") is not None,
+        "env_status": status,
     }
 
 
 def _check_action_backend(checks: dict[str, Any], errors: list[str], backend: Any) -> None:
+    if backend is not None and hasattr(backend, "health"):
+        health = backend.health()
+        ok = bool(health.get("ok")) if isinstance(health, dict) else False
+        if not ok:
+            reason = health.get("reason") if isinstance(health, dict) else "health_unavailable"
+            errors.append(_action_backend_error_code(reason))
+        checks["action_backend"] = {
+            "status": "passed" if ok else "failed",
+            "backend_present": backend is not None,
+            "health": health,
+            "action_spec": backend.action_spec() if hasattr(backend, "action_spec") else None,
+        }
+        return
     config = get_attr(backend, "config", {})
     enabled = bool(config.get("enabled")) if isinstance(config, dict) else False
     pretrained_path = config.get("pretrained_path") if isinstance(config, dict) else None
@@ -279,6 +313,13 @@ def _check_action_backend(checks: dict[str, Any], errors: list[str], backend: An
         "pretrained_path_exists": pretrained_exists,
         "worker": worker_status,
     }
+
+
+def _action_backend_error_code(reason: Any) -> str:
+    text = str(reason or "health_unavailable")
+    if text.startswith(("action_backend_", "openpi_worker_")):
+        return text
+    return f"action_backend_{text}"
 
 
 def _write_report(
@@ -346,7 +387,7 @@ def _valid_bbox(value: Any) -> bool:
     return all(_finite(item) for item in (x1, y1, x2, y2)) and x2 > x1 and y2 > y1
 
 
-def _camera_status(view: Any) -> dict[str, Any]:
+def _camera_status(view: Any, expected_resolution: Any = None) -> dict[str, Any]:
     if view is None:
         return {"ok": False, "reason": "missing"}
     rgb_path = get_attr(view, "rgb_path")
@@ -362,8 +403,38 @@ def _camera_status(view: Any) -> dict[str, Any]:
             size = list(image.size)
     except Exception as exc:
         return {"ok": False, "reason": "rgb_file_unreadable", "path": str(path), "error": str(exc)}
-    ok = size == [960, 540]
+    expected = [int(item) for item in expected_resolution] if isinstance(expected_resolution, list) else None
+    ok = True if expected is None else size == expected
     return {"ok": ok, "reason": "ok" if ok else "unexpected_resolution", "path": str(path), "resolution": size}
+
+
+def _state_vector(observation: Any, state_spec: dict[str, Any]) -> tuple[list[float], str | None, str | None]:
+    source_hint = str(state_spec.get("source") or "")
+    if source_hint == "libero_state8":
+        vector, source, error = _libero_state8_vector(observation)
+        if vector or error is not None:
+            return vector, source, error
+    return _joint_action_vector(observation)
+
+
+def _libero_state8_vector(observation: Any) -> tuple[list[float], str | None, str | None]:
+    if observation is None:
+        return [], None, None
+    raw = get_attr(observation, "raw", {})
+    if isinstance(raw, dict) and isinstance(raw.get("libero_state8"), list):
+        try:
+            return [float(item) for item in raw["libero_state8"]], "observation.raw.libero_state8", None
+        except (TypeError, ValueError) as exc:
+            return [], "observation.raw.libero_state8", f"libero_state8_invalid:{type(exc).__name__}:{exc}"
+    arms = get_attr(observation, "robot_arms", {})
+    panda = arms.get("panda") if isinstance(arms, dict) else None
+    metadata = get_attr(panda, "metadata", {})
+    if isinstance(metadata, dict) and isinstance(metadata.get("state8"), list):
+        try:
+            return [float(item) for item in metadata["state8"]], "observation.robot_arms.panda.metadata.state8", None
+        except (TypeError, ValueError) as exc:
+            return [], "observation.robot_arms.panda.metadata.state8", f"libero_state8_invalid:{type(exc).__name__}:{exc}"
+    return [], "observation.raw.libero_state8", "libero_state8_missing"
 
 
 def _joint_action_vector(observation: Any) -> tuple[list[float], str | None, str | None]:
@@ -407,6 +478,20 @@ def _openpi_worker_status(runtime_cfg: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "mode": "worker", "host": host, "port": port, "reason": "unreachable", "error": str(exc)}
     ok = response.get("status") == "ok"
     return {"ok": ok, "mode": "worker", "host": host, "port": port, "reason": response.get("status"), "response": response}
+
+
+def _preflight_spec(env: Any) -> dict[str, Any]:
+    if env is not None and hasattr(env, "preflight_spec"):
+        spec = env.preflight_spec()
+        if isinstance(spec, dict):
+            return spec
+    return {
+        "required_cameras": ["head_camera", "front_camera", "left_camera", "right_camera"],
+        "action_cameras": ["head_camera", "left_camera", "right_camera"],
+        "expected_resolution": [960, 540],
+        "state": {"required": True, "dim": 14, "source": "joint_action_vector"},
+        "action": {"required": True, "types": {"qpos": 14, "ee": 16}},
+    }
 
 
 def _finite(value: Any) -> bool:

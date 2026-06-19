@@ -30,9 +30,11 @@ class AgentExecutor(AgentExecutorBase):
     async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine, images=None):
         metadata = _parse_label(label)
         episode_index = int(metadata.get("index", 0) or 0)
-        seed = int(metadata.get("seed", episode_index) or episode_index)
+        seed_value = metadata.get("seed")
+        seed = int(seed_value if seed_value is not None else episode_index)
         task_name = str(metadata.get("task_name") or self.rl_config.rollout.task_name)
         instruction = str(metadata.get("instruction") or self.rl_config.rollout.instruction)
+        task_params = metadata.get("params") if isinstance(metadata.get("params"), dict) else {}
         writer = TrajectoryWriter(self.run_dir / "events.jsonl")
         backend = _OpenRLHFPolicyBackend(
             sampling_params=sampling_params,
@@ -53,6 +55,7 @@ class AgentExecutor(AgentExecutorBase):
                 policy_base_url=proxy.base_url,
                 task_name=task_name,
                 instruction=instruction,
+                task_params=task_params,
             )
         finally:
             proxy.stop()
@@ -175,6 +178,8 @@ def _episode_to_call_samples(*, prompt: str, label: str, episode: Any, reward_sc
                     "clawvla_episode_uid": int(episode_uid),
                     "clawvla_call_index": int(call_index),
                     "clawvla_policy_calls": int(policy_calls),
+                    "clawvla_has_images": int(bool(call.image_refs)),
+                    "clawvla_image_count": int(len(call.image_refs)),
                 },
             }
         )

@@ -21,6 +21,7 @@ class Pi05ActionBackend:
     def __init__(self, config: dict[str, Any] | None = None):
         self.config = dict(config or {})
         self._openpi_runtime: dict[str, Any] | None = None
+        self._lerobot_runtime: dict[str, Any] | None = None
 
     def build_action_chunk(
         self,
@@ -52,6 +53,17 @@ class Pi05ActionBackend:
                 return self._result_from_chunk(chunk)
             chunk = self._build_openpi_action_chunk(motion_goal, world_state, observation, request, summary)
             return self._result_from_chunk(chunk)
+        if isinstance(summary, dict) and summary.get("checkpoint_format") == "lerobot":
+            adapter = self._lerobot_adapter_summary(summary)
+            if adapter.get("adapter") == "libero" and adapter.get("compatible_for_execution", False):
+                chunk = self._build_lerobot_libero_action_chunk(motion_goal, world_state, observation, request, summary)
+                return self._result_from_chunk(chunk)
+            return self._unavailable(
+                "pi05_lerobot_action_adapter_not_configured",
+                motion_goal,
+                request,
+                {"diagnosis": diagnosis, "lerobot_adapter": adapter},
+            )
         if find_spec("lerobot") is None:
             return self._unavailable("lerobot_not_installed_in_current_environment", motion_goal, request)
         adapter = diagnosis.get("robotwin_adapter", {})
@@ -63,6 +75,105 @@ class Pi05ActionBackend:
                 {"diagnosis": diagnosis},
             )
         return self._unavailable("pi05_robotwin_observation_adapter_not_implemented", motion_goal, request, {"diagnosis": diagnosis})
+
+    def action_spec(self) -> dict[str, Any]:
+        summary = self._policy_summary(self.config.get("pretrained_path"))
+        if summary.get("checkpoint_format") == "lerobot":
+            adapter = self._lerobot_adapter_summary(summary)
+            if adapter.get("adapter") == "libero":
+                return {
+                    "backend": self.name,
+                    "checkpoint_format": "lerobot",
+                    "adapter": "libero",
+                    "types": {"libero_ee_delta": 7},
+                    "horizon": summary.get("n_action_steps") or summary.get("chunk_size"),
+                }
+        if summary.get("checkpoint_format") == "openpi":
+            robotwin = self._robotwin_adapter_summary(summary)
+            action_type = robotwin.get("action_type") or "qpos"
+            dim = 14 if action_type == "qpos" else 16 if action_type == "ee" else None
+            return {
+                "backend": self.name,
+                "checkpoint_format": "openpi",
+                "adapter": "robotwin",
+                "types": {str(action_type): dim} if dim is not None else {},
+                "horizon": summary.get("action_horizon"),
+            }
+        return {"backend": self.name, "types": {}, "checkpoint_format": summary.get("checkpoint_format")}
+
+    def health(self) -> dict[str, Any]:
+        if not self.config.get("enabled", False):
+            return {"ok": False, "backend": self.name, "reason": "action_backend_disabled"}
+        pretrained_path = self.config.get("pretrained_path")
+        if not pretrained_path:
+            return {"ok": False, "backend": self.name, "reason": "action_backend_pretrained_path_missing"}
+        if not Path(str(pretrained_path)).exists():
+            return {
+                "ok": False,
+                "backend": self.name,
+                "reason": "action_backend_pretrained_path_not_found",
+                "pretrained_path": str(pretrained_path),
+            }
+        summary = self._policy_summary(pretrained_path)
+        if summary.get("checkpoint_format") == "lerobot":
+            adapter = self._lerobot_adapter_summary(summary)
+            if not adapter.get("compatible_for_execution", False):
+                return {
+                    "ok": False,
+                    "backend": self.name,
+                    "reason": "lerobot_adapter_not_compatible",
+                    "policy_summary": summary,
+                    "adapter": adapter,
+                }
+            if find_spec("lerobot") is None:
+                return {
+                    "ok": False,
+                    "backend": self.name,
+                    "reason": "lerobot_not_importable",
+                    "required_pythonpath": self.config.get("lerobot_src") or "/mnt/wangwai/lerobot/src",
+                }
+            return {
+                "ok": True,
+                "backend": self.name,
+                "reason": "ok",
+                "checkpoint_format": "lerobot",
+                "adapter": adapter,
+                "pretrained_path": str(pretrained_path),
+            }
+        if summary.get("checkpoint_format") == "openpi":
+            robotwin = self._robotwin_adapter_summary(summary)
+            if not robotwin.get("compatible_for_execution", False):
+                return {
+                    "ok": False,
+                    "backend": self.name,
+                    "reason": "robotwin_adapter_not_compatible",
+                    "policy_summary": summary,
+                    "adapter": robotwin,
+                }
+            runtime_cfg = self.config.get("openpi_runtime", {})
+            if isinstance(runtime_cfg, dict) and runtime_cfg.get("mode") == "worker" and os.environ.get("CLAWVLA_PI05_DIRECT") != "1":
+                worker = _openpi_worker_health(runtime_cfg)
+                return {
+                    "ok": bool(worker.get("ok")),
+                    "backend": self.name,
+                    "reason": "ok" if worker.get("ok") else f"openpi_worker_{worker.get('reason')}",
+                    "checkpoint_format": "openpi",
+                    "adapter": robotwin,
+                    "worker": worker,
+                }
+            return {
+                "ok": True,
+                "backend": self.name,
+                "reason": "ok",
+                "checkpoint_format": "openpi",
+                "adapter": robotwin,
+            }
+        return {
+            "ok": False,
+            "backend": self.name,
+            "reason": "unsupported_checkpoint_format",
+            "policy_summary": summary,
+        }
 
     def _use_openpi_subprocess(self) -> bool:
         runtime_cfg = self.config.get("openpi_runtime", {})
@@ -300,6 +411,140 @@ class Pi05ActionBackend:
             "raw_action_shape": list(raw_np.shape),
         }
 
+    def _build_lerobot_libero_action_chunk(
+        self,
+        motion_goal: MotionGoal | None,
+        world_state: WorldState | None,
+        observation: ObservationBundle | None,
+        request: dict[str, Any],
+        summary: dict[str, Any],
+    ) -> ActionChunk:
+        runtime = self._load_lerobot_runtime(summary)
+        inference = self._infer_lerobot_libero_actions(runtime, motion_goal, world_state, observation, request)
+        commands = inference["commands"]
+        metadata = {
+            "backend": self.name,
+            "status": "pi05_action_chunk_built",
+            "checkpoint_format": "lerobot",
+            "adapter": "libero",
+            "action_type": "libero_ee_delta",
+            "prompt": inference["prompt"],
+            "state_source": inference["state_source"],
+            "image_sources": inference["image_sources"],
+            "raw_action_shape": inference["raw_action_shape"],
+            "command_shape": [len(commands), len(commands[0]) if commands else 0],
+            "policy_class": runtime["policy_class"],
+            "pretrained_path": runtime["pretrained_path"],
+            "motion_goal": motion_goal.to_dict() if hasattr(motion_goal, "to_dict") else None,
+            "request": dict(request),
+        }
+        return ActionChunk(
+            action_type="libero_ee_delta",
+            commands=commands,
+            control_horizon=len(commands),
+            metadata=metadata,
+        )
+
+    def _load_lerobot_runtime(self, summary: dict[str, Any]) -> dict[str, Any]:
+        if self._lerobot_runtime is not None:
+            return self._lerobot_runtime
+
+        import torch
+        from lerobot.configs import PreTrainedConfig
+        from lerobot.envs.configs import LiberoEnv
+        from lerobot.policies import make_policy, make_pre_post_processors
+
+        pretrained_path = str(self.config.get("pretrained_path") or "")
+        policy_kwargs = self.config.get("policy_kwargs", {})
+        policy_kwargs = dict(policy_kwargs) if isinstance(policy_kwargs, dict) else {}
+        policy_kwargs["device"] = str(self.config.get("device") or policy_kwargs.get("device") or "cuda")
+        policy_cfg = PreTrainedConfig.from_pretrained(
+            pretrained_name_or_path=pretrained_path,
+            local_files_only=True,
+            **policy_kwargs,
+        )
+        policy_cfg.pretrained_path = pretrained_path
+        env_payload = self.config.get("lerobot_env", {})
+        env_payload = env_payload if isinstance(env_payload, dict) else {}
+        env_cfg = LiberoEnv(
+            task=str(env_payload.get("task") or "libero_object"),
+            obs_type=str(env_payload.get("obs_type") or "pixels_agent_pos"),
+            observation_height=int(env_payload.get("observation_height") or 256),
+            observation_width=int(env_payload.get("observation_width") or 256),
+            control_mode=str(env_payload.get("control_mode") or "relative"),
+        )
+        policy = make_policy(policy_cfg, env_cfg=env_cfg)
+        policy.eval()
+        if hasattr(policy, "to"):
+            policy.to(torch.device(str(policy_kwargs["device"])))
+        preprocessor_overrides = {"device_processor": {"device": str(policy_kwargs["device"])}}
+        tokenizer_name = self._resolve_tokenizer_name()
+        if tokenizer_name:
+            preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": tokenizer_name}
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy_cfg,
+            pretrained_path=pretrained_path,
+            preprocessor_overrides=preprocessor_overrides,
+        )
+        self._lerobot_runtime = {
+            "torch": torch,
+            "device": str(policy_kwargs["device"]),
+            "policy_cfg": policy_cfg,
+            "policy": policy,
+            "policy_class": type(policy).__name__,
+            "preprocessor": preprocessor,
+            "postprocessor": postprocessor,
+            "pretrained_path": pretrained_path,
+            "input_features": summary.get("input_features", {}),
+            "output_features": summary.get("output_features", {}),
+        }
+        return self._lerobot_runtime
+
+    def _infer_lerobot_libero_actions(
+        self,
+        runtime: dict[str, Any],
+        motion_goal: MotionGoal | None,
+        world_state: WorldState | None,
+        observation: ObservationBundle | None,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        torch = runtime["torch"]
+        policy = runtime["policy"]
+        prompt = _resolve_prompt(self, motion_goal, world_state, observation, request)
+        frame, frame_metadata = _lerobot_libero_frame(
+            observation,
+            prompt,
+            flip_images=bool(self.config.get("libero_flip_images", False)),
+        )
+        batch = runtime["preprocessor"](frame)
+        if hasattr(policy, "reset"):
+            policy.reset()
+        horizon = int(request.get("horizon") or self.config.get("policy_kwargs", {}).get("n_action_steps") or 10)
+        commands: list[list[float]] = []
+        raw_shape: list[int] | None = None
+        with torch.inference_mode():
+            for _ in range(horizon):
+                raw_action = policy.select_action(batch)
+                raw_shape = list(raw_action.shape)
+                action = runtime["postprocessor"](raw_action)
+                if hasattr(action, "detach"):
+                    array = action.detach().float().cpu().numpy()
+                else:
+                    import numpy as np
+
+                    array = np.asarray(action, dtype=float)
+                vector = array.reshape(-1)
+                if vector.shape[0] != 7:
+                    raise ValueError(f"pi05_libero_action_dim_mismatch:{vector.shape[0]}!=7")
+                commands.append([float(item) for item in vector.tolist()])
+        return {
+            "commands": commands,
+            "prompt": prompt,
+            "state_source": frame_metadata["state_source"],
+            "image_sources": frame_metadata["image_sources"],
+            "raw_action_shape": raw_shape,
+        }
+
     def diagnose(self, load_policy: bool = False) -> dict[str, Any]:
         pretrained_path = self.config.get("pretrained_path")
         summary = self._policy_summary(pretrained_path)
@@ -314,6 +559,7 @@ class Pi05ActionBackend:
             "tokenizer_name": self._resolve_tokenizer_name(),
             "policy_summary": summary,
             "robotwin_adapter": self._robotwin_adapter_summary(summary),
+            "lerobot_adapter": self._lerobot_adapter_summary(summary),
             "policy_load": {"requested": bool(load_policy), "status": "not_requested"},
         }
         if load_policy:
@@ -681,6 +927,57 @@ class Pi05ActionBackend:
             else None,
         }
 
+    def _lerobot_adapter_summary(self, policy_summary: dict[str, Any]) -> dict[str, Any]:
+        adapter_cfg = self.config.get("environment_adapter", {})
+        adapter_cfg = adapter_cfg if isinstance(adapter_cfg, dict) else {}
+        libero_cfg = self.config.get("libero_adapter", {})
+        libero_cfg = libero_cfg if isinstance(libero_cfg, dict) else {}
+        env_type = str(adapter_cfg.get("type") or libero_cfg.get("type") or "").lower()
+        lerobot_env = self.config.get("lerobot_env", {})
+        lerobot_env = lerobot_env if isinstance(lerobot_env, dict) else {}
+        output_features = policy_summary.get("output_features", {}) if isinstance(policy_summary, dict) else {}
+        input_features = policy_summary.get("input_features", {}) if isinstance(policy_summary, dict) else {}
+        action_shape = _feature_shape(output_features.get("action")) if isinstance(output_features, dict) else None
+        state_shape = _feature_shape(input_features.get("observation.state")) if isinstance(input_features, dict) else None
+        inferred_libero = (
+            env_type == "libero"
+            or str(lerobot_env.get("task") or "").startswith("libero")
+            or bool(libero_cfg)
+        )
+        compatible = (
+            policy_summary.get("checkpoint_format") == "lerobot"
+            and inferred_libero
+            and action_shape == [7]
+            and state_shape == [8]
+        )
+        reason = None
+        if not compatible:
+            if policy_summary.get("checkpoint_format") != "lerobot":
+                reason = "checkpoint is not a LeRobot checkpoint"
+            elif not inferred_libero:
+                reason = "environment_adapter.type must be libero for 7D LIBERO execution"
+            elif action_shape != [7]:
+                reason = f"policy action shape must be [7] for LIBERO, got {action_shape}"
+            elif state_shape != [8]:
+                reason = f"policy state shape must be [8] for LIBERO, got {state_shape}"
+            else:
+                reason = "unknown_lerobot_libero_adapter_mismatch"
+        return {
+            "adapter": "libero" if inferred_libero else None,
+            "compatible_for_execution": compatible,
+            "checkpoint_format": policy_summary.get("checkpoint_format"),
+            "policy_action_shape": action_shape,
+            "policy_state_shape": state_shape,
+            "expected_action_type": "libero_ee_delta",
+            "expected_action_shape": [7],
+            "expected_state_shape": [8],
+            "reason": reason,
+            "lerobot_env": dict(lerobot_env),
+            "environment_adapter": dict(adapter_cfg),
+            "libero_adapter": dict(libero_cfg),
+            "flip_images_for_policy": bool(self.config.get("libero_flip_images", False)),
+        }
+
     def _openpi_import_summary(self) -> dict[str, Any]:
         openpi_src = self._openpi_src()
         return {
@@ -780,9 +1077,16 @@ class Pi05ActionBackend:
             "lerobot_env": dict(self.config.get("lerobot_env", {}))
             if isinstance(self.config.get("lerobot_env"), dict)
             else {},
+            "environment_adapter": dict(self.config.get("environment_adapter", {}))
+            if isinstance(self.config.get("environment_adapter"), dict)
+            else {},
+            "libero_adapter": dict(self.config.get("libero_adapter", {}))
+            if isinstance(self.config.get("libero_adapter"), dict)
+            else {},
             "robotwin_adapter": dict(self.config.get("robotwin_adapter", {}))
             if isinstance(self.config.get("robotwin_adapter"), dict)
             else {},
+            "libero_flip_images": bool(self.config.get("libero_flip_images", False)),
         }
 
 
@@ -939,6 +1243,76 @@ def _read_socket_json_line(sock: socket.socket) -> dict[str, Any]:
     if not data:
         raise RuntimeError("pi05_worker_empty_response")
     return json.loads(data.decode("utf-8"))
+
+
+def _openpi_worker_health(runtime_cfg: dict[str, Any]) -> dict[str, Any]:
+    host = str(runtime_cfg.get("host") or "127.0.0.1")
+    port = int(runtime_cfg.get("port") or 8765)
+    try:
+        with socket.create_connection((host, port), timeout=2.0) as sock:
+            sock.sendall(b'{"op":"health"}\n')
+            payload = sock.recv(4096).split(b"\n", 1)[0]
+        response = json.loads(payload.decode("utf-8"))
+    except Exception as exc:
+        return {"ok": False, "mode": "worker", "host": host, "port": port, "reason": "unreachable", "error": str(exc)}
+    return {
+        "ok": response.get("status") == "ok",
+        "mode": "worker",
+        "host": host,
+        "port": port,
+        "reason": response.get("status"),
+        "response": response,
+    }
+
+
+def _lerobot_libero_frame(
+    observation: ObservationBundle | None,
+    prompt: str,
+    *,
+    flip_images: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    if observation is None:
+        raise ValueError("Observation is required for pi05 LIBERO inference.")
+    state8, state_source = _libero_state8_from_observation(observation)
+    image_sources: dict[str, str] = {}
+    frame: dict[str, Any] = {
+        "observation.state": torch.as_tensor(state8, dtype=torch.float32),
+        "task": prompt,
+    }
+    for policy_key, camera_name in {
+        "observation.images.image": "agentview",
+        "observation.images.image2": "wrist",
+    }.items():
+        view = observation.camera_views.get(camera_name)
+        if view is None or not view.rgb_path:
+            raise ValueError(f"Missing LIBERO RGB artifact for camera {camera_name}.")
+        image = Image.open(view.rgb_path).convert("RGB")
+        array = np.asarray(image, dtype=np.uint8).copy()
+        if flip_images:
+            array = np.flip(array, axis=(0, 1)).copy()
+        tensor = torch.as_tensor(array, dtype=torch.float32).permute(2, 0, 1) / 255.0
+        frame[policy_key] = tensor
+        image_sources[policy_key] = str(view.rgb_path)
+    return frame, {"state_source": state_source, "image_sources": image_sources}
+
+
+def _libero_state8_from_observation(observation: ObservationBundle) -> tuple[list[float], str]:
+    if isinstance(observation.raw, dict) and isinstance(observation.raw.get("libero_state8"), list):
+        values = [float(item) for item in observation.raw["libero_state8"]]
+        if len(values) == 8:
+            return values, "observation.raw.libero_state8"
+    arms = observation.robot_arms if isinstance(observation.robot_arms, dict) else {}
+    panda = arms.get("panda")
+    metadata = getattr(panda, "metadata", {}) if panda is not None else {}
+    if isinstance(metadata, dict) and isinstance(metadata.get("state8"), list):
+        values = [float(item) for item in metadata["state8"]]
+        if len(values) == 8:
+            return values, "observation.robot_arms.panda.metadata.state8"
+    raise ValueError("8D LIBERO state is missing from observation.")
 
 
 def _openpi_image_keys() -> tuple[str, str, str]:

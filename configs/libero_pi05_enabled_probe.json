@@ -1,0 +1,252 @@
+{
+  "name": "clawvla_libero_pi05_enabled_probe",
+  "task": {
+    "instruction": "pick up the alphabet soup and place it in the basket",
+    "default_stage": "observe"
+  },
+  "models": {
+    "vision": {
+      "backend": "openai_compatible",
+      "model": "gpt-5.5",
+      "api_base_url": null,
+      "api_base_url_env": "OPENAI_COMPATIBLE_API_BASE_URL",
+      "api_key": null,
+      "api_key_env": "OPENAI_COMPATIBLE_API_KEY",
+      "max_new_tokens": 2048,
+      "temperature": 0.0,
+      "request_timeout": 1800.0,
+      "reasoning_effort": "medium"
+    },
+    "state": {
+      "backend": "none",
+      "model": null
+    },
+    "scheduler": {
+      "backend": "openai_compatible",
+      "model": "gpt-5.5",
+      "api_base_url": null,
+      "api_base_url_env": "OPENAI_COMPATIBLE_API_BASE_URL",
+      "api_key": null,
+      "api_key_env": "OPENAI_COMPATIBLE_API_KEY",
+      "max_new_tokens": 2048,
+      "temperature": 0.0,
+      "request_timeout": 1800.0,
+      "reasoning_effort": "medium"
+    },
+    "safety": {
+      "backend": "none",
+      "model": null
+    },
+    "motion": {
+      "backend": "none",
+      "model": null
+    },
+    "verifier": {
+      "backend": "openai_compatible",
+      "model": "gpt-5.5",
+      "api_base_url": null,
+      "api_base_url_env": "OPENAI_COMPATIBLE_API_BASE_URL",
+      "api_key": null,
+      "api_key_env": "OPENAI_COMPATIBLE_API_KEY",
+      "max_new_tokens": 2048,
+      "temperature": 0.0,
+      "request_timeout": 1800.0,
+      "reasoning_effort": "medium"
+    },
+    "recovery": {
+      "backend": "openai_compatible",
+      "model": "gpt-5.5",
+      "api_base_url": null,
+      "api_base_url_env": "OPENAI_COMPATIBLE_API_BASE_URL",
+      "api_key": null,
+      "api_key_env": "OPENAI_COMPATIBLE_API_KEY",
+      "max_new_tokens": 2048,
+      "temperature": 0.0,
+      "request_timeout": 1800.0,
+      "reasoning_effort": "medium"
+    }
+  },
+  "components": {
+    "vision": {
+      "enabled": true,
+      "model": "vision",
+      "prompt_format": "json",
+      "skills": [
+        "capture_views",
+        "perceive_scene",
+        "localize_task_objects",
+        "refresh_preflight_observation",
+        "render_grounding_overlay",
+        "lift_depth_cluster",
+        "lift_geometry",
+        "bind_arm",
+        "estimate_uncertainty"
+      ]
+    },
+    "state": {
+      "enabled": true,
+      "model": "state",
+      "prompt_format": "json",
+      "skills": [
+        "update_world_state",
+        "summarize_state"
+      ]
+    },
+    "scheduler": {
+      "enabled": true,
+      "model": "scheduler",
+      "prompt_format": "json",
+      "skills": [
+        "select_next_component",
+        "choose_next_skill",
+        "build_task_plan",
+        "select_current_subgoal",
+        "advance_subgoal",
+        "allocate_budget",
+        "repair_stage_transition"
+      ]
+    },
+    "safety": {
+      "enabled": true,
+      "model": "safety",
+      "prompt_format": "json",
+      "skills": [
+        "validate_skill_request",
+        "validate_arm_binding",
+        "check_reachability",
+        "check_workspace",
+        "preflight_action"
+      ]
+    },
+    "motion": {
+      "enabled": true,
+      "model": "motion",
+      "prompt_format": "json",
+      "skills": [
+        "build_motion_goal",
+        "plan_motion",
+        "emit_action_chunk",
+        "execute_action"
+      ]
+    },
+    "verifier": {
+      "enabled": true,
+      "model": "verifier",
+      "prompt_format": "json",
+      "skills": [
+        "verify_progress"
+      ]
+    },
+    "recovery": {
+      "enabled": true,
+      "model": "recovery",
+      "prompt_format": "json",
+      "skills": [
+        "decide_recovery",
+        "build_retry_request"
+      ]
+    }
+  },
+  "stages": [
+    {
+      "name": "observe",
+      "description": "Collect and interpret current public observations."
+    },
+    {
+      "name": "plan",
+      "description": "Select the next component and skill from shared state."
+    },
+    {
+      "name": "preflight",
+      "description": "Validate safety, binding, workspace, and reachability before motion."
+    },
+    {
+      "name": "execute",
+      "description": "Run a bounded motion/control skill."
+    },
+    {
+      "name": "verify",
+      "description": "Check progress and residuals from before/after observations."
+    },
+    {
+      "name": "recover",
+      "description": "Recover or replan after a failed or uncertain step."
+    }
+  ],
+  "environment": {
+    "type": "libero",
+    "artifact_dir": "/mnt/wangwai/vla/clawvla/tmp_artifacts/libero",
+    "task_name": "libero_object",
+    "seed": 0,
+    "params": {
+      "suite": "libero_object",
+      "task_id": 0,
+      "episode_index": 0,
+      "obs_size": 256,
+      "camera_names": [
+        "agentview_image",
+        "robot0_eye_in_hand_image"
+      ],
+      "control_mode": "relative",
+      "init_states": true,
+      "num_steps_wait": 10,
+      "render_gpu_device_id": -1,
+      "rotate_images_180": true
+    }
+  },
+  "robotwin": {
+    "repo_root": "/mnt/wangwai/RoboTwin",
+    "task_name": "place_container_plate",
+    "task_config": "demo_clean",
+    "seed": 0,
+    "artifact_dir": "/mnt/wangwai/vla/clawvla/tmp_artifacts"
+  },
+  "runtime_environment": {
+    "conda_env": "robotwin-py312",
+    "conda_bin": "/mnt/wangwai/miniconda3/bin/conda",
+    "pythonpath_prefix": [
+      "/mnt/wangwai/vla/clawvla/src",
+      "/mnt/wangwai/lerobot/src"
+    ],
+    "env": {
+      "PYTHONPATH": "/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/lerobot/src",
+      "MUJOCO_GL": "egl",
+      "PYOPENGL_PLATFORM": "egl",
+      "__EGL_VENDOR_LIBRARY_DIRS": "/usr/share/glvnd/egl_vendor.d",
+      "VK_ICD_FILENAMES": "/etc/vulkan/icd.d/nvidia_icd.json"
+    }
+  },
+  "metadata": {
+    "action_backend": {
+      "type": "pi05",
+      "enabled": true,
+      "policy_type": "pi05",
+      "pretrained_path": "/mnt/wangwai/weights/lerobot/pi05_libero_finetuned_v044",
+      "device": "cuda",
+      "policy_kwargs": {
+        "n_action_steps": 10,
+        "num_inference_steps": 10
+      },
+      "lerobot_env": {
+        "task": "libero_object",
+        "obs_type": "pixels_agent_pos",
+        "observation_height": 256,
+        "observation_width": 256,
+        "control_mode": "relative"
+      },
+      "environment_adapter": {
+        "type": "libero"
+      },
+      "libero_adapter": {
+        "type": "libero",
+        "action_type": "libero_ee_delta",
+        "state_mapping": "libero_state8",
+        "image_mapping": {
+          "observation.images.image": "agentview",
+          "observation.images.image2": "wrist"
+        }
+      },
+      "libero_flip_images": false
+    }
+  }
+}
