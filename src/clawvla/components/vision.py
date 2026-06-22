@@ -176,6 +176,7 @@ def perceive_scene(request: SkillRequest, context: SkillContext) -> SkillResult:
         payload = {
             "task_instruction": blackboard.task_instruction,
             "observation_context": _compact_observation_context(blackboard.read("observation")),
+            "task_role_hints": _task_role_hints(blackboard, existing_perception),
             "current_candidates": _compact_candidates(existing_perception) if existing_perception else [],
             "current_source_candidate_id": existing_perception.source_candidate_id if existing_perception else None,
             "current_target_candidate_id": existing_perception.target_candidate_id if existing_perception else None,
@@ -199,7 +200,11 @@ def perceive_scene(request: SkillRequest, context: SkillContext) -> SkillResult:
                 "top-level JSON object must contain exactly the keys candidates and uncertainty. The first "
                 "top-level key must be candidates. Do not wrap the answer in perception/result/output/data. "
                 "Do not echo inputs. Keep stable candidate ids when current_candidates are provided. Do not "
-                "estimate image coordinates. If "
+                "estimate image coordinates. Include both the movable source object and the destination "
+                "target/receptacle/fixture named or implied by the task. A cabinet, drawer, counter, sink, "
+                "plate, basket, bowl, or other destination fixture is a valid candidate even when it is part "
+                "of the background. For RoboCasa pick-place tasks, do not return only the small object; also "
+                "return the destination fixture such as the cabinet as a separate candidate. If "
                 "current_source_candidate_id/current_target_candidate_id are already set and the new "
                 "observation does not clearly contradict them, preserve those ids. Do not replace an already "
                 "grounded container/plate with visibility=no and null source/target."
@@ -256,11 +261,18 @@ def localize_task_objects(request: SkillRequest, context: SkillContext) -> Skill
                 "Bind the task source object and target object to semantic visual candidates. Output only the required schema object. "
                 "Do not echo task_instruction, observation, current_perception, required_schema, or any input object. "
                 "Top-level keys must be candidates, source_candidate_id, target_candidate_id, and uncertainty. "
-                "Keep stable candidate ids when possible. Do not estimate image coordinates."
+                "Keep stable candidate ids when possible. Do not estimate image coordinates. The source is the movable "
+                "object being picked, grasped, moved, or manipulated. The target is the destination object, receptacle, "
+                "support surface, or fixture named by the task. For 'place it in the cabinet', the cabinet is the "
+                "target candidate, not the movable object. If current_candidates contains only the source but the "
+                "target destination is visible in the images or listed in task_role_hints, add a separate target "
+                "candidate with a new stable id and bind target_candidate_id to it. Never set source_candidate_id "
+                "and target_candidate_id to the same candidate."
             ),
             payload={
                 "task_instruction": blackboard.task_instruction,
                 "observation_context": _compact_observation_context(blackboard.read("observation")),
+                "task_role_hints": _task_role_hints(blackboard, perception),
                 "current_candidates": _compact_candidates(perception),
                 "required_schema": {
                     "candidates": [
@@ -307,6 +319,7 @@ def localize_task_objects(request: SkillRequest, context: SkillContext) -> Skill
             )
         if localized.observation_id is None:
             localized.observation_id = get_attr(blackboard.read("observation"), "observation_id")
+        localized = _repair_localization_from_environment_hints(localized, perception, blackboard.read("observation"))
         contract_errors = _localization_contract_errors(localized)
         if contract_errors:
             _emit_invalid_model_output("vision.localize_task_objects", "localization_contract_failed", raw)
@@ -332,6 +345,8 @@ def localize_task_objects(request: SkillRequest, context: SkillContext) -> Skill
             )
         localized.metadata.update(perception.metadata)
         localized.metadata["localization_source"] = "vision_model"
+        if localized.metadata.get("environment_semantic_grounding_applied"):
+            localized.metadata["localization_source"] = "vision_model+environment_semantics"
         blackboard.write("perception", localized, event_type="vision.localize_task_objects")
         return ok("task_objects_localized_by_model", {"perception": localized.to_dict()})
 
@@ -404,8 +419,10 @@ def refresh_preflight_observation(request: SkillRequest, context: SkillContext) 
         )
         return result
 
+    base_prefix = str(request.payload.get("artifact_prefix") or blackboard.read("artifact_prefix") or "agent_loop").strip("/")
+    refresh_prefix = f"{base_prefix}/preflight_refresh/step_{len(blackboard.events):04d}"
     capture_payload = {
-        "artifact_prefix": request.payload.get("artifact_prefix") or blackboard.read("artifact_prefix") or "agent_loop",
+        "artifact_prefix": refresh_prefix,
         "instruction": request.payload.get("instruction") or blackboard.task_instruction,
     }
     env = blackboard.read("env_adapter")
@@ -591,8 +608,15 @@ def _compact_observation_context(observation: object | None) -> dict[str, Any]:
     camera_views = getattr(observation, "camera_views", {})
     if not isinstance(camera_views, dict):
         camera_views = {}
+    metadata = getattr(observation, "metadata", {})
+    raw = getattr(observation, "raw", {})
+    environment_semantics = _environment_semantics(observation) or None
     return {
         "observation_id": get_attr(observation, "observation_id"),
+        "task_instruction": get_attr(observation, "task_instruction"),
+        "environment_backend": metadata.get("backend") if isinstance(metadata, dict) else None,
+        "environment_task_name": metadata.get("task_name") if isinstance(metadata, dict) else None,
+        "environment_semantics": environment_semantics,
         "camera_views": {
             str(name): {
                 "rgb_path": getattr(view, "rgb_path", None),
@@ -615,6 +639,112 @@ def _compact_candidates(perception: PerceptionResult) -> list[dict[str, Any]]:
         }
         for candidate in perception.candidates
     ]
+
+
+def _task_role_hints(blackboard: Blackboard, perception: PerceptionResult | None) -> dict[str, Any]:
+    observation = blackboard.read("observation")
+    semantics = _environment_semantics(observation)
+    task_roles = semantics.get("task_roles", {}) if isinstance(semantics.get("task_roles"), dict) else {}
+    source_hint = task_roles.get("source") if isinstance(task_roles.get("source"), dict) else None
+    target_hint = task_roles.get("target") if isinstance(task_roles.get("target"), dict) else None
+    return {
+        "source_role": "the movable object to grasp or pick up",
+        "target_role": "the destination, receptacle, support surface, or fixture to place into/on",
+        "instruction_source_target_rule": (
+            "For tasks like 'pick/place/put X in/on Y', source_candidate_id must be X and "
+            "target_candidate_id must be Y. Do not use the same candidate for both roles."
+        ),
+        "environment_source_hint": source_hint,
+        "environment_target_hint": target_hint,
+        "existing_source_candidate_id": getattr(perception, "source_candidate_id", None),
+        "existing_target_candidate_id": getattr(perception, "target_candidate_id", None),
+    }
+
+
+def _environment_semantics(observation: object | None) -> dict[str, Any]:
+    metadata = getattr(observation, "metadata", {})
+    raw = getattr(observation, "raw", {})
+    metadata_enabled = isinstance(metadata, dict) and bool(metadata.get("environment_semantics_enabled"))
+    raw_enabled = isinstance(raw, dict) and bool(raw.get("environment_semantics_enabled"))
+    if not (metadata_enabled or raw_enabled):
+        return {}
+    if metadata_enabled and isinstance(metadata, dict) and isinstance(metadata.get("environment_semantics"), dict):
+        return dict(metadata["environment_semantics"])
+    if raw_enabled and isinstance(raw, dict) and isinstance(raw.get("environment_semantics"), dict):
+        return dict(raw["environment_semantics"])
+    return {}
+
+
+def _repair_localization_from_environment_hints(
+    localized: PerceptionResult,
+    existing: PerceptionResult,
+    observation: object | None,
+) -> PerceptionResult:
+    semantics = _environment_semantics(observation)
+    task_roles = semantics.get("task_roles", {}) if isinstance(semantics.get("task_roles"), dict) else {}
+    if not isinstance(task_roles, dict):
+        return localized
+    by_id = {candidate.candidate_id: candidate for candidate in localized.candidates}
+    next_index = _next_candidate_index(by_id)
+    applied: list[str] = []
+
+    if not localized.source_candidate_id:
+        source_hint = task_roles.get("source")
+        candidate = _candidate_from_environment_hint(source_hint, role="source", candidate_id=f"C{next_index}")
+        if candidate is not None:
+            next_index += 1
+            localized.candidates.append(candidate)
+            localized.source_candidate_id = candidate.candidate_id
+            applied.append("source")
+
+    if not localized.target_candidate_id:
+        target_hint = task_roles.get("target")
+        candidate = _candidate_from_environment_hint(target_hint, role="target", candidate_id=f"C{next_index}")
+        if candidate is not None:
+            next_index += 1
+            localized.candidates.append(candidate)
+            localized.target_candidate_id = candidate.candidate_id
+            applied.append("target")
+
+    if applied and localized.source_candidate_id and localized.target_candidate_id:
+        localized = _merge_perception_update(existing, localized)[0]
+
+    if applied:
+        localized.metadata["environment_semantic_grounding_applied"] = applied
+        localized.metadata["environment_semantic_grounding_source"] = "observation.environment_semantics"
+    return localized
+
+
+def _candidate_from_environment_hint(hint: Any, *, role: str, candidate_id: str):
+    if not isinstance(hint, dict):
+        return None
+    label = str(hint.get("label") or "").strip()
+    if not label:
+        return None
+    from ..schema import SceneCandidate
+
+    return SceneCandidate(
+        candidate_id=candidate_id,
+        label=label,
+        role_hypotheses={role: 0.8},
+        evidence={"environment_hint": dict(hint)},
+        visibility="uncertain",
+        confidence=0.7,
+        status=f"{role} semantic handle from real environment registry",
+        metadata={
+            "source": "environment_semantics",
+            "env_key": hint.get("env_key"),
+            "fixture_class": hint.get("fixture_class"),
+            "role": role,
+        },
+    )
+
+
+def _next_candidate_index(by_id: dict[str, object]) -> int:
+    index = 1
+    while f"C{index}" in by_id:
+        index += 1
+    return index
 
 
 def _localization_contract_errors(perception: PerceptionResult) -> list[str]:

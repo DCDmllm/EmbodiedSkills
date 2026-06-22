@@ -24,6 +24,8 @@ Presets:
   robotwin-real1       configs/rl/qwen3vl_pi05_real_1update.yaml
   libero-multitask     configs/rl/qwen3vl_pi05_libero_multitask_1update.yaml
   libero-single        configs/rl/qwen3vl_pi05_libero_multitask_1update_single_gpu.yaml
+  robocasa-rollout     configs/rl/qwen3vl_groot_robocasa_rollout_smoke.yaml
+  robocasa-1update     configs/rl/qwen3vl_groot_robocasa_1update.yaml
   train-smoke          configs/rl/qwen3vl_pi05_train_smoke.yaml
   rollout-smoke        configs/rl/qwen3vl_pi05_rollout_smoke.yaml
 
@@ -46,6 +48,8 @@ preset_config() {
     robotwin-real1) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_pi05_real_1update.yaml" ;;
     libero-multitask) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_pi05_libero_multitask_1update.yaml" ;;
     libero-single) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_pi05_libero_multitask_1update_single_gpu.yaml" ;;
+    robocasa-rollout) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_groot_robocasa_rollout_smoke.yaml" ;;
+    robocasa-1update) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_groot_robocasa_1update.yaml" ;;
     train-smoke) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_pi05_train_smoke.yaml" ;;
     rollout-smoke) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_pi05_rollout_smoke.yaml" ;;
     "")

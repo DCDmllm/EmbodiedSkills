@@ -128,6 +128,7 @@ def emit_action_chunk(request: SkillRequest, context: SkillContext) -> SkillResu
     artifact_metadata = {
         "subgoal_id": get_attr(current_subgoal, "subgoal_id"),
         "observation_id": current_observation_id(blackboard),
+        "artifact_prefix": _execution_artifact_prefix(blackboard, request.payload),
         "consumed": False,
         "stale": False,
     }
@@ -139,8 +140,9 @@ def emit_action_chunk(request: SkillRequest, context: SkillContext) -> SkillResu
         output = {"action_chunk": chunk.to_dict(), "motion_plan": to_dict(motion_plan)}
         return unavailable("action_chunk_unavailable", "motion_plan_unavailable", output)
     if backend is not None and hasattr(backend, "build_action_chunk"):
+        backend_name = str(getattr(backend, "name", "action_backend"))
         emit_human_trace(
-            "openpi",
+            backend_name,
             "request action chunk",
             detail=f"subgoal={artifact_metadata.get('subgoal_id')} observation={artifact_metadata.get('observation_id')}",
         )
@@ -153,7 +155,7 @@ def emit_action_chunk(request: SkillRequest, context: SkillContext) -> SkillResu
         chunk = backend_result.action_chunk or _unavailable_chunk(backend_result.status, backend_result.to_dict())
         _stamp_chunk_metadata(chunk, artifact_metadata)
         emit_human_trace(
-            "openpi" if backend_result.success else "failure",
+            backend_name if backend_result.success else "failure",
             f"action backend -> {backend_result.status}",
             detail=f"commands={len(getattr(chunk, 'commands', []) or [])}",
         )
@@ -297,6 +299,16 @@ def _action_validation_report(
     }
 
 
+def _execution_artifact_prefix(blackboard: Blackboard, payload: dict[str, Any]) -> str:
+    requested = payload.get("artifact_prefix") if isinstance(payload, dict) else None
+    if requested:
+        return str(requested).strip("/")
+    run_prefix = blackboard.read("artifact_prefix")
+    if run_prefix:
+        return f"{str(run_prefix).strip('/')}/execute"
+    return "execute"
+
+
 def _expected_action_dim(action_type: object | None, backend: object | None = None) -> int | None:
     if backend is not None and hasattr(backend, "action_spec"):
         spec = backend.action_spec()
@@ -368,6 +380,8 @@ def _image_grounded_plan(
     current_subgoal = blackboard.read("current_subgoal")
     observation_id = current_observation_id(blackboard)
     vla_prompt = _vla_prompt(blackboard)
+    backend = blackboard.read("action_backend")
+    backend_name = str(payload.get("backend") or getattr(backend, "name", "vla_action_backend"))
     if not vla_prompt:
         return {
             "status": "motion_plan_unavailable",
@@ -384,7 +398,7 @@ def _image_grounded_plan(
         }
     return {
         "status": "image_grounded_motion_plan_built",
-        "backend": str(payload.get("backend", "pi05")),
+        "backend": backend_name,
         "motion_goal": to_dict(motion_goal),
         "vla_prompt": vla_prompt,
         "current_subgoal": to_dict(current_subgoal),

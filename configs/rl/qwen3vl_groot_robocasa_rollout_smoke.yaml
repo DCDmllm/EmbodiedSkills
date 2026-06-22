@@ -1,0 +1,80 @@
+extends:
+  - qwen3vl_pi05_grpo.yaml
+  - rewards/robocasa.yaml
+
+name: qwen3vl_groot_robocasa_rollout_smoke
+
+environment:
+  python: /mnt/wangwai/miniconda3/envs/groot-py312/bin/python
+  cwd: /mnt/wangwai/vla/clawvla
+  unset_env:
+    - PYTHONPATH
+  env:
+    PYTHONPATH: /mnt/wangwai/vla/clawvla/src:/mnt/wangwai/lerobot/src:/mnt/wangwai/RoboCasa:/mnt/wangwai/robosuite
+    MUJOCO_GL: egl
+    PYOPENGL_PLATFORM: egl
+    __EGL_VENDOR_LIBRARY_DIRS: /usr/share/glvnd/egl_vendor.d
+    http_proxy: http://10.20.5.5:20171
+    https_proxy: http://10.20.5.5:20171
+
+rollout:
+  base_config: /mnt/wangwai/vla/clawvla/configs/robocasa_groot_enabled_probe.json
+  instruction: pick up the object and place it in the cabinet
+  initial_stage: observe
+  max_steps: 20
+  run_environment: true
+  run_robotwin: false
+  start_openpi_worker: true
+  episodes: 1
+  group_size: 2
+  artifact_prefix: clawvla_rl_robocasa_groot_smoke
+  task_name: robocasa/PickPlaceCounterToCabinet
+  seeds:
+    - 0
+  episode_timeout_s: 1800.0
+  openpi_port_base: 9866
+
+openrlhf:
+  train_mode: full
+  rollout_n: 2
+  tensor_parallel_size: 1
+  total_epochs: 1
+  total_training_steps: 1
+  max_prompt_length: 8192
+  max_response_length: 2048
+  max_model_len: 12288
+  max_num_batched_tokens: 12288
+  max_num_seqs: 4
+  gpu_memory_utilization: 0.35
+  actor_ppo_mini_batch_size: 2
+  actor_ppo_micro_batch_size_per_gpu: 1
+  actor_ppo_max_token_len_per_gpu: 12288
+  rollout_log_prob_micro_batch_size_per_gpu: 1
+  ref_log_prob_micro_batch_size_per_gpu: 1
+  fsdp_param_offload: true
+  fsdp_optimizer_offload: true
+  val_before_train: false
+  test_freq: -1
+
+policy:
+  proxy_port: 18110
+
+cluster:
+  policy_gpus:
+    - 2
+    - 3
+  openpi_gpus:
+    - 6
+  robotwin_gpus:
+    - 7
+  ray_num_workers: 1
+
+logging:
+  wandb_tags:
+    - qwen3vl
+    - robocasa
+    - groot
+    - rollout
+
+metadata:
+  notes: Real RoboCasa plus GR00T rollout smoke. The policy is local Qwen3-VL through the OpenRLHF policy proxy; GR00T runs as the frozen RoboCasa action backend.

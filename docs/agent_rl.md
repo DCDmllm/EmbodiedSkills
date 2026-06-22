@@ -4,7 +4,7 @@ This document describes the current RL training scaffold in this repository. It 
 
 ## Scope
 
-The RL path trains one unified VLM policy for `vision`, `scheduler`, `verifier`, and `recovery`. RoboTwin and LIBERO can supply environment rollouts. OpenPI/pi0.5 remains frozen as the low-level action backend.
+The RL path trains one unified VLM policy for `vision`, `scheduler`, `verifier`, and `recovery`. RoboTwin, LIBERO, and RoboCasa can supply rollout observations. OpenPI/pi0.5 and GR00T remain frozen as low-level action backends.
 
 The implementation is under:
 
@@ -25,6 +25,7 @@ The training stack intentionally uses separate Python environments:
                       OpenRLHF / torch / vLLM / DeepSpeed / flash-attn training process
 robotwin-py312       ClawVLA runtime, RoboTwin rollout, and LIBERO rollout process
 openpi-torch-py312   OpenPI/pi0.5 worker process
+groot-py312          RoboCasa rollout process and GR00T worker process
 ```
 
 The processes communicate through subprocesses, HTTP-compatible policy calls, and archived trajectory files. The
@@ -59,6 +60,7 @@ Reward registration is configured in:
 ```text
 configs/rl/rewards/robotwin.yaml
 configs/rl/rewards/libero.yaml
+configs/rl/rewards/robocasa.yaml
 ```
 
 Current dense RoboTwin specs cover these tasks:
@@ -78,7 +80,7 @@ blocks_ranking_rgb
 ```
 
 All 50 RoboTwin training tasks are mapped to the `robotwin` reward handler. Tasks without a dedicated dense spec currently
-use the terminal/task-status baseline plus episode penalties. LIBERO object tasks use the same terminal penalty path plus the LIBERO reward registry hook.
+use the terminal/task-status baseline plus episode penalties. LIBERO object tasks use the same terminal penalty path plus the LIBERO reward registry hook. RoboCasa tasks use the RoboCasa task status and GR00T action backend.
 
 Episode-level penalties are also explicit:
 
@@ -99,6 +101,7 @@ Main current OpenRLHF config:
 ```text
 configs/rl/qwen3vl_pi05_multitask_1update.yaml
 configs/rl/qwen3vl_pi05_libero_multitask_1update.yaml
+configs/rl/qwen3vl_groot_robocasa_1update.yaml
 ```
 
 Useful smoke configs:
@@ -111,6 +114,7 @@ configs/rl/qwen3vl_pi05_rollout_real_smoke.yaml
 configs/rl/qwen3vl_pi05_real_1update.yaml
 configs/rl/qwen3vl_pi05_real_5step_1update.yaml
 configs/rl/qwen3vl_pi05_libero_multitask_1update_single_gpu.yaml
+configs/rl/qwen3vl_groot_robocasa_rollout_smoke.yaml
 ```
 
 Cluster and task overlays:
@@ -122,6 +126,7 @@ configs/rl/tasks/libero_object_smoke.yaml
 configs/rl/tasks/libero_object_all.yaml
 configs/rl/rewards/robotwin.yaml
 configs/rl/rewards/libero.yaml
+configs/rl/rewards/robocasa.yaml
 ```
 
 ## Commands
@@ -132,6 +137,7 @@ Dry run:
 cd /mnt/wangwai/vla/clawvla
 ./scripts/run_clawvla_rl.sh --mode dry-run
 ./scripts/run_clawvla_rl.sh --preset libero-multitask --mode dry-run
+./scripts/run_clawvla_rl.sh --preset robocasa-rollout --mode dry-run
 clawvla-rl --preset robotwin-multitask --mode dry-run
 ```
 
@@ -147,6 +153,11 @@ One-update real multimodal startup checks:
   --preset libero-multitask \
   --mode train \
   --run-id libero_rl_multitask
+
+./scripts/run_clawvla_rl.sh \
+  --preset robocasa-1update \
+  --mode dry-run \
+  --run-id robocasa_groot_1update
 ```
 
 ## Run Archive
@@ -180,7 +191,7 @@ cd /mnt/wangwai/vla/clawvla
 PYTHONPATH=src /mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python -m pytest tests/test_rl_framework.py -q
 ```
 
-The current tests cover config loading, reward registry behavior, policy proxy tracing, multimodal adapter payloads, call-level OpenRLHF samples, terminal penalties, runtime env setup, state placeholder rejection, LIBERO config wiring, and OpenRLHF mixed-modality alignment.
+The current tests cover config loading, reward registry behavior, policy proxy tracing, multimodal adapter payloads, call-level OpenRLHF samples, terminal penalties, runtime env setup, state placeholder rejection, LIBERO config wiring, RoboCasa/GR00T config wiring, and OpenRLHF mixed-modality alignment.
 
 ## Verified State
 
@@ -192,6 +203,7 @@ Verified:
 - OpenRLHF dry-run generates the 50-task prompt dataset and command successfully.
 - LIBERO `qwen3vl_pi05_libero_multitask_1update.yaml` completed one ZeRO-3 two-policy-GPU update with mixed text/multimodal samples.
 - RobotWin `qwen3vl_pi05_real_5step_1update.yaml` completed one ZeRO-3 four-policy-GPU update with mixed text/multimodal samples.
+- RoboCasa + GR00T path reports model action dim 32, environment action dim 12, and real execute state/image deltas in smoke runs. Task success is not claimed.
 - OpenRLHF runtime patches keep modality-compatible actor/ref forward batches and data-parallel replay-buffer order.
 - The RobotWin five-step smoke had uniform negative rewards, so it validated infrastructure and synchronization only.
 - Generated files are archived into run directories and ignored by git.

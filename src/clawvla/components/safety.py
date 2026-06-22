@@ -409,12 +409,78 @@ def _camera_status(view: Any, expected_resolution: Any = None) -> dict[str, Any]
 
 
 def _state_vector(observation: Any, state_spec: dict[str, Any]) -> tuple[list[float], str | None, str | None]:
-    source_hint = str(state_spec.get("source") or "")
+    source_hint_value = state_spec.get("source")
+    if isinstance(source_hint_value, list):
+        vector, source, error = _raw_or_arm_state_vector(observation, [str(item) for item in source_hint_value])
+        if vector or error is not None:
+            return vector, source, error
+    source_hint = str(source_hint_value or "")
     if source_hint == "libero_state8":
         vector, source, error = _libero_state8_vector(observation)
         if vector or error is not None:
             return vector, source, error
+    if source_hint:
+        vector, source, error = _raw_or_arm_state_vector(observation, [source_hint])
+        if vector or error is not None:
+            return vector, source, error
     return _joint_action_vector(observation)
+
+
+def _raw_or_arm_state_vector(observation: Any, keys: list[str]) -> tuple[list[float], str | None, str | None]:
+    if observation is None:
+        return [], None, None
+    raw = get_attr(observation, "raw", {})
+    if isinstance(raw, dict):
+        for key in keys:
+            vector = _float_list(raw.get(key))
+            if vector is not None:
+                return vector, f"observation.raw.{key}", None
+        summary_ref = raw.get("summary_ref")
+        if summary_ref:
+            try:
+                payload = json.loads(Path(str(summary_ref)).read_text(encoding="utf-8"))
+            except Exception as exc:
+                return [], "observation.raw.summary_ref", f"summary_ref_unreadable:{type(exc).__name__}:{exc}"
+            for key in keys:
+                vector = _float_list(payload.get(key))
+                if vector is not None:
+                    return vector, f"observation.raw.summary_ref.{key}", None
+    arms = get_attr(observation, "robot_arms", {})
+    if isinstance(arms, dict):
+        for arm_name, arm in arms.items():
+            metadata = get_attr(arm, "metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+            for key in keys:
+                vector = _float_list(metadata.get(key))
+                if vector is not None:
+                    return vector, f"observation.robot_arms.{arm_name}.metadata.{key}", None
+    return [], f"observation.raw.{keys[0] if keys else 'state'}", "state_vector_missing"
+
+
+def _float_list(value: Any) -> list[float] | None:
+    if value is None:
+        return None
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, tuple):
+        value = list(value)
+    if not isinstance(value, list):
+        return None
+    try:
+        return [float(item) for item in _flatten(value)]
+    except (TypeError, ValueError):
+        return None
+
+
+def _flatten(value: list[Any]) -> list[Any]:
+    result: list[Any] = []
+    for item in value:
+        if isinstance(item, list):
+            result.extend(_flatten(item))
+        else:
+            result.append(item)
+    return result
 
 
 def _libero_state8_vector(observation: Any) -> tuple[list[float], str | None, str | None]:

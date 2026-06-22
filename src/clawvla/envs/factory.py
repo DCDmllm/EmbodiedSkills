@@ -3,6 +3,7 @@ from __future__ import annotations
 from ..config import AgentConfig
 from .base import RobotEnvAdapter
 from .libero import LiberoAdapter
+from .robocasa import RoboCasaAdapter
 from .robotwin import RoboTwinAdapter
 
 
@@ -12,6 +13,8 @@ def build_env_adapter(config: AgentConfig) -> RobotEnvAdapter:
         return RoboTwinAdapter(config.robotwin)
     if env_type in {"libero", "libero_env"}:
         return LiberoAdapter(config.environment)
+    if env_type in {"robocasa", "robo_casa"}:
+        return RoboCasaAdapter(config.environment)
     raise ValueError(f"unsupported_environment_type:{env_type}")
 
 

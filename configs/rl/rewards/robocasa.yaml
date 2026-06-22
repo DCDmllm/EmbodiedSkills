@@ -1,0 +1,6 @@
+reward:
+  registry:
+    - clawvla.rl.reward_registry:register_builtin_robotwin
+    - clawvla.rl.reward_registry:register_builtin_robocasa
+  task_map:
+    robocasa/PickPlaceCounterToCabinet: robocasa

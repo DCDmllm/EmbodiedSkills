@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.request import Request, urlopen
 
@@ -12,7 +13,7 @@ import pytest
 
 from clawvla.agent_loop import AgentLoop, AgentLoopConfig
 from clawvla.action_backends.pi05 import _resolve_prompt
-from clawvla.config import RobotwinConfig, load_config
+from clawvla.config import EnvironmentConfig, RobotwinConfig, load_config
 from clawvla.components.motion import _vla_prompt, execute_action
 from clawvla.components.recovery import build_retry_request, decide_recovery
 from clawvla.components.safety import preflight_action
@@ -215,6 +216,90 @@ def test_pi05_libero_checkpoint_diagnosis() -> None:
     assert diagnosis["policy_summary"]["checkpoint_format"] == "lerobot"
     assert diagnosis["lerobot_adapter"]["compatible_for_execution"] is True
     assert backend.action_spec()["types"]["libero_ee_delta"] == 7
+
+
+def test_groot_robocasa_action_spec_separates_model_and_env_dims(tmp_path) -> None:
+    from clawvla.action_backends.groot import GrootActionBackend
+
+    checkpoint = tmp_path / "groot_checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gr00t_n1_5",
+                "action_dim": 32,
+                "action_horizon": 16,
+                "compute_dtype": "bfloat16",
+            }
+        ),
+        encoding="utf-8",
+    )
+    backend = GrootActionBackend(
+        {
+            "type": "groot",
+            "enabled": True,
+            "pretrained_path": str(checkpoint),
+            "env_action_dim": 12,
+            "action_type": "robocasa_action",
+            "policy_kwargs": {"n_action_steps": 16, "max_action_dim": 32},
+        }
+    )
+
+    spec = backend.action_spec()
+
+    assert spec["checkpoint_format"] == "raw_groot"
+    assert spec["model_action_dim"] == 32
+    assert spec["env_action_dim"] == 12
+    assert spec["types"]["robocasa_action"] == 12
+    assert spec["horizon"] == 16
+
+
+def test_robocasa_execute_action_reports_state_effect(tmp_path) -> None:
+    import numpy as np
+
+    from clawvla.envs.robocasa import RoboCasaAdapter
+
+    def raw_state(offset: float) -> dict[str, object]:
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+        return {
+            "video.robot0_agentview_left": image,
+            "video.robot0_agentview_right": image,
+            "video.robot0_eye_in_hand": image,
+            "state.base_position": [2.0 + offset, -0.7, 0.7],
+            "state.base_rotation": [0.0, 0.0, 0.7, 0.7],
+            "state.end_effector_position_relative": [0.2 + offset, 0.0, 0.5],
+            "state.end_effector_rotation_relative": [-1.0, 0.0, 0.0, 0.0],
+            "state.gripper_qpos": [0.02 + offset, -0.02],
+        }
+
+    class FakeEnv:
+        action_space = None
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def step(self, action):
+            self.calls += 1
+            return raw_state(0.01 * self.calls), 0.0, False, False, {"success": False}
+
+    adapter = RoboCasaAdapter(
+        EnvironmentConfig(
+            type="robocasa",
+            task_name="robocasa/PickPlaceCounterToCabinet",
+            artifact_dir=str(tmp_path / "artifacts"),
+        )
+    )
+    adapter.env = FakeEnv()
+    adapter.last_raw_observation = raw_state(0.0)
+
+    report = adapter.execute_action(ActionChunk(action_type="robocasa_action", commands=[[0.1] * 12]))
+
+    assert report["status"] == "action_executed"
+    assert report["executed_steps"] == 1
+    assert report["action_effect"]["state_delta_available"] is True
+    assert report["action_effect"]["state_changed"] is True
+    assert report["action_effect"]["max_abs_state_delta"] > 0.0
+    assert report["action_effect"]["max_abs_action"] == pytest.approx(0.1)
 
 
 def test_reward_registry_requires_configured_task() -> None:
@@ -1397,6 +1482,111 @@ def test_localize_task_objects_accepts_semantic_binding_without_bbox() -> None:
     assert perception.source_candidate_id == "C1"
     assert perception.target_candidate_id == "C2"
     assert all(candidate.bbox_by_view == {} for candidate in perception.candidates)
+
+
+def test_localize_task_objects_repairs_missing_robocasa_target_from_env_semantics() -> None:
+    existing = PerceptionResult(
+        observation_id="obs_test",
+        candidates=[SceneCandidate(candidate_id="C1", label="beer", visibility="yes", confidence=0.9)],
+    )
+    response_missing_target = json.dumps(
+        {
+            "candidates": [
+                {"candidate_id": "C1", "label": "beer", "visibility": "yes", "confidence": 0.9},
+            ],
+            "source_candidate_id": "C1",
+            "target_candidate_id": None,
+            "uncertainty": {"needs_reobserve": False, "reasons": []},
+        }
+    )
+    blackboard = Blackboard(task_instruction="pick up the object and place it in the cabinet")
+    blackboard.write(
+        "observation",
+        ObservationBundle(
+            observation_id="obs_test",
+            raw={
+                "environment_semantics_enabled": True,
+                "environment_semantics": {
+                    "backend": "robocasa",
+                    "task_roles": {
+                        "source": {"env_key": "obj", "label": "beer", "source": "robocasa_env_registry"},
+                        "target": {
+                            "env_key": "cab",
+                            "label": "cabinet",
+                            "fixture_class": "SingleCabinet",
+                            "source": "robocasa_fixture_registry",
+                        },
+                    },
+                }
+            },
+        ),
+    )
+    blackboard.write("perception", existing)
+    model_runtime = SimpleNamespace(enabled=True, generate_text=lambda **kwargs: response_missing_target)
+
+    result = localize_task_objects(
+        SkillRequest(component="vision", skill="localize_task_objects", payload={"use_model": True}),
+        SkillContext("vision", blackboard, model_runtime=model_runtime),
+    )
+
+    assert result.success is True
+    perception = blackboard.read("perception")
+    assert perception.source_candidate_id == "C1"
+    assert perception.target_candidate_id == "C2"
+    target = perception.candidates[1]
+    assert target.label == "cabinet"
+    assert target.metadata["source"] == "environment_semantics"
+    assert perception.metadata["environment_semantic_grounding_applied"] == ["target"]
+
+
+def test_localize_task_objects_ignores_robocasa_env_semantics_by_default() -> None:
+    existing = PerceptionResult(
+        observation_id="obs_test",
+        candidates=[SceneCandidate(candidate_id="C1", label="beer", visibility="yes", confidence=0.9)],
+    )
+    response_missing_target = json.dumps(
+        {
+            "candidates": [
+                {"candidate_id": "C1", "label": "beer", "visibility": "yes", "confidence": 0.9},
+            ],
+            "source_candidate_id": "C1",
+            "target_candidate_id": None,
+            "uncertainty": {"needs_reobserve": False, "reasons": []},
+        }
+    )
+    blackboard = Blackboard(task_instruction="pick up the object and place it in the cabinet")
+    blackboard.write(
+        "observation",
+        ObservationBundle(
+            observation_id="obs_test",
+            raw={
+                "environment_semantics": {
+                    "backend": "robocasa",
+                    "task_roles": {
+                        "target": {
+                            "env_key": "cab",
+                            "label": "cabinet",
+                            "fixture_class": "SingleCabinet",
+                            "source": "robocasa_fixture_registry",
+                        },
+                    },
+                }
+            },
+        ),
+    )
+    blackboard.write("perception", existing)
+    model_runtime = SimpleNamespace(enabled=True, generate_text=lambda **kwargs: response_missing_target)
+
+    result = localize_task_objects(
+        SkillRequest(component="vision", skill="localize_task_objects", payload={"use_model": True}),
+        SkillContext("vision", blackboard, model_runtime=model_runtime),
+    )
+
+    assert result.success is False
+    assert result.status == "localization_invalid_model_output"
+    assert result.output["reason"] == "localization_contract_failed"
+    assert blackboard.read("perception").target_candidate_id is None
+    assert "environment_semantic_grounding_applied" not in blackboard.read("perception").metadata
 
 
 def test_localize_task_objects_model_prompt_has_no_bbox_contract() -> None:

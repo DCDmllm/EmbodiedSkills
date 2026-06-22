@@ -39,7 +39,7 @@ def main() -> None:
     config = load_config(args.config)
     _apply_runtime_environment(config)
     result_output = Path(args.result_output) if args.result_output else _default_run_path(config, args.artifact_prefix, "result.json")
-    with _openpi_worker_lifecycle(config, args.config, args.artifact_prefix):
+    with _action_worker_lifecycle(config, args.config, args.artifact_prefix):
         runtime = AgentRuntime(config)
         adapter = build_env_adapter(config)
         runtime.blackboard.write("env_adapter", adapter)
@@ -57,6 +57,18 @@ def main() -> None:
 
         result = runtime.run_loop(max_steps=args.max_steps, initial_stage=args.initial_stage)
         _print_result(runtime, result.to_dict(), result_output)
+
+
+@contextmanager
+def _action_worker_lifecycle(config: AgentConfig, config_path: str, artifact_prefix: str) -> Iterator[None]:
+    backend_cfg = config.metadata.get("action_backend", {})
+    backend_type = str(backend_cfg.get("type", "pi05")).lower() if isinstance(backend_cfg, dict) else "pi05"
+    if backend_type in {"groot", "gr00t", "gr00t_n1_5", "gr00t-n1.5"}:
+        with _groot_worker_lifecycle(config, config_path, artifact_prefix):
+            yield
+        return
+    with _openpi_worker_lifecycle(config, config_path, artifact_prefix):
+        yield
 
 
 @contextmanager
@@ -99,6 +111,49 @@ def _openpi_runtime_cfg(config: AgentConfig) -> dict[str, object]:
     if not isinstance(backend_cfg, dict):
         return {}
     runtime_cfg = backend_cfg.get("openpi_runtime", {})
+    return dict(runtime_cfg) if isinstance(runtime_cfg, dict) else {}
+
+
+@contextmanager
+def _groot_worker_lifecycle(config: AgentConfig, config_path: str, artifact_prefix: str) -> Iterator[None]:
+    runtime_cfg = _groot_runtime_cfg(config)
+    if runtime_cfg.get("mode") != "worker" or not runtime_cfg.get("auto_start", True):
+        yield
+        return
+
+    process, log_path = _start_groot_worker(config_path, artifact_prefix, runtime_cfg, config)
+    previous_handlers: dict[int, signal.Handlers] = {}
+
+    def stop_worker() -> None:
+        _stop_process_group(process)
+
+    def handle_signal(signum: int, frame: object) -> None:
+        stop_worker()
+        previous = previous_handlers.get(signum)
+        if callable(previous):
+            previous(signum, frame)
+            return
+        raise SystemExit(128 + signum)
+
+    atexit.register(stop_worker)
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, handle_signal)
+    try:
+        yield
+    finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+        atexit.unregister(stop_worker)
+        stop_worker()
+        print(json.dumps({"status": "groot_worker_stopped", "log": str(log_path)}, ensure_ascii=True), file=sys.stderr, flush=True)
+
+
+def _groot_runtime_cfg(config: AgentConfig) -> dict[str, object]:
+    backend_cfg = config.metadata.get("action_backend", {})
+    if not isinstance(backend_cfg, dict):
+        return {}
+    runtime_cfg = backend_cfg.get("runtime", {})
     return dict(runtime_cfg) if isinstance(runtime_cfg, dict) else {}
 
 
@@ -150,6 +205,48 @@ def _start_openpi_worker(
     return process, log_path
 
 
+def _start_groot_worker(
+    config_path: str,
+    artifact_prefix: str,
+    runtime_cfg: dict[str, object],
+    config: AgentConfig,
+) -> tuple[subprocess.Popen[bytes], Path]:
+    log_path = _default_run_path(config, artifact_prefix, "groot_worker.log")
+    log_file = log_path.open("w", encoding="utf-8")
+    command = [
+        *_python_command_prefix(
+            runtime_cfg.get("conda_bin"),
+            runtime_cfg.get("conda_env") or "groot-py312",
+            source="run_loop.groot_worker",
+        ),
+        "-m",
+        "clawvla.scripts.groot_worker",
+        "--config",
+        str(config_path),
+        "--host",
+        str(runtime_cfg.get("host") or "127.0.0.1"),
+        "--port",
+        str(runtime_cfg.get("port") or 8766),
+    ]
+    if runtime_cfg.get("load_policy", True):
+        command.append("--load-policy")
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+    env["PYTHONPATH"] = str(runtime_cfg.get("pythonpath") or "/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/lerobot/src")
+    env["CLAWVLA_GROOT_DIRECT"] = "1"
+    if runtime_cfg.get("cuda_visible_devices"):
+        env["CUDA_VISIBLE_DEVICES"] = str(runtime_cfg["cuda_visible_devices"])
+    process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, env=env, preexec_fn=_parent_death_preexec)
+    log_file.close()
+    try:
+        _wait_for_groot_worker_ready(process, log_path, float(runtime_cfg.get("startup_timeout", 1200.0)))
+    except BaseException:
+        _stop_process_group(process)
+        raise
+    print(json.dumps({"status": "groot_worker_started", "log": str(log_path)}, ensure_ascii=True), file=sys.stderr, flush=True)
+    return process, log_path
+
+
 def _wait_for_openpi_worker_ready(process: subprocess.Popen[bytes], log_path: Path, timeout: float) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -161,6 +258,19 @@ def _wait_for_openpi_worker_ready(process: subprocess.Popen[bytes], log_path: Pa
             raise RuntimeError(f"pi05 worker exited before ready. log={log_path}")
         time.sleep(1.0)
     raise TimeoutError(f"pi05 worker did not become ready within {timeout:.1f}s. log={log_path}")
+
+
+def _wait_for_groot_worker_ready(process: subprocess.Popen[bytes], log_path: Path, timeout: float) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if log_path.exists():
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            if "groot_worker_ready" in text:
+                return
+        if process.poll() is not None:
+            raise RuntimeError(f"GR00T worker exited before ready. log={log_path}")
+        time.sleep(1.0)
+    raise TimeoutError(f"GR00T worker did not become ready within {timeout:.1f}s. log={log_path}")
 
 
 def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -298,6 +408,8 @@ def _reward_registry_defaults(config: AgentConfig, task_name: str) -> tuple[list
     env_type = str(config.environment.type or "robotwin").lower()
     if env_type == "libero":
         return ["clawvla.rl.reward_registry:register_builtin_libero"], {task_name: "libero"}
+    if env_type in {"robocasa", "robo_casa"}:
+        return ["clawvla.rl.reward_registry:register_builtin_robocasa"], {task_name: "robocasa"}
     return ["clawvla.rl.reward_registry:register_builtin_robotwin"], {task_name: "robotwin"}
 
 

@@ -195,7 +195,7 @@ def _write_agent_config(
             "request_timeout": config.policy.request_timeout,
             "reasoning_effort": None,
         }
-    _override_openpi_runtime(base, config, openpi_port)
+    _override_action_backend_runtime(base, config, openpi_port)
     path = run_dir / "artifacts" / episode.episode_id / "agent_config.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(base, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
@@ -228,10 +228,20 @@ def _allocate_openpi_port(config: RLConfig, run_dir: Path) -> int:
     return port
 
 
-def _override_openpi_runtime(base: dict[str, Any], config: RLConfig, openpi_port: int) -> None:
+def _override_action_backend_runtime(base: dict[str, Any], config: RLConfig, openpi_port: int) -> None:
     action_backend = base.setdefault("metadata", {}).setdefault("action_backend", {})
     if not isinstance(action_backend, dict):
         return
+    backend_type = str(action_backend.get("type", "pi05")).lower()
+    if backend_type in {"pi05", "pi0.5", "pi_05"}:
+        _override_openpi_runtime(action_backend, config, openpi_port)
+        return
+    if backend_type in {"groot", "gr00t", "gr00t_n1_5", "gr00t-n1.5"}:
+        _override_groot_runtime(action_backend, config, openpi_port)
+        return
+
+
+def _override_openpi_runtime(action_backend: dict[str, Any], config: RLConfig, openpi_port: int) -> None:
     runtime = action_backend.setdefault("openpi_runtime", {})
     if not isinstance(runtime, dict):
         return
@@ -239,6 +249,19 @@ def _override_openpi_runtime(base: dict[str, Any], config: RLConfig, openpi_port
     runtime["auto_start"] = bool(config.rollout.start_openpi_worker)
     runtime["pythonpath"] = config.openpi.env.get("PYTHONPATH", runtime.get("pythonpath"))
     runtime["port"] = int(openpi_port)
+    if config.cluster.openpi_gpus:
+        runtime["cuda_visible_devices"] = ",".join(str(item) for item in config.cluster.openpi_gpus)
+
+
+def _override_groot_runtime(action_backend: dict[str, Any], config: RLConfig, openpi_port: int) -> None:
+    runtime = action_backend.setdefault("runtime", {})
+    if not isinstance(runtime, dict):
+        return
+    runtime["mode"] = "worker"
+    runtime["auto_start"] = bool(config.rollout.start_openpi_worker)
+    runtime["port"] = int(openpi_port)
+    if config.environment.env.get("PYTHONPATH"):
+        runtime.setdefault("pythonpath", config.environment.env["PYTHONPATH"])
     if config.cluster.openpi_gpus:
         runtime["cuda_visible_devices"] = ",".join(str(item) for item in config.cluster.openpi_gpus)
 

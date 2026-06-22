@@ -1,9 +1,9 @@
 # ClawVLA
 
-ClawVLA 是一个面向 RoboTwin 和 LIBERO 的多组件 VLA agent 运行时。当前主线是：
+ClawVLA 是一个面向 RoboTwin、LIBERO 和 RoboCasa 的多组件 VLA agent 运行时。当前主线是：
 
 ```text
-environment observation -> VLM grounding -> scheduler subgoal loop -> OpenPI/pi0.5 action chunk -> environment execute -> verifier
+environment observation -> VLM grounding -> scheduler subgoal loop -> frozen action backend -> environment execute -> verifier
 ```
 
 运行时由 **scheduler 选择 skill + runtime 检查前置条件** 共同驱动：
@@ -21,7 +21,7 @@ environment observation -> VLM grounding -> scheduler subgoal loop -> OpenPI/pi0
 - `vision`：采集 RoboTwin 公开观测、生成候选、绑定 source/target、渲染 bbox overlay。
 - `state`：把 perception 更新为 world state，维护 task object、stage 和简短历史。
 - `scheduler`：选择下一步 skill，构建/推进 subgoal plan。
-- `motion`：从当前 subgoal 构建 motion goal、motion plan、OpenPI/pi0.5 action chunk，并执行。
+- `motion`：从当前 subgoal 构建 motion goal、motion plan、动作 backend action chunk，并执行。
 - `verifier`：动作后判断当前 subgoal 是否完成，以及下一步应该继续执行、重观察、重规划或恢复。
 - `recovery`：失败后显式路由，不偷偷执行动作。
 
@@ -35,7 +35,7 @@ observe -> plan -> preflight -> execute -> verify -> recover
 
 ## 环境
 
-项目现在实际用三套环境。
+项目现在实际用四套环境。
 
 ### 1. robotwin-py312
 
@@ -80,6 +80,25 @@ worker 通过 `PYTHONPATH` 引入 RoboTwin 自带 OpenPI 源码：
 /mnt/wangwai/RoboTwin/policy/pi05/src
 ```
 
+### 4. groot-py312
+
+RoboCasa rollout 和 GR00T worker 运行在这里。
+
+```bash
+cd /mnt/wangwai/vla/clawvla
+conda activate groot-py312
+export PYTHONPATH=/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/lerobot/src:/mnt/wangwai/RoboCasa:/mnt/wangwai/robosuite
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export __EGL_VENDOR_LIBRARY_DIRS=/usr/share/glvnd/egl_vendor.d
+```
+
+当前本地 GR00T checkpoint：
+
+```text
+/mnt/wangwai/weights/robocasa/robocasa365_checkpoints/gr00t_n1-5/multitask_learning/checkpoint-120000
+```
+
 ## 配置
 
 主配置：
@@ -88,6 +107,7 @@ worker 通过 `PYTHONPATH` 引入 RoboTwin 自带 OpenPI 源码：
 configs/robotwin_default.json
 configs/robotwin_pi05_worker_probe.json
 configs/libero_pi05_enabled_probe.json
+configs/robocasa_groot_enabled_probe.json
 configs/run_profiles/qwen3vl_pi05_vllm.json
 configs/run_profiles/qwen3vl_pi05_libero_vllm.json
 ```
@@ -157,12 +177,13 @@ scripts/run_clawvla_rl.sh
 核心约束：
 
 - 训练一个统一 VLM policy；`vision/scheduler/verifier/recovery` 都走同一个 policy。
-- OpenPI/pi0.5 冻结，只作为动作 backend。
+- OpenPI/pi0.5 和 GR00T 冻结，只作为动作 backend。
 - 训练样本保留真实图文输入；有 image ref 但没有 multimodal payload 会直接报错。
 - `action_ranges` 只覆盖模型输出 token；工具返回、环境状态、skill 结果不作为 action token 训练。
 - 超长 prompt/response 不静默截断，配置不够会显式失败。
 - 50 个 RoboTwin 任务已在 `configs/rl/rewards/robotwin.yaml` 映射到 reward handler。
 - LIBERO object tasks 已通过 `configs/rl/tasks/libero_object_*.yaml` 和 `configs/rl/rewards/libero.yaml` 接入同一套 RL runner。
+- RoboCasa `PickPlaceCounterToCabinet` 已通过 `configs/robocasa_groot_enabled_probe.json`、`configs/rl/rewards/robocasa.yaml` 和 GR00T action backend 接入同一套 loop；GR00T 模型动作维度 32，RoboCasa 环境执行动作维度 12。
 - OpenRLHF 多卡训练会对 mixed text/multimodal samples 做 modality-aligned replay 排列，保持 ZeRO-3 collective 顺序一致。
 
 常用入口：
@@ -173,6 +194,8 @@ cd /mnt/wangwai/vla/clawvla
 ./scripts/run_clawvla_rl.sh --preset robotwin-multitask --mode dry-run
 ./scripts/run_clawvla_rl.sh --preset robotwin-real5 --mode train --run-id robotwin_rl_real5
 ./scripts/run_clawvla_rl.sh --preset libero-multitask --mode train --run-id libero_rl_multitask
+./scripts/run_clawvla_rl.sh --preset robocasa-rollout --mode dry-run
+./scripts/run_clawvla_rl.sh --preset robocasa-1update --mode dry-run
 clawvla-rl --preset libero-multitask --mode dry-run
 ```
 
@@ -201,6 +224,14 @@ OpenPI/pi0.5：
 - `python -m clawvla.scripts.robotwin_pi05_execute_once`：采集、推理并执行一次，用于端到端诊断。
 - `python -m clawvla.scripts.libero_pi05_execute_once`：LIBERO 采集、pi0.5 推理、7D action 执行诊断。
 - `python -m clawvla.scripts.pi05_libero_action_smoke`：LIBERO action adapter 轻量 smoke。
+
+GR00T / RoboCasa：
+
+- `configs/robocasa_groot_enabled_probe.json`：RoboCasa + GR00T 本地 probe 配置，默认任务 `robocasa/PickPlaceCounterToCabinet`。
+- `python -m clawvla.scripts.groot_worker --config configs/robocasa_groot_enabled_probe.json --load-policy`：常驻 GR00T worker。
+- `python -m clawvla.scripts.groot_inference_smoke --config configs/robocasa_groot_enabled_probe.json --artifact-dir <artifact_dir> --prompt "move to the bottle"`：只测 GR00T action backend，不执行环境。
+
+完整整理见 [docs/robocasa_groot.md](docs/robocasa_groot.md)。
 
 轻量 smoke/probe：
 
