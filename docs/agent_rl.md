@@ -26,6 +26,7 @@ The training stack intentionally uses separate Python environments:
 robotwin-py312       ClawVLA runtime, RoboTwin rollout, and LIBERO rollout process
 openpi-torch-py312   OpenPI/pi0.5 worker process
 groot-py312          RoboCasa rollout process and GR00T worker process
+calvin-py38          CALVIN rollout process; calls the external X-VLA HTTP action server
 ```
 
 The processes communicate through subprocesses, HTTP-compatible policy calls, and archived trajectory files. The
@@ -55,37 +56,41 @@ Training keeps the important invariants:
 
 ## Reward
 
+完整的自然语言信用分配、奖励公式和50任务逐项映射见
+[RoboTwin RL 奖励函数手册](robotwin_rl_reward_catalog.md)。
+
 Reward registration is configured in:
 
 ```text
 configs/rl/rewards/robotwin.yaml
 configs/rl/rewards/libero.yaml
 configs/rl/rewards/robocasa.yaml
+configs/rl/rewards/calvin.yaml
 ```
 
-Current dense RoboTwin specs cover these tasks:
+All 50 configured RoboTwin training tasks now have an explicit dense reward spec. The specs are organized by physical
+reward family:
 
 ```text
-place_container_plate
-stack_blocks_two
-open_laptop
-handover_mic
-handover_block
-press_stapler
-click_bell
-click_alarmclock
-lift_pot
-grab_roller
-blocks_ranking_rgb
+spatial / relative_place / collection_place
+stack / stack_multi / ordering
+articulation / cabinet_place
+contact_press / tool_contact / scan
+handover / dual_lift / container_lift
+axis_lift / axis_away / shake / dump
 ```
 
-All 50 RoboTwin training tasks are mapped to the `robotwin` reward handler. Tasks without a dedicated dense spec currently
-use the terminal/task-status baseline plus episode penalties. LIBERO object tasks use the same terminal penalty path plus the LIBERO reward registry hook. RoboCasa tasks use the RoboCasa task status and GR00T action backend.
+The dense signals use simulator state such as actor poses, functional/contact points, gripper contact, articulation qpos,
+task-private target/start fields, actor-pair contact, and collection member poses. Official terminal success always comes
+from RoboTwin `check_success()`; an agent-loop `finished` result does not count as task success by itself. LIBERO object
+tasks use the terminal penalty path plus the LIBERO reward registry hook. RoboCasa tasks use the RoboCasa task status and
+GR00T action backend.
 
 Episode-level penalties are also explicit:
 
 ```text
 incomplete_episode_penalty
+premature_finish_penalty
 invalid_decision_penalty
 skill_failure_penalty
 recoverable_preflight_penalty
@@ -102,6 +107,8 @@ Main current OpenRLHF config:
 configs/rl/qwen3vl_pi05_multitask_1update.yaml
 configs/rl/qwen3vl_pi05_libero_multitask_1update.yaml
 configs/rl/qwen3vl_groot_robocasa_1update.yaml
+configs/rl/qwen3vl_calvin_xvla_1update.yaml
+configs/rl/rynnbrain2b_pi05_real_1update.yaml
 ```
 
 Useful smoke configs:
@@ -115,6 +122,8 @@ configs/rl/qwen3vl_pi05_real_1update.yaml
 configs/rl/qwen3vl_pi05_real_5step_1update.yaml
 configs/rl/qwen3vl_pi05_libero_multitask_1update_single_gpu.yaml
 configs/rl/qwen3vl_groot_robocasa_rollout_smoke.yaml
+configs/rl/qwen3vl_calvin_xvla_1update_long_smoke.yaml
+configs/rl/rynnbrain2b_pi05_train_smoke.yaml
 ```
 
 Cluster and task overlays:
@@ -127,6 +136,7 @@ configs/rl/tasks/libero_object_all.yaml
 configs/rl/rewards/robotwin.yaml
 configs/rl/rewards/libero.yaml
 configs/rl/rewards/robocasa.yaml
+configs/rl/rewards/calvin.yaml
 ```
 
 ## Commands
@@ -138,6 +148,8 @@ cd /mnt/wangwai/vla/clawvla
 ./scripts/run_clawvla_rl.sh --mode dry-run
 ./scripts/run_clawvla_rl.sh --preset libero-multitask --mode dry-run
 ./scripts/run_clawvla_rl.sh --preset robocasa-rollout --mode dry-run
+./scripts/run_clawvla_rl.sh --preset calvin-xvla --mode dry-run
+./scripts/run_clawvla_rl.sh --preset rynnbrain-train-smoke --mode dry-run
 clawvla-rl --preset robotwin-multitask --mode dry-run
 ```
 
@@ -191,6 +203,9 @@ cd /mnt/wangwai/vla/clawvla
 PYTHONPATH=src /mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python -m pytest tests/test_rl_framework.py -q
 ```
 
+If HTTP proxies are configured, add `NO_PROXY=127.0.0.1,localhost` (and the lowercase equivalent) so local PolicyProxy
+requests are not routed through the cluster proxy.
+
 The current tests cover config loading, reward registry behavior, policy proxy tracing, multimodal adapter payloads, call-level OpenRLHF samples, terminal penalties, runtime env setup, state placeholder rejection, LIBERO config wiring, RoboCasa/GR00T config wiring, and OpenRLHF mixed-modality alignment.
 
 ## Verified State
@@ -204,6 +219,8 @@ Verified:
 - LIBERO `qwen3vl_pi05_libero_multitask_1update.yaml` completed one ZeRO-3 two-policy-GPU update with mixed text/multimodal samples.
 - RobotWin `qwen3vl_pi05_real_5step_1update.yaml` completed one ZeRO-3 four-policy-GPU update with mixed text/multimodal samples.
 - RoboCasa + GR00T path reports model action dim 32, environment action dim 12, and real execute state/image deltas in smoke runs. Task success is not claimed.
+- CALVIN environment/action factories, terminal reward, presets, and OpenRLHF config wiring are covered by local tests; a live X-VLA server is still required for real rollout validation.
+- RynnBrain presets now use `openrlhf:` keys and their intended token/training limits are covered by a regression test.
 - OpenRLHF runtime patches keep modality-compatible actor/ref forward batches and data-parallel replay-buffer order.
 - The RobotWin five-step smoke had uniform negative rewards, so it validated infrastructure and synchronization only.
 - Generated files are archived into run directories and ignored by git.
@@ -211,5 +228,6 @@ Verified:
 Remaining validation:
 
 - Full 25-step task completion through `motion.execute_action`.
-- Dense reward coverage for all RoboTwin 2.0 tasks.
+- Simulator calibration of dense reward thresholds across all 50 registered RoboTwin tasks.
+- End-to-end CALVIN rollout with the matching live X-VLA server and validation dataset.
 - Long multi-task training stability.

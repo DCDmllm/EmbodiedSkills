@@ -1,0 +1,20 @@
+# ClawVLA bridge dependencies for the existing CALVIN Python 3.8 environment.
+# CALVIN, PyTorch, EGL, and simulator dependencies must already be installed by
+# the CALVIN checkout/environment and are intentionally not managed here.
+#
+# Do not add `-e .`: pyproject.toml targets Python >=3.12. The CALVIN rollout
+# subprocess imports ClawVLA and CALVIN sources through PYTHONPATH instead.
+
+numpy==1.24.4
+pillow==10.4.0
+requests==2.32.4
+json-numpy==2.1.0
+PyYAML==6.0.3
+rich==13.7.1
+openai==1.109.1
+
+# Versions verified in the current CALVIN environment. They are also imported
+# by the CALVIN task-oracle and environment helpers used by the adapter.
+scipy==1.10.1
+hydra-core==1.1.1
+omegaconf==2.1.2

@@ -12,5 +12,6 @@ flash_attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.8
 flashinfer-python==0.6.12
 qwen-vl-utils==0.0.14
 wandb==0.27.2
+openai>=1.0.0
 PyYAML==6.0.3
 rich==15.0.0

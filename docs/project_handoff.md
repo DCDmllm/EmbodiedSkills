@@ -4,11 +4,13 @@
 
 更细的章节：
 
+- [环境安装与进程分工](environment_setup.md)
 - [Runtime 架构与执行循环](handoff/runtime_architecture.md)
 - [组件、技能与数据接口](handoff/components_and_skills.md)
 - [Agent RL 训练与奖励系统](handoff/rl_training_and_rewards.md)
 - [扩展、测试与调试手册](handoff/extending_testing_debugging.md)
 - [成员分工](handoff/member_roles.md)
+- [CALVIN + X-VLA 接入说明](calvin_xvla.md)
 
 ## 当前定位
 
@@ -62,26 +64,20 @@ tests/test_rl_framework.py
 
 ## 环境分工
 
-当前代码按进程职责拆分为四类环境文件。
+当前代码按进程职责拆分为六类环境：
 
-```text
-robotwin-py312
-  主 agent runtime、RoboTwin adapter、run_loop.py。
-  requirements/robotwin-py312.txt 保持 RoboTwin/CUDA/SAPIEN 栈稳定，未在该文件中安装 torch。
-
-vllm
-  本地 Qwen3-VL OpenAI-compatible server。
-  requirements/vllm.txt 包含 vllm、transformers、torch、qwen-vl-utils。
-
-openpi-torch-py312
-  pi0.5/OpenPI worker。
-  requirements/openpi-torch-py312.txt 使用 torch + transformers==4.53.2，并通过 PYTHONPATH 引 RoboTwin 的 policy/pi05/src。
-
-.venv-openrlhf-py310-cu128
-  当前 Agent RL 训练环境，使用 OpenRLHF + vLLM + DeepSpeed + flash-attn。
-```
+| 环境 | 职责 | requirements/来源 |
+| --- | --- | --- |
+| `robotwin-py312` | 主 runtime、RoboTwin/LIBERO rollout、数据/评测脚本 | `requirements/robotwin-py312.txt` |
+| `vllm` | 本地 Qwen3-VL OpenAI-compatible server | `requirements/vllm.txt` |
+| `openpi-torch-py312` | pi0.5/OpenPI worker | `requirements/openpi-torch-py312.txt` |
+| `.venv-openrlhf-py310-cu128` | OpenRLHF + vLLM + DeepSpeed + flash-attn | `requirements/openrlhf-py310-cu128.txt` |
+| `groot-py312` | RoboCasa rollout 与 GR00T worker | 现有 RoboCasa/LeRobot 环境 |
+| `calvin-py38` | CALVIN rollout 与 task oracle | `requirements/calvin-py38.txt` |
 
 普通 agent 运行通常是 `robotwin-py312 + vllm + openpi-torch-py312` 三个进程族配合。RL 训练当前由 OpenRLHF 环境启动，再通过子进程跑 `robotwin-py312` rollout 和 `openpi-torch-py312` worker。
+RoboCasa 改用 `groot-py312` rollout/worker；CALVIN 改用 `calvin-py38` rollout，并调用独立 X-VLA HTTP server。
+详细安装、Python 版本、`PYTHONPATH` 和 proxy/`NO_PROXY` 设置见 [环境安装与进程分工](environment_setup.md)。
 
 ## 普通 Agent 运行
 
@@ -92,7 +88,7 @@ cd /mnt/wangwai/vla/clawvla
 ./scripts/run_qwen3vl_pi05_agent.sh \
   --instruction "place the container on the plate" \
   --artifact-prefix agent_qwen3vl_vllm_pi05 \
-  --max-steps 50 \
+  --max-steps 25 \
   --gpus 5,6 \
   --run
 ```
@@ -103,7 +99,7 @@ cd /mnt/wangwai/vla/clawvla
 ./scripts/run_qwen3vl_pi05_agent.sh \
   --instruction "place the container on the plate" \
   --artifact-prefix agent_qwen3vl_vllm_pi05 \
-  --max-steps 50 \
+  --max-steps 25 \
   --gpus 5,6 \
   --dry-run
 ```

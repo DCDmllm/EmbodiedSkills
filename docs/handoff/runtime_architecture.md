@@ -270,7 +270,7 @@ recover:
 - `repair_stage_transition` 是否有合法 target 和 reason。
 - `refresh_preflight_observation` 是否只在 preflight 且确实有视觉/相机类 preflight error。
 - skill-specific prerequisites。
-- `motion.emit_action_chunk` 的 payload 必须有 `horizon`，范围是 10 到 50。
+- `motion.emit_action_chunk` 的 payload 必须有 `horizon`，范围是 10 到 32。
 
 skill-specific prerequisites 包括：
 

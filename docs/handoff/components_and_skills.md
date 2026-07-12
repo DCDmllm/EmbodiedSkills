@@ -546,7 +546,8 @@ target handle：
 
 ### `emit_action_chunk`
 
-要求 motion_plan fresh。payload 必须有 `horizon`，AgentLoop 限制 10 到 50。
+要求 motion_plan fresh。payload 必须有 `horizon`，AgentLoop 限制 10 到 32；当前正式 pi0.5 checkpoint 的
+action horizon 也是 32。
 
 行为：
 

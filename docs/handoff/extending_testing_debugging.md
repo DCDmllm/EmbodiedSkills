@@ -479,13 +479,13 @@ PYTHONPATH=src python -m clawvla.scripts.pi05_backend_probe \
 ### pi05 inference smoke
 
 ```bash
-PYTHONPATH=src:/mnt/wangwai/RoboTwin/policy/pi05/src \
+PYTHONPATH=src:/mnt/linyutong/wangwai_mirror/pi0.5/src \
 python -m clawvla.scripts.pi05_inference_smoke \
-  --config configs/robotwin_pi05_enabled_probe.json \
+  --config configs/robotwin_pi05_subtasks_25k.json \
   --artifact-dir tmp_artifacts/<prefix>/... \
   --prompt "place the container on the plate" \
   --num-steps 2 \
-  --horizon 10
+  --horizon 32
 ```
 
 只跑 OpenPI inference，不执行 RoboTwin。

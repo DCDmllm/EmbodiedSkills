@@ -1,5 +1,8 @@
 # Agent RL 训练与奖励系统
 
+RoboTwin 50类任务的逐项奖励表和“自然语言如何获得奖励”的完整说明见
+[RoboTwin RL 奖励函数手册](../robotwin_rl_reward_catalog.md)。
+
 当前主训练路径是 OpenRLHF。本文说明当前 `src/clawvla/rl/`、`src/clawvla/rewards/` 和 `configs/rl/` 的结构。
 
 普通 agent runtime 见 [Runtime 架构与执行循环](runtime_architecture.md)。
@@ -15,9 +18,10 @@ verifier
 recovery
 ```
 
-OpenPI/pi0.5 不参与 RL 更新，只作为冻结 action backend。RoboTwin 是真实交互环境。
+OpenPI/pi0.5、GR00T 和 X-VLA 不参与 RL 更新，只作为冻结 action backend。真实交互环境可以是 RoboTwin、
+LIBERO、RoboCasa 或 CALVIN，由 `environment` 配置和对应 reward handler 选择。
 
-一条 OpenRLHF prompt 对应一个 RoboTwin episode。episode 中的每次 VLM 调用都通过 policy proxy 路由到当前 actor rollout server，同时记录 token、图像 payload 和 JSON 输出。episode 结束后按 policy call 展开：每次 call 生成一条训练样本，样本使用真实执行时该 call 看到的 prompt/images，并把整条 episode 的最终 reward 写到该 call。
+一条 OpenRLHF prompt 对应一个 environment episode。episode 中的每次 VLM 调用都通过 policy proxy 路由到当前 actor rollout server，同时记录 token、图像 payload 和 JSON 输出。episode 结束后按 policy call 展开：每次 call 生成一条训练样本，样本使用真实执行时该 call 看到的 prompt/images，并把整条 episode 的最终 reward 写到该 call。
 
 ## RL 配置结构
 
@@ -29,6 +33,7 @@ RLConfig:
   run_id
   trainer: EnvCommandConfig
   robotwin: EnvCommandConfig
+  environment: EnvCommandConfig
   openpi: EnvCommandConfig
   policy: PolicyConfig
   rollout: RolloutConfig
@@ -109,6 +114,7 @@ registry
 task_map
 step_cost
 incomplete_episode_penalty
+premature_finish_penalty
 invalid_decision_penalty
 skill_failure_penalty
 recoverable_preflight_penalty
@@ -574,9 +580,17 @@ task_success
 
 检查 ordered 物体的 x 顺序和 y 对齐。
 
+### 扩展物理奖励族
+
+当前还包括 `spatial`、`relative_place`、`collection_place`、`container_lift`、`cabinet_place`、
+`stack_multi`、`tool_contact`、`dump`、`scan`、`shake`、`axis_lift` 和 `axis_away`。这些 family 共同覆盖
+50个 RoboTwin 训练任务，并使用 actor pose、functional/contact point、真实接触、qpos、集合成员和任务私有目标字段。
+
 ### terminal_only
 
-`compute_robotwin_reward()` 内部保留 terminal-only 计算路径：step cost + task success bonus。未知任务不会走隐式 fallback；新增 task 必须显式配置 reward handler。
+`compute_robotwin_reward()` 内部只为未登记的新任务保留 terminal-only 防御性路径。当前50个训练任务均不走该路径。
+episode terminal success 只认环境 `task_status.success`（RoboTwin 即 `check_success()`），不能由 Agent loop 的
+`finished` 代替。
 
 ## 添加新 RoboTwin 奖励
 

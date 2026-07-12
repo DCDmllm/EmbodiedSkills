@@ -35,7 +35,19 @@ observe -> plan -> preflight -> execute -> verify -> recover
 
 ## 环境
 
-项目现在实际用四套环境。
+项目按进程职责拆为六套环境，避免把互相冲突的 CUDA、仿真器和训练依赖装进同一个 Python：
+
+| 环境 | 职责 | requirements |
+| --- | --- | --- |
+| `robotwin-py312` | 主 runtime、RoboTwin/LIBERO rollout、数据与评测工具 | `requirements/robotwin-py312.txt` |
+| `vllm` | 本地 Qwen3-VL 服务 | `requirements/vllm.txt` |
+| `openpi-torch-py312` | pi0.5/OpenPI worker | `requirements/openpi-torch-py312.txt` |
+| `.venv-openrlhf-py310-cu128` | OpenRLHF/DeepSpeed/Ray 训练 | `requirements/openrlhf-py310-cu128.txt` |
+| `groot-py312` | RoboCasa rollout 和 GR00T worker | 复用 RoboCasa/LeRobot 环境 |
+| `calvin-py38` | CALVIN rollout 和 task oracle | `requirements/calvin-py38.txt` |
+
+完整安装、路径布局、代理设置和验证命令见 [环境安装与进程分工](docs/environment_setup.md)。LIBERO 复用
+`robotwin-py312`，不单独增加环境。
 
 ### 1. robotwin-py312
 
@@ -48,6 +60,7 @@ pip install -r requirements/robotwin-py312.txt
 ```
 
 RoboTwin/CUDA/SAPIEN/PyTorch 依赖默认由现有 `robotwin-py312` 环境提供，requirements 里不强行装 torch，避免动 CUDA 栈。
+专家子任务采集和合并工具直接使用的 `h5py`、OpenCV 已显式写入 requirements。
 
 ### 2. vllm
 
@@ -69,18 +82,32 @@ pip install -r /mnt/wangwai/vla/clawvla/requirements/vllm.txt
 pi0.5/OpenPI worker 运行在这里。
 
 ```bash
-cd /mnt/wangwai/vla/clawvla
+cd /mnt/linyutong/wangwai_mirror/vla/clawvla
 conda activate openpi-torch-py312
 pip install -r requirements/openpi-torch-py312.txt
 ```
 
-worker 通过 `PYTHONPATH` 引入 RoboTwin 自带 OpenPI 源码：
+正式 RoboTwin worker 通过 `PYTHONPATH` 引入 mirror 中与训练一致的 OpenPI 源码：
 
 ```text
-/mnt/wangwai/RoboTwin/policy/pi05/src
+/mnt/linyutong/wangwai_mirror/pi0.5/src
 ```
 
-### 4. groot-py312
+新的 PyTorch 直推路径还直接依赖 `sentencepiece`，已写入该环境 requirements。
+
+### 4. openrlhf-py310-cu128
+
+Agent RL trainer 使用仓库内的 Python 3.10 venv：
+
+```bash
+cd /mnt/wangwai/vla/clawvla
+python3.10 -m venv .venv-openrlhf-py310-cu128
+.venv-openrlhf-py310-cu128/bin/python -m pip install -r requirements/openrlhf-py310-cu128.txt
+```
+
+runner 通过 `PYTHONPATH` 引入 ClawVLA，不在 Python 3.10 环境执行 `pip install -e .`。
+
+### 5. groot-py312
 
 RoboCasa rollout 和 GR00T worker 运行在这里。
 
@@ -99,6 +126,29 @@ export __EGL_VENDOR_LIBRARY_DIRS=/usr/share/glvnd/egl_vendor.d
 /mnt/wangwai/weights/robocasa/robocasa365_checkpoints/gr00t_n1-5/multitask_learning/checkpoint-120000
 ```
 
+### 6. calvin-py38
+
+CALVIN rollout 使用独立的 Python 3.8 环境，并通过 HTTP 调冻结的 X-VLA action server：
+
+```bash
+cd /mnt/wangwai/vla/clawvla
+conda activate calvin-py38
+python -m pip install -r requirements/calvin-py38.txt
+export PYTHONPATH=/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/vla/CALVIN/calvin_env:/mnt/wangwai/vla/CALVIN/calvin_models
+export PYOPENGL_PLATFORM=egl
+export __EGL_VENDOR_LIBRARY_DIRS=/usr/share/glvnd/egl_vendor.d
+```
+
+不要在 `calvin-py38` 中执行 `pip install -e .`；项目包元数据要求 Python 3.12+，该子进程通过 `PYTHONPATH`
+加载源码。完整说明见 [CALVIN + X-VLA 接入说明](docs/calvin_xvla.md)。
+
+如果机器设置了 HTTP proxy，本地 vLLM、PolicyProxy、OpenPI 和 X-VLA 服务必须绕过代理：
+
+```bash
+export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
+export no_proxy="$NO_PROXY"
+```
+
 ## 配置
 
 主配置：
@@ -106,11 +156,16 @@ export __EGL_VENDOR_LIBRARY_DIRS=/usr/share/glvnd/egl_vendor.d
 ```text
 configs/robotwin_default.json
 configs/robotwin_pi05_worker_probe.json
+configs/robotwin_pi05_subtasks_25k.json
 configs/libero_pi05_enabled_probe.json
 configs/robocasa_groot_enabled_probe.json
+configs/calvin_xvla_enabled_probe.json
 configs/run_profiles/qwen3vl_pi05_vllm.json
 configs/run_profiles/qwen3vl_pi05_libero_vllm.json
 ```
+
+`robotwin_pi05_subtasks_25k.json` 是当前正式 RoboTwin 配置，加载验证 loss 最低的 25k checkpoint。
+它使用 32-step action horizon、10 次 flow 去噪、256 token 上限，以及仅由训练 split 计算的归一化统计。
 
 远程 OpenAI-compatible 配置不再写明文 key。需要远程模型时设置：
 
@@ -126,7 +181,7 @@ export OPENAI_COMPATIBLE_API_KEY="..."
 推荐入口：
 
 ```bash
-cd /mnt/wangwai/vla/clawvla
+cd /mnt/linyutong/wangwai_mirror/vla/clawvla
 ./scripts/run_qwen3vl_pi05_agent.sh \
   --instruction "place the container on the plate" \
   --artifact-prefix agent_subgoal_loop_25 \
@@ -184,6 +239,7 @@ scripts/run_clawvla_rl.sh
 - 50 个 RoboTwin 任务已在 `configs/rl/rewards/robotwin.yaml` 映射到 reward handler。
 - LIBERO object tasks 已通过 `configs/rl/tasks/libero_object_*.yaml` 和 `configs/rl/rewards/libero.yaml` 接入同一套 RL runner。
 - RoboCasa `PickPlaceCounterToCabinet` 已通过 `configs/robocasa_groot_enabled_probe.json`、`configs/rl/rewards/robocasa.yaml` 和 GR00T action backend 接入同一套 loop；GR00T 模型动作维度 32，RoboCasa 环境执行动作维度 12。
+- CALVIN 已通过 `configs/calvin_xvla_enabled_probe.json`、`configs/rl/rewards/calvin.yaml` 和 X-VLA HTTP action backend 接入同一套 loop；外部 X-VLA server 仍由用户单独启动。
 - OpenRLHF 多卡训练会对 mixed text/multimodal samples 做 modality-aligned replay 排列，保持 ZeRO-3 collective 顺序一致。
 
 常用入口：
@@ -196,6 +252,8 @@ cd /mnt/wangwai/vla/clawvla
 ./scripts/run_clawvla_rl.sh --preset libero-multitask --mode train --run-id libero_rl_multitask
 ./scripts/run_clawvla_rl.sh --preset robocasa-rollout --mode dry-run
 ./scripts/run_clawvla_rl.sh --preset robocasa-1update --mode dry-run
+./scripts/run_clawvla_rl.sh --preset calvin-xvla --mode dry-run
+./scripts/run_clawvla_rl.sh --preset rynnbrain-train-smoke --mode dry-run
 clawvla-rl --preset libero-multitask --mode dry-run
 ```
 
@@ -233,6 +291,13 @@ GR00T / RoboCasa：
 
 完整整理见 [docs/robocasa_groot.md](docs/robocasa_groot.md)。
 
+CALVIN / X-VLA：
+
+- `configs/calvin_xvla_enabled_probe.json`：CALVIN validation 环境和 X-VLA `/act` endpoint 配置。
+- `python -m clawvla.rl.openrlhf_runner --preset calvin-xvla --mode dry-run`：展开 CALVIN one-update 配置。
+
+完整整理见 [docs/calvin_xvla.md](docs/calvin_xvla.md)。
+
 轻量 smoke/probe：
 
 - `python -m clawvla.scripts.inspect_stack`
@@ -261,6 +326,13 @@ PYTHONPATH=src python -m clawvla.scripts.robotwin_execute_smoke
 
 ```bash
 PYTHONPATH=src python -m compileall -q src/clawvla
+```
+
+单元测试（显式绕过本机 HTTP proxy）：
+
+```bash
+NO_PROXY=127.0.0.1,localhost PYTHONPATH=src \
+  /mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python -m pytest -q
 ```
 
 ## 当前注意点

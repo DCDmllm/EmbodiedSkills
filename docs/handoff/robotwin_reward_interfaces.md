@@ -225,7 +225,15 @@ qpos
 qpos_ratio
 ```
 
-当前实现只 snapshot `RewardSpec` 声明过的对象。没有专属 spec 的任务会走 terminal-only，`actors` 基本为空。
+当前50个训练任务都有专属 spec。snapshot 除了普通 actor 和 articulation，还会按 spec 读取：
+
+```text
+collections      bread / bottles / sphere_lst 等动态 actor 列表
+task_fields      target_pose / start_height / arm_tag 等任务私有只读字段
+actor_contacts   hammer-block、object-basket 等真实 actor-pair 接触
+```
+
+未登记的新任务仍保留 terminal-only 防御性 fallback，但正式训练配置不应依赖该 fallback。
 
 ## 其他可用接口
 

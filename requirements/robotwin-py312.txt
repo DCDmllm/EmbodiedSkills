@@ -3,10 +3,15 @@
 -e .
 
 numpy
+h5py
 openai>=1.0.0
+opencv-python
 pillow
 pyyaml
 rich>=13.0.0
 
 # RoboTwin/CUDA/SAPIEN/PyTorch dependencies are provided by the robotwin-py312 env.
 # Do not install torch from this file unless rebuilding that environment.
+# h5py and OpenCV are direct dependencies of the expert-subtask collection and
+# merge tools; they are listed here even though the current RoboTwin env already
+# receives them transitively from robomimic/robosuite.
