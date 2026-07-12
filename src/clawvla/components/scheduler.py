@@ -4,10 +4,11 @@ from typing import Any
 
 from ..blackboard_utils import current_observation_id, mark_motion_artifacts_stale, metadata_value
 from ..blackboard import Blackboard
-from ..loop_types import LoopDecision
+from ..loop_types import MAX_ACTION_HORIZON, MIN_ACTION_HORIZON, LoopDecision
 from ..model_calls import call_component_json
 from ..schema import SchedulerDecision, SkillRequest, SkillResult, Subgoal, TaskPlan
 from ..skills.base import SkillContext, SkillRegistry
+from ..task_semantics import task_plan_requires_target
 from .skill_helpers import ok, register_skill, to_dict, unavailable
 
 
@@ -149,17 +150,20 @@ def build_task_plan(request: SkillRequest, context: SkillContext) -> SkillResult
         return unavailable("task_plan_unavailable", "missing_world_state", {})
     source_id = getattr(world_state, "source_candidate_id", None)
     target_id = getattr(world_state, "target_candidate_id", None)
-    if not source_id or not target_id:
-        return unavailable("task_plan_unavailable", "missing_source_or_target_candidate", {"world_state": to_dict(world_state)})
+    if not source_id:
+        return unavailable("task_plan_unavailable", "missing_source_candidate", {"world_state": to_dict(world_state)})
 
     if context.has_model and request.payload.get("use_model", True):
         raw = call_component_json(
             context,
             instruction=_task_plan_instruction(),
             payload={
-                "task_instruction": blackboard.task_instruction,
+                "original_task_instruction": blackboard.task_instruction,
                 "world_state": to_dict(world_state),
                 "required_schema": _task_plan_schema(source_id, target_id),
+                "hard_planning_constraints": _task_plan_hard_constraints(),
+                "instruction_style_examples": _task_plan_style_examples(),
+                "full_plan_few_shots": _task_plan_full_few_shots(),
             },
             image_paths=request.payload.get("image_paths"),
             render_format=request.payload.get("render_format", "json"),
@@ -425,79 +429,380 @@ def _task_plan_instruction() -> str:
     return (
         "Build a complete ordered manipulation subgoal plan from the current scene state to final task success. "
         "The plan must cover the whole task instruction, not only the first useful action. "
-        "Each subgoal must include an instruction: one natural-language robot command that can be sent directly "
-        "to the short-horizon VLA action policy. The instruction should say the concrete object names and relation, "
-        "for example 'move close to the container', 'grasp the container', or 'place the container on the plate'. "
+        "The top-level output key for the copied instruction must be exactly 'task', not 'task_instruction' or "
+        "'original_task_instruction'. "
+        f"{_vla_subgoal_instruction_style()} "
+        "Follow instruction_style_examples for both segmentation granularity and command wording. The examples "
+        "show instruction sequences, not a fixed number of subgoals; choose the number required by this task. "
+        "Treat hard_planning_constraints as mandatory, and imitate the complete JSON structures in full_plan_few_shots. "
         "Each subgoal must also include completion_criteria.natural_language: one concrete visual success condition "
         "for that exact subgoal. The verifier will use that success condition directly, so do not write placeholders "
         "such as 'what must be true' or vague labels. "
         "The runtime will send this exact instruction to the action policy; do not rely on type/source/target being "
         "converted into a better command later. The final subgoal must make the original instruction true. "
         "Use existing candidate ids only; do not invent objects. "
-        "For normal multi-step manipulation, prefer a slightly more detailed plan with four or more subgoals "
-        "when the task naturally contains that many short-horizon stages. Keep subgoals reasonably atomic: "
-        "approaching an object, grasping it, lifting or transporting it, aligning with a target, placing it, "
-        "releasing it, and waiting for stability are separate stages when they matter. Do not combine transport "
-        "with placement, release, insertion, pressing, or other terminal effects in one subgoal. "
-        "For placement tasks, final success requires the object to be released or otherwise visibly stable on/in "
-        "the target, not merely held above or touching the target while the gripper still supports it. "
-        "Represent that as a separate release/wait_for_stability subgoal when the action policy may need a clean "
-        "short-horizon command for it, or make the final placement instruction explicitly include release and stability. "
-        "Do not force every task into a place sequence: choose subgoal types that match the task, such as "
-        "approach, grasp, lift, transport, align, place, release, press, open, close, pull, push, insert, pour, "
-        "stack, handover, fold, wipe, or wait_for_stability. For contact or articulation tasks, include the "
-        "reaching/contact stage and the terminal press, open, close, pull, or push stage. A one-subgoal plan is "
-        "invalid for normal manipulation tasks unless that single subgoal itself fully completes the entire "
-        "instruction from the current state."
+        "Each subgoal.type must be a short lowercase action label, for example approach, grasp, move, place, press, "
+        "open, close, stack, scan, or shake. Do not copy schema explanation text into type. "
+        "Do not add confirmation-only subgoals such as confirm, check, verify, or ensure; every subgoal must request "
+        "a physical action or a necessary wait for stability. "
+        "Candidate bindings are semantic hints, not mandatory slots: source_candidate_id is the object, tool, fixture, "
+        "or control used by that subgoal; target_candidate_id is only for a separate destination or relation object. "
+        "If a subgoal has no separate target, set target_candidate_id to null. In a dual-object manipulation, do not "
+        "misuse target_candidate_id for the second manipulated object; encode the full left/right object mapping in "
+        "the natural-language instruction and record both bindings in metadata.arm_candidate_bindings. Before returning, "
+        "check two invariants: a final place must not be immediately preceded by a redundant move toward the same target, "
+        "and an independent two-object, separate-target dual-arm plan with no ordering dependency must not contain a "
+        "complete left-arm sequence followed by a right-arm sequence."
     )
 
 
-def _task_plan_schema(source_id: str, target_id: str) -> dict[str, Any]:
+def _vla_subgoal_instruction_style() -> str:
+    return (
+        "Each subgoal must include one imperative natural-language command sent verbatim to the short-horizon VLA. "
+        "The VLA receives only that current command plus current images and robot state; it does not see the full task, "
+        "other subgoals, candidate ids, or completion criteria. Make every command locally executable and name the "
+        "current object, destination, and relation needed to disambiguate it. Use natural object descriptions rather "
+        "than candidate ids, retaining useful color, size, shape, texture, and left/right target attributes. Keep one "
+        "physical motion stage per command, usually 6-14 words and at most about 18 words; an explicit dual-arm mapping "
+        "may use up to about 22 words. For ordinary pick-and-place, start with a grasp command that includes approaching "
+        "and closing the gripper; do not add a separate approach subgoal. Continue only with the needed lift, move, place "
+        "or release, and retract stages. Do not insert a generic 'move toward the target' immediately before a place "
+        "command when the place stage can carry the held object there directly. Keep a separate transport/move stage "
+        "only when it names and achieves a distinct necessary state, such as an above-target pre-place pose, clearance "
+        "waypoint, required orientation, handover position, or long transport endpoint. Reserve separate "
+        "approach/contact/retract stages for direct interactions such as "
+        "pressing a bell, where no grasp or lift belongs. Name the arm for an initial grasp or contact, a handover, an "
+        "arm-specific release or retract, and whenever arm choice is ambiguous. After one arm is unambiguously holding "
+        "an object, a continuous single-arm lift, move, rotate, shake, or place command may omit the arm name, but it "
+        "must not imply an arm switch. For two arms manipulating different objects, spell out both mappings as left arm "
+        "to object X and right arm to object Y in every stage where the mapping matters; use 'both arms' only when both "
+        "arms act symmetrically on one shared object. When the task sends two independent objects to separately assigned "
+        "targets and has no ordering, asymmetric-role, shared-container, or collision dependency, preserve the "
+        "training-time parallel segmentation: make one paired dual-arm grasp subgoal, then paired lift/move subgoals, then "
+        "one paired placement subgoal. If the task genuinely requires sequential or asymmetric placement, pair only the "
+        "shared stages and keep both arm-object mappings explicit in every simultaneous stage. Never serialize two fully "
+        "independent arm plans when their corresponding stages can be paired. A paired dual-arm command still counts as "
+        "one physical motion stage. "
+        "Avoid filler such as 'securely', 'while keeping it grasped', "
+        "'respectively', or 'at the same time', and never create check, confirm, verify, or ensure-only commands."
+    )
+
+
+def _task_plan_style_examples() -> list[dict[str, Any]]:
+    """Training-split examples that define PI0.5 command granularity and wording."""
+    return [
+        {
+            "pattern": "single_arm_pick_place",
+            "task_instruction": "Place the bowl-shaped container onto the round plate.",
+            "subgoals": [
+                {"type": "grasp", "instruction": "Use the left arm to grasp the bowl-shaped container."},
+                {"type": "lift", "instruction": "Lift the bowl-shaped container about 10 centimeters."},
+                {"type": "place", "instruction": "Place the bowl-shaped container onto the round plate."},
+                {"type": "retract", "instruction": "Raise the left gripper away from the placed container."},
+            ],
+            "note": "The grasp already includes approach; held-object continuations may omit the arm.",
+        },
+        {
+            "pattern": "dual_arm_two_objects",
+            "task_instruction": "Move the red bottle and orange bottle to their separate targets.",
+            "subgoals": [
+                {
+                    "type": "grasp",
+                    "instruction": (
+                        "Use left arm to grasp shiny red bottle and right arm to grasp rounded-base plastic orange bottle."
+                    ),
+                },
+                {
+                    "type": "lift",
+                    "instruction": (
+                        "Lift shiny red bottle with left arm and rounded-base plastic orange bottle with right arm."
+                    ),
+                },
+                {
+                    "type": "place",
+                    "instruction": (
+                        "Use left arm to place shiny red bottle at left target and right arm to place plastic orange "
+                        "bottle at right target."
+                    ),
+                },
+            ],
+            "note": (
+                "For this independent separate-target pattern, keep both arm-object mappings explicit and pair the "
+                "corresponding stages. Never serialize a complete left-arm plan followed by a complete right-arm plan; "
+                "do not say only 'both objects' or 'respectively'."
+            ),
+            "forbidden_serialized_shape": [
+                "left grasp, left lift, left place, left retract",
+                "right grasp, right lift, right place, right retract",
+            ],
+        },
+        {
+            "pattern": "shared_object_dual_arm",
+            "task_instruction": "Lift the pot by both handles.",
+            "subgoals": [
+                {"type": "prepare", "instruction": "Close the left and right grippers halfway."},
+                {
+                    "type": "grasp",
+                    "instruction": "Use the left arm to grasp the left pot handle and the right arm to grasp the right pot handle.",
+                },
+                {"type": "lift", "instruction": "Lift the pot upward with both arms."},
+            ],
+            "note": "Use 'both arms' only after both arms are bound to the same shared object.",
+        },
+        {
+            "pattern": "direct_press_without_grasp",
+            "task_instruction": "Click the glossy blue bell.",
+            "subgoals": [
+                {
+                    "type": "approach",
+                    "instruction": "Move the right gripper above the glossy blue bell's top center and close it.",
+                },
+                {
+                    "type": "press",
+                    "instruction": "Lower the right gripper onto the glossy blue bell's top center.",
+                },
+                {
+                    "type": "retract",
+                    "instruction": "Raise the right gripper back above the glossy blue bell.",
+                },
+            ],
+            "note": "Use approach, contact, and retract; do not invent grasp or lift stages.",
+        },
+        {
+            "pattern": "handover",
+            "task_instruction": "Hand the microphone from the right arm to the left arm.",
+            "subgoals": [
+                {"type": "grasp", "instruction": "Use the right arm to grasp the microphone."},
+                {"type": "lift", "instruction": "Lift and orient the microphone for handover."},
+                {"type": "move", "instruction": "Move the microphone to the center handover position."},
+                {"type": "grasp", "instruction": "Use the left arm to grasp the microphone from the right arm."},
+                {"type": "release", "instruction": "Open the right gripper to release the microphone."},
+                {
+                    "type": "move",
+                    "instruction": "Raise the right arm and move the microphone leftward with the left arm.",
+                },
+            ],
+            "note": "Name both arms at the transfer and never imply an unannounced arm switch.",
+        },
+    ]
+
+
+def _task_plan_hard_constraints() -> list[dict[str, str]]:
+    return [
+        {
+            "name": "final_place_absorbs_transport",
+            "rule": (
+                "When a place subgoal can carry the held object directly from its post-lift pose to the final destination, "
+                "do not emit a generic preceding `Move X toward final Y` that establishes no distinct necessary state. "
+                "A separate move is valid when it explicitly achieves different geometry needed by the next action, such "
+                "as an above-target pre-place pose, clearance waypoint, required orientation, handover position, long "
+                "transport endpoint, or a move-only task with no place. Repeating the target name alone does not make a "
+                "move redundant; judge whether the move adds a real intermediate spatial relation."
+            ),
+            "forbidden": "grasp X -> lift X -> move X toward final Y -> place X on final Y -> retract",
+            "required_rewrite": "grasp X -> lift X -> place X on final Y -> retract",
+        },
+        {
+            "name": "independent_dual_objects_use_paired_stages",
+            "rule": (
+                "If the task sends two independent objects to separately assigned targets and has no ordering, "
+                "asymmetric-role, shared-container, or collision dependency, every corresponding stage must command both "
+                "mappings in one subgoal. Produce paired grasp, paired lift/move, and paired place stages; never finish "
+                "all stages for one arm before starting the other. If a real dependency requires sequential or "
+                "asymmetric placement, paired grasp/lift followed by explicit asymmetric stages is valid. The scalar "
+                "source_candidate_id/target_candidate_id fields may hold the left/primary pair; put both complete pairs "
+                "under metadata.arm_candidate_bindings."
+            ),
+            "forbidden": "left grasp -> left lift -> left place -> right grasp -> right lift -> right place",
+            "required_rewrite": "paired left+right grasp -> paired left+right lift/move -> paired left+right place",
+        },
+    ]
+
+
+def _task_plan_full_few_shots() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "single_arm_place_without_redundant_move",
+            "input": {
+                "task": "Place the bowl-shaped container onto the round plate.",
+                "candidate_bindings": {"source": "C1 bowl-shaped container", "target": "C2 round plate"},
+            },
+            "correct_output": {
+                "task": "Place the bowl-shaped container onto the round plate.",
+                "subgoals": [
+                    {
+                        "subgoal_id": "S1",
+                        "type": "grasp",
+                        "instruction": "Use the left arm to grasp the bowl-shaped container.",
+                        "source_candidate_id": "C1",
+                        "target_candidate_id": None,
+                        "status": "pending",
+                        "completion_criteria": {
+                            "natural_language": "The left gripper holds the bowl-shaped container."
+                        },
+                        "metadata": {},
+                    },
+                    {
+                        "subgoal_id": "S2",
+                        "type": "lift",
+                        "instruction": "Lift the bowl-shaped container about 10 centimeters.",
+                        "source_candidate_id": "C1",
+                        "target_candidate_id": None,
+                        "status": "pending",
+                        "completion_criteria": {
+                            "natural_language": "The held container is raised above the table."
+                        },
+                        "metadata": {},
+                    },
+                    {
+                        "subgoal_id": "S3",
+                        "type": "place",
+                        "instruction": "Place the bowl-shaped container onto the round plate.",
+                        "source_candidate_id": "C1",
+                        "target_candidate_id": "C2",
+                        "status": "pending",
+                        "completion_criteria": {
+                            "natural_language": "The bowl-shaped container rests on the round plate."
+                        },
+                        "metadata": {},
+                    },
+                    {
+                        "subgoal_id": "S4",
+                        "type": "retract",
+                        "instruction": "Raise the left gripper away from the placed container.",
+                        "source_candidate_id": "C1",
+                        "target_candidate_id": None,
+                        "status": "pending",
+                        "completion_criteria": {
+                            "natural_language": "The left gripper is clear of the placed container."
+                        },
+                        "metadata": {},
+                    },
+                ],
+                "current_subgoal_id": "S1",
+                "status": "pending",
+            },
+            "do_not_add": "Move the bowl-shaped container toward the round plate.",
+        },
+        {
+            "name": "paired_dual_arm_two_objects",
+            "input": {
+                "task": (
+                    "Move the shiny red bottle to the left target and the rounded-base orange bottle to the right target."
+                ),
+                "candidate_bindings": {
+                    "left": {"source": "C1 shiny red bottle", "target": "C3 left target"},
+                    "right": {"source": "C2 rounded-base orange bottle", "target": "C4 right target"},
+                },
+            },
+            "correct_output": {
+                "task": (
+                    "Move the shiny red bottle to the left target and the rounded-base orange bottle to the right target."
+                ),
+                "subgoals": [
+                    {
+                        "subgoal_id": "S1",
+                        "type": "grasp",
+                        "instruction": (
+                            "Use left arm to grasp shiny red bottle and right arm to grasp rounded-base plastic orange bottle."
+                        ),
+                        "source_candidate_id": "C1",
+                        "target_candidate_id": None,
+                        "status": "pending",
+                        "completion_criteria": {
+                            "natural_language": "The left gripper holds the red bottle and the right gripper holds the orange bottle."
+                        },
+                        "metadata": {
+                            "arm_candidate_bindings": {
+                                "left": {"source_candidate_id": "C1", "target_candidate_id": "C3"},
+                                "right": {"source_candidate_id": "C2", "target_candidate_id": "C4"},
+                            }
+                        },
+                    },
+                    {
+                        "subgoal_id": "S2",
+                        "type": "lift",
+                        "instruction": (
+                            "Lift shiny red bottle with left arm and rounded-base plastic orange bottle with right arm."
+                        ),
+                        "source_candidate_id": "C1",
+                        "target_candidate_id": None,
+                        "status": "pending",
+                        "completion_criteria": {
+                            "natural_language": "Both bottles are lifted clear of the table by their assigned arms."
+                        },
+                        "metadata": {
+                            "arm_candidate_bindings": {
+                                "left": {"source_candidate_id": "C1", "target_candidate_id": "C3"},
+                                "right": {"source_candidate_id": "C2", "target_candidate_id": "C4"},
+                            }
+                        },
+                    },
+                    {
+                        "subgoal_id": "S3",
+                        "type": "place",
+                        "instruction": (
+                            "Use left arm to place shiny red bottle at left target and right arm to place plastic "
+                            "orange bottle at right target."
+                        ),
+                        "source_candidate_id": "C1",
+                        "target_candidate_id": "C3",
+                        "status": "pending",
+                        "completion_criteria": {
+                            "natural_language": "The red bottle is at the left target and the orange bottle is at the right target."
+                        },
+                        "metadata": {
+                            "arm_candidate_bindings": {
+                                "left": {"source_candidate_id": "C1", "target_candidate_id": "C3"},
+                                "right": {"source_candidate_id": "C2", "target_candidate_id": "C4"},
+                            }
+                        },
+                    },
+                ],
+                "current_subgoal_id": "S1",
+                "status": "pending",
+            },
+            "do_not_output": (
+                "A complete C1/left-arm sequence followed by a complete C2/right-arm sequence."
+            ),
+        },
+    ]
+
+
+def _task_plan_schema(source_id: str | None, target_id: str | None) -> dict[str, Any]:
+    source_rule = (
+        f"{source_id} or another existing candidate id for the object/fixture/tool controlled by this subgoal; "
+        "null only if no visual candidate is involved"
+    )
+    target_rule = (
+        (
+            f"{target_id} when this subgoal needs the bound separate target/destination/relation object; "
+            "null for direct contact/articulation/source-only subgoals"
+        )
+        if target_id is not None
+        else (
+            "an existing candidate id only if this subgoal truly needs a separate destination/relation object; "
+            "otherwise null because no separate target is currently bound"
+        )
+    )
     return {
         "task": "copy the task instruction",
         "subgoals": [
             {
-                "subgoal_id": "S1",
-                "type": "first short-horizon stage, e.g. approach or grasp",
-                "instruction": "one natural-language command for S1 to send directly to the VLA",
-                "source_candidate_id": source_id,
-                "target_candidate_id": None,
+                "subgoal_id": "S1, S2, ... in execution order; repeat this item for every required physical stage",
+                "type": "short task-specific lowercase action label such as grasp, lift, move, place, press, or retract",
+                "instruction": "one locally executable command sent verbatim to the VLA",
+                "source_candidate_id": source_rule,
+                "target_candidate_id": target_rule,
                 "status": "pending",
                 "completion_criteria": {
-                    "natural_language": "concrete visible success condition for S1, not a placeholder"
+                    "natural_language": "concrete visible success condition for this exact subgoal, not a placeholder"
                 },
-            },
-            {
-                "subgoal_id": "S2",
-                "type": "next task-specific stage, e.g. lift, transport, press, open, pour, place",
-                "instruction": "one natural-language command for S2 to send directly to the VLA",
-                "source_candidate_id": source_id,
-                "target_candidate_id": target_id,
-                "status": "pending",
-                "completion_criteria": {
-                    "natural_language": "concrete visible success condition for S2, not a placeholder"
-                },
-            },
-            {
-                "subgoal_id": "S3",
-                "type": "next atomic stage, e.g. lift, transport, align, press, open, pour",
-                "instruction": "one natural-language command for S3 to send directly to the VLA",
-                "source_candidate_id": source_id,
-                "target_candidate_id": target_id,
-                "status": "pending",
-                "completion_criteria": {
-                    "natural_language": "concrete visible success condition for S3, not a placeholder"
-                },
-            },
-            {
-                "subgoal_id": "S4",
-                "type": "optional or terminal atomic stage that makes the whole instruction true",
-                "instruction": "one natural-language command for S4 to send directly to the VLA",
-                "source_candidate_id": source_id,
-                "target_candidate_id": target_id,
-                "status": "pending",
-                "completion_criteria": {
-                    "natural_language": "concrete visible success condition for S4 or the whole task, not a placeholder"
+                "metadata": {
+                    "arm_candidate_bindings": (
+                        "for a paired dual-arm subgoal, map left and right to their source_candidate_id and "
+                        "target_candidate_id; otherwise use an empty object"
+                    )
                 },
             },
         ],
@@ -510,9 +815,8 @@ def _validate_task_plan_completeness(
     plan: TaskPlan,
     task_instruction: str | None,
     source_id: str,
-    target_id: str,
+    target_id: str | None,
 ) -> list[str]:
-    _ = task_instruction  # Task-text keyword completeness checks are intentionally disabled.
     errors: list[str] = []
     if not plan.subgoals:
         return ["empty_subgoals_in_model_output"]
@@ -524,6 +828,9 @@ def _validate_task_plan_completeness(
         errors.append("current_subgoal_id_not_in_subgoals")
 
     for subgoal in plan.subgoals:
+        type_error = _subgoal_type_error(subgoal)
+        if type_error is not None:
+            errors.append(type_error)
         instruction = str(getattr(subgoal, "instruction", "") or "").strip()
         if not instruction:
             errors.append(f"missing_subgoal_instruction:{subgoal.subgoal_id}")
@@ -533,14 +840,28 @@ def _validate_task_plan_completeness(
 
     if not any(subgoal.source_candidate_id == source_id for subgoal in plan.subgoals):
         errors.append("missing_source_candidate_in_subgoals")
+    target_required = task_plan_requires_target(task_instruction, plan.subgoals)
+    if target_required and not target_id:
+        errors.append("missing_target_candidate_for_target_required_task")
     if (
-        target_id
+        target_required
+        and target_id
         and target_id != source_id
         and not any(subgoal.target_candidate_id == target_id for subgoal in plan.subgoals)
     ):
         errors.append("missing_target_candidate_in_subgoals")
 
     return errors
+
+
+def _subgoal_type_error(subgoal: Subgoal) -> str | None:
+    type_text = str(getattr(subgoal, "type", "") or "").strip()
+    normalized = _norm_text(type_text)
+    if not type_text:
+        return f"missing_subgoal_type:{subgoal.subgoal_id}"
+    if len(type_text) > 32 or "e.g." in type_text.lower() or "short_horizon" in normalized:
+        return f"placeholder_subgoal_type:{subgoal.subgoal_id}"
+    return None
 
 
 def _completion_criteria_error(subgoal: Subgoal) -> str | None:
@@ -621,15 +942,18 @@ def _scheduler_instruction(loop_mode: bool) -> str:
         "If runtime_state.observation_present is false, choose vision.capture_views first; do not choose "
         "perceive_scene, localize_task_objects, state.update_world_state, or any non-observe skill before images exist. "
         "If either shows the task objects are already bound and fresh, choose control=advance_stage with stage=null. "
-        "Do not call localize_task_objects again when runtime_state.world_state_source_candidate_id and "
-        "runtime_state.world_state_target_candidate_id are both set. Metric geometry is optional evidence for this "
+        "Do not call localize_task_objects again when runtime_state.world_state_source_candidate_id is set and "
+        "either runtime_state.target_candidate_required is false or runtime_state.world_state_target_candidate_id is set. "
+        "Metric geometry is optional evidence for this "
         "agent and is not required to leave observe because the PI0.5/OpenPI execution backend receives images. "
         "Do not call lift_depth_cluster or lift_geometry merely because metric_geometry is unavailable. "
         "In observe, the visual state is built in strict semantic order: capture_views obtains images; "
-        "perceive_scene detects candidate objects only and does not produce source_candidate_id or target_candidate_id; "
-        "localize_task_objects is the required skill that binds top-level source_candidate_id and target_candidate_id; "
-        "update_world_state should run only after those top-level bindings exist in perception. If perception has "
-        "candidates but source_candidate_id or target_candidate_id is null, choose vision.localize_task_objects, "
+        "perceive_scene detects candidate objects only and does not produce source_candidate_id or optional "
+        "target_candidate_id; localize_task_objects is the required skill that binds top-level source_candidate_id "
+        "and binds target_candidate_id only when the task has a separate target/destination/relation object. "
+        "update_world_state should run only after source exists and any required target binding exists in perception. "
+        "If perception has candidates but source_candidate_id is null, or target_candidate_required is true and "
+        "target_candidate_id is null, choose vision.localize_task_objects, "
         "not state.update_world_state and not another perceive_scene unless the existing candidates are empty or stale. "
         "When runtime_state.observe_complete is true, observe is complete: choose control=advance_stage with stage=null. "
         "Do not run safety.preflight_action in observe; preflight checks are only legal after observe advances through plan "
@@ -671,9 +995,12 @@ def _scheduler_instruction(loop_mode: bool) -> str:
         "from the earliest invalid artifact instead of retrying execute_action unchanged. "
         "Task planning artifacts are task_plan then current_subgoal. Motion artifacts are motion_goal, "
         "motion_plan, action_chunk, then execute_action. When choosing motion.emit_action_chunk, payload "
-        "must include an integer horizon from 10 to 50. Use horizon=10 for precise grasp, place, release, or "
+        f"must include an integer horizon from {MIN_ACTION_HORIZON} to {MAX_ACTION_HORIZON}. "
+        "Use horizon=10 for precise grasp, place, release, or "
         "stability checks; horizon=20 for approach, align, lift, press, open, close, pull, push, insert, or pour; "
-        "horizon=30 for normal transport; use up to horizon=50 only for clearly longer moves. "
+        "horizon=30 for normal transport; use horizon=32 only for clearly longer moves. Never request more than "
+        "32 actions because the deployed PI0.5 policy has action_horizon=32; continue a longer motion only after "
+        "executing the chunk, observing again, and replanning from the fresh state. "
         "After execute_action succeeds, verify the current "
         "subgoal before advancing, continuing execution, replanning, reobserving, recovering, or finishing. "
         "In verify, first capture fresh verification images with vision.capture_verify_views when "

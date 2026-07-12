@@ -9,6 +9,7 @@ from typing import Any
 from ..blackboard_utils import current_observation_id, mark_motion_artifacts_stale
 from ..schema import SafetyReport, SkillRequest, SkillResult
 from ..skills.base import SkillContext, SkillRegistry
+from ..task_semantics import subgoal_requires_target
 from .skill_helpers import get_attr, ok, register_skill
 
 
@@ -169,13 +170,13 @@ def _check_object_binding(checks: dict[str, Any], errors: list[str], world_state
     subgoal_type = str(get_attr(current_subgoal, "type", "") or "").lower()
     source_id = get_attr(current_subgoal, "source_candidate_id") or get_attr(world_state, "source_candidate_id")
     target_id = get_attr(current_subgoal, "target_candidate_id") or get_attr(world_state, "target_candidate_id")
-    target_required = subgoal_type in {"transport", "place", "release"}
+    target_required = subgoal_requires_target(subgoal_type, get_attr(current_subgoal, "instruction"))
 
     if not source_id:
         errors.append("missing_source_candidate")
     if target_required and not target_id:
         errors.append(f"missing_target_candidate_for_{subgoal_type}")
-    if source_id and target_id and source_id == target_id:
+    if target_required and source_id and target_id and source_id == target_id:
         errors.append("source_target_same_candidate")
 
     source = _candidate_by_id(world_state, source_id)

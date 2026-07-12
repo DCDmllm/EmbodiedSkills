@@ -62,7 +62,11 @@ def prepare_task_args(config: RobotwinConfig, overrides: dict[str, Any] | None =
     args["collect_data"] = False
     args["save_data"] = False
     args["eval_video_log"] = False
-    args["need_plan"] = False
+    args["is_test"] = bool(config.is_test)
+    args["eval_mode"] = bool(config.eval_mode)
+    if config.render_freq is not None:
+        args["render_freq"] = int(config.render_freq)
+    args["need_plan"] = bool(config.need_plan) if config.need_plan is not None else False
 
     camera_map = load_yaml(camera_config_path)
     apply_embodiment_files(args, repo_root, load_yaml(embodiment_config_path))

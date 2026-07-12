@@ -269,6 +269,10 @@ def _override_groot_runtime(action_backend: dict[str, Any], config: RLConfig, op
 def _populate_episode_from_result(episode: EpisodeRecord, payload: dict[str, Any]) -> None:
     loop = payload.get("loop") if isinstance(payload.get("loop"), dict) else {}
     episode.status = str(loop.get("status") or "unknown")
+    task_status = payload.get("task_status") if isinstance(payload.get("task_status"), dict) else {}
+    episode.metadata["task_status"] = dict(task_status)
+    episode.metadata["official_task_success"] = bool(task_status.get("success", False))
+    episode.metadata["task_status_available"] = bool(task_status.get("available", bool(task_status)))
     if loop.get("reason"):
         episode.metadata["loop_reason"] = loop.get("reason")
     for item in loop.get("steps") or []:
@@ -290,10 +294,7 @@ def _populate_episode_from_result(episode: EpisodeRecord, payload: dict[str, Any
                 else [],
             )
         )
-    if episode.status in {"finished"}:
-        episode.reward_score = 0.0
-    else:
-        episode.reward_score = None
+    episode.reward_score = None
 
 
 def _populate_episode_rewards(episode: EpisodeRecord, reward_path: Path) -> None:
@@ -339,14 +340,18 @@ def _append_episode_terminal_reward(episode: EpisodeRecord, reward_path: Path, c
         for skill in episode.skill_calls
         if skill.status != "invalid_decision" and not skill.success and not _is_recoverable_preflight_failure(skill)
     )
-    incomplete = episode.status != "finished"
+    official_success, success_source = _episode_task_success(episode, config)
+    loop_finished = episode.status == "finished"
+    incomplete = not official_success
+    premature_finish = bool(loop_finished and not official_success)
     penalty = (
         (float(config.reward.incomplete_episode_penalty) if incomplete else 0.0)
+        + (float(config.reward.premature_finish_penalty) if premature_finish else 0.0)
         + invalid_decisions * float(config.reward.invalid_decision_penalty)
         + failed_skills * float(config.reward.skill_failure_penalty)
         + recoverable_preflight_failures * float(config.reward.recoverable_preflight_penalty)
     )
-    terminal_success = episode.status == "finished"
+    terminal_success = official_success
     reward = RewardRecord(
         step_index=None,
         task_name=episode.task_name,
@@ -354,25 +359,38 @@ def _append_episode_terminal_reward(episode: EpisodeRecord, reward_path: Path, c
         family="episode_terminal",
         reason=_terminal_reward_reason(
             episode.status,
+            incomplete,
+            premature_finish,
             invalid_decisions,
             failed_skills,
             recoverable_preflight_failures,
         ),
         events={
             "episode_finished": terminal_success,
+            "loop_finished": loop_finished,
+            "official_task_success": official_success,
             "episode_incomplete": incomplete,
+            "premature_finish": premature_finish,
             "invalid_decision_seen": invalid_decisions > 0,
             "skill_failure_seen": failed_skills > 0,
             "recoverable_preflight_failure_seen": recoverable_preflight_failures > 0,
         },
         metrics={
             "incomplete_episode": 1.0 if incomplete else 0.0,
+            "loop_finished": 1.0 if loop_finished else 0.0,
+            "official_task_success": 1.0 if official_success else 0.0,
+            "premature_finish": 1.0 if premature_finish else 0.0,
             "invalid_decisions": float(invalid_decisions),
             "failed_skills": float(failed_skills),
             "recoverable_preflight_failures": float(recoverable_preflight_failures),
             "skill_calls": float(len(episode.skill_calls)),
         },
-        metadata={"episode_status": episode.status, "errors": list(episode.errors)},
+        metadata={
+            "episode_status": episode.status,
+            "success_source": success_source,
+            "task_status": dict(episode.metadata.get("task_status") or {}),
+            "errors": list(episode.errors),
+        },
     )
     episode.rewards.append(reward)
     episode.reward_score = float(sum(item.reward for item in episode.rewards))
@@ -406,13 +424,17 @@ def _is_recoverable_preflight_failure(skill: SkillCallTrace) -> bool:
 
 def _terminal_reward_reason(
     status: str,
+    incomplete: bool,
+    premature_finish: bool,
     invalid_decisions: int,
     failed_skills: int,
     recoverable_preflight_failures: int = 0,
 ) -> str:
     parts = [f"episode_status={status}"]
-    if status != "finished":
+    if incomplete:
         parts.append("incomplete_episode=1")
+    if premature_finish:
+        parts.append("premature_finish=1")
     if invalid_decisions:
         parts.append(f"invalid_decisions={invalid_decisions}")
     if failed_skills:
@@ -420,6 +442,17 @@ def _terminal_reward_reason(
     if recoverable_preflight_failures:
         parts.append(f"recoverable_preflight_failures={recoverable_preflight_failures}")
     return ";".join(parts)
+
+
+def _episode_task_success(episode: EpisodeRecord, config: RLConfig) -> tuple[bool, str]:
+    task_status = episode.metadata.get("task_status")
+    if isinstance(task_status, dict) and "success" in task_status:
+        return bool(task_status.get("success")), "environment_task_status"
+    if "official_task_success" in episode.metadata:
+        return bool(episode.metadata.get("official_task_success")), "episode_metadata"
+    if not _should_run_environment(config):
+        return episode.status == "finished", "non_environment_loop_status"
+    return False, "missing_environment_task_status"
 
 
 if __name__ == "__main__":

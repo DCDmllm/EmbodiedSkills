@@ -73,6 +73,7 @@ class RewardConfig:
     task_map: dict[str, str] = field(default_factory=dict)
     step_cost: float = 0.05
     incomplete_episode_penalty: float = -1.0
+    premature_finish_penalty: float = -3.0
     invalid_decision_penalty: float = -2.0
     skill_failure_penalty: float = -1.0
     recoverable_preflight_penalty: float = -0.1
@@ -172,7 +173,12 @@ class RLConfig:
     openpi: EnvCommandConfig = field(
         default_factory=lambda: EnvCommandConfig(
             python="/mnt/wangwai/miniconda3/envs/openpi-torch-py312/bin/python",
-            env={"PYTHONPATH": "/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/RoboTwin/policy/pi05/src"},
+            env={
+                "PYTHONPATH": (
+                    "/mnt/linyutong/wangwai_mirror/vla/clawvla/src:"
+                    "/mnt/linyutong/wangwai_mirror/pi0.5/src"
+                )
+            },
         )
     )
     policy: PolicyConfig = field(
@@ -180,7 +186,9 @@ class RLConfig:
     )
     rollout: RolloutConfig = field(
         default_factory=lambda: RolloutConfig(
-            base_config="/mnt/wangwai/vla/clawvla/configs/robotwin_pi05_worker_probe.json",
+            base_config=(
+                "/mnt/linyutong/wangwai_mirror/vla/clawvla/configs/robotwin_pi05_subtasks_25k.json"
+            ),
             instruction="place the container on the plate",
         )
     )

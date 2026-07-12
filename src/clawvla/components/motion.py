@@ -38,7 +38,7 @@ def build_motion_goal(request: SkillRequest, context: SkillContext) -> SkillResu
     target_candidate_id = (
         payload.get("target_candidate_id")
         or get_attr(current_subgoal, "target_candidate_id")
-        or get_attr(world_state, "target_candidate_id")
+        or (None if current_subgoal is not None else get_attr(world_state, "target_candidate_id"))
     )
     source = world_state.candidate_by_id(source_candidate_id) if world_state is not None else None
     target = world_state.candidate_by_id(target_candidate_id) if world_state is not None else None
@@ -321,6 +321,8 @@ def _expected_action_dim(action_type: object | None, backend: object | None = No
         return 16
     if action_type == "libero_ee_delta":
         return 7
+    if action_type in {"calvin_ee_pose_10d", "calvin_ee_delta"}:
+        return 10
     return None
 
 

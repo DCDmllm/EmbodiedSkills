@@ -1,16 +1,16 @@
 {
   "name": "qwen3vl_pi05_vllm_agent",
-  "cwd": "/mnt/wangwai/vla/clawvla",
+  "cwd": "/mnt/linyutong/wangwai_mirror/vla/clawvla",
   "python": "/mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python",
   "unset_env": [
     "PYTHONPATH"
   ],
   "env": {
-    "PYTHONPATH": "/mnt/wangwai/tmp_pytorch3d_target:/mnt/wangwai/vla/clawvla/src"
+    "PYTHONPATH": "/mnt/wangwai/tmp_pytorch3d_target:/mnt/linyutong/wangwai_mirror/vla/clawvla/src"
   },
   "module": "clawvla.scripts.run_loop_with_vllm",
   "args": {
-    "base-config": "/mnt/wangwai/vla/clawvla/configs/robotwin_pi05_worker_probe.json",
+    "base-config": "/mnt/linyutong/wangwai_mirror/vla/clawvla/configs/robotwin_pi05_subtasks_25k.json",
     "model": "/mnt/wangwai/weights/Qwen/Qwen3-VL-8B-Instruct",
     "served-model-name": "local-scheduler",
     "model-keys": "vision,scheduler,verifier,recovery",

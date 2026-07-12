@@ -54,6 +54,7 @@ reward:
     turn_switch: robotwin
   step_cost: 0.05
   incomplete_episode_penalty: -1.0
+  premature_finish_penalty: -3.0
   invalid_decision_penalty: -2.0
   skill_failure_penalty: -1.0
   recoverable_preflight_penalty: -0.1

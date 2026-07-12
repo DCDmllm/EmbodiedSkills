@@ -4,11 +4,21 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .blackboard_utils import current_observation_id, metadata_value
-from .loop_types import ADVANCE_STAGE, FINISH_RUN, RUN_SKILL, LoopDecision, LoopRunResult, LoopStepRecord
+from .loop_types import (
+    ADVANCE_STAGE,
+    FINISH_RUN,
+    MAX_ACTION_HORIZON,
+    MIN_ACTION_HORIZON,
+    RUN_SKILL,
+    LoopDecision,
+    LoopRunResult,
+    LoopStepRecord,
+)
 from .notices import emit_human_trace, emit_runtime_event, emit_status_notice
 from .phase_policy import PhasePolicy
 from .runtime import AgentRuntime
 from .schema import SkillResult
+from .task_semantics import task_requires_target
 
 
 REPAIR_TARGET_STAGES = {"observe", "plan", "preflight", "recover"}
@@ -324,6 +334,9 @@ class AgentLoop:
         }:
             payload.setdefault("use_model", True)
             payload.setdefault("image_paths", self._current_vlm_image_paths())
+        if decision.next_component == "scheduler" and decision.next_skill == "build_task_plan":
+            payload.setdefault("use_model", True)
+            payload.setdefault("image_paths", self._current_vlm_image_paths())
         if decision.next_component == "verifier" and decision.next_skill == "verify_progress":
             payload.setdefault("use_model", True)
             payload.setdefault("image_paths", self._current_verify_image_paths())
@@ -527,7 +540,11 @@ class AgentLoop:
             return "world_state_requires_reobserve"
         if not getattr(world_state, "source_candidate_id", None):
             return "missing_source_candidate"
-        if not getattr(world_state, "target_candidate_id", None):
+        if task_requires_target(self.runtime.blackboard.task_instruction) and not getattr(
+            world_state,
+            "target_candidate_id",
+            None,
+        ):
             return "missing_target_candidate"
         return None
 
@@ -555,6 +572,7 @@ class AgentLoop:
         preflight_errors = list(getattr(self.runtime.blackboard.read("preflight_report"), "errors", []) or [])
         stale_visual_errors = {"stale_perception", "stale_world_state"} & {str(error) for error in preflight_errors}
         next_required_decision = self._next_required_decision_summary(current_stage, preflight_error)
+        target_candidate_required = task_requires_target(self.runtime.blackboard.task_instruction)
         return {
             "observation_id": obs_id,
             "observation_present": obs_id is not None,
@@ -573,6 +591,7 @@ class AgentLoop:
             "perception_target_candidate_id": getattr(perception, "target_candidate_id", None),
             "world_state_source_candidate_id": getattr(world_state, "source_candidate_id", None),
             "world_state_target_candidate_id": getattr(world_state, "target_candidate_id", None),
+            "target_candidate_required": target_candidate_required,
             "world_state_needs_reobserve": getattr(world_state, "needs_reobserve", None),
             "world_state_ready": world_state_ready_error is None,
             "world_state_ready_error": world_state_ready_error,
@@ -626,13 +645,21 @@ class AgentLoop:
                 return _required_decision("run_skill", current_stage, "vision", "capture_views", reason="missing_observation")
             if perception is None:
                 return _required_decision("run_skill", current_stage, "vision", "perceive_scene", reason="missing_perception")
-            if not getattr(perception, "source_candidate_id", None) or not getattr(perception, "target_candidate_id", None):
+            target_required = task_requires_target(self.runtime.blackboard.task_instruction)
+            if not getattr(perception, "source_candidate_id", None) or (
+                target_required and not getattr(perception, "target_candidate_id", None)
+            ):
+                reason = (
+                    "missing_source_binding"
+                    if not getattr(perception, "source_candidate_id", None)
+                    else "missing_required_target_binding"
+                )
                 return _required_decision(
                     "run_skill",
                     current_stage,
                     "vision",
                     "localize_task_objects",
-                    reason="missing_source_or_target_binding",
+                    reason=reason,
                 )
             if self._world_state_ready_error() is not None:
                 return _required_decision("run_skill", current_stage, "state", "update_world_state", reason=self._world_state_ready_error())
@@ -902,8 +929,11 @@ class AgentLoop:
             horizon_value = int(horizon)
         except (TypeError, ValueError):
             return f"invalid_horizon_before_emit_action_chunk:{horizon}"
-        if horizon_value < 10 or horizon_value > 50:
-            return f"horizon_out_of_range_before_emit_action_chunk:{horizon_value}:expected_10_to_50"
+        if horizon_value < MIN_ACTION_HORIZON or horizon_value > MAX_ACTION_HORIZON:
+            return (
+                f"horizon_out_of_range_before_emit_action_chunk:{horizon_value}:"
+                f"expected_{MIN_ACTION_HORIZON}_to_{MAX_ACTION_HORIZON}"
+            )
         return None
 
     def _verify_post_report_run_skill_error(self, stage: str, component: str, skill: str) -> str | None:

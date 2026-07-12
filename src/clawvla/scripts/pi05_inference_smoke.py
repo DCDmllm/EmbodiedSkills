@@ -40,7 +40,11 @@ def main() -> None:
         motion_goal=None,
         world_state=None,
         observation=observation,
-        request={"prompt": args.prompt, "num_steps": args.num_steps, "horizon": args.horizon},
+        request={
+            "motion_plan": {"vla_prompt": args.prompt},
+            "num_steps": args.num_steps,
+            "horizon": args.horizon,
+        },
     )
     payload = result.to_dict()
     rendered = json.dumps(payload, indent=2, ensure_ascii=True)

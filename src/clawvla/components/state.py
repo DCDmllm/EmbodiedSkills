@@ -11,7 +11,7 @@ def register_state_skills(registry: SkillRegistry) -> None:
         registry,
         "state",
         "update_world_state",
-        "Write world_state from perception after source_candidate_id/target_candidate_id are bound.",
+        "Write world_state from perception after source_candidate_id and any required target_candidate_id are bound.",
         update_world_state,
     )
     register_skill(registry, "state", "summarize_state", "Summarize compact state for scheduling/model prompts.", summarize_state)

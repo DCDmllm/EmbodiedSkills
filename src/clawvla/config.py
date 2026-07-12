@@ -58,6 +58,10 @@ class RobotwinConfig:
     task_config: str = "demo_clean"
     seed: int = 0
     now_ep_num: int = 0
+    is_test: bool = False
+    eval_mode: bool = False
+    render_freq: int | None = None
+    need_plan: bool | None = None
     enable_depth: bool = True
     enable_pointcloud: bool = True
     enable_actor_segmentation: bool = False

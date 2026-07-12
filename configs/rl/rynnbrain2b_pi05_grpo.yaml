@@ -1,0 +1,39 @@
+extends:
+  - qwen3vl_pi05_grpo.yaml
+
+name: rynnbrain2b_pi05_grpo
+
+policy:
+  model_path: /mnt/zrh/.cache/huggingface/hub/models--Alibaba-DAMO-Academy--RynnBrain-2B/snapshots/ad71236d013ae5618833fded73a32569045a8e9e
+  served_model_name: rynnbrain2b-policy
+
+rollout:
+  artifact_prefix: clawvla_rl_rynnbrain2b_pi05
+
+openrlhf:
+  tensor_parallel_size: 1
+  max_prompt_length: 32768
+  max_response_length: 32768
+  max_model_len: 65536
+  max_num_batched_tokens: 32768
+  max_num_seqs: 8
+  gpu_memory_utilization: 0.5
+
+cluster:
+  policy_gpus:
+    - 0
+    - 1
+  openpi_gpus:
+    - 6
+  robotwin_gpus:
+    - 7
+  ray_num_workers: 4
+
+logging:
+  wandb_tags:
+    - rynnbrain2b
+    - robotwin
+    - pi05
+
+metadata:
+  notes: Unified OpenRLHF VLM policy RL with RynnBrain-2B and frozen OpenPI/pi0.5 backend.

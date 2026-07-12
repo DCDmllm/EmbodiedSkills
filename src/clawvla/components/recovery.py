@@ -6,6 +6,7 @@ from ..blackboard_utils import mark_motion_artifacts_stale
 from ..model_calls import call_component_json
 from ..schema import SkillRequest, SkillResult, Subgoal, TaskPlan
 from ..skills.base import SkillContext, SkillRegistry
+from .scheduler import _task_plan_style_examples, _vla_subgoal_instruction_style
 from .skill_helpers import get_attr, ok, register_skill, to_dict, unavailable
 
 
@@ -68,7 +69,9 @@ def decide_recovery(request: SkillRequest, context: SkillContext) -> SkillResult
             "recovery patch. Do not route normal not_done progress here; not_done should have used continue_execute. "
             "A recovery patch must change something meaningful: revise the current subgoal instruction, insert a short "
             "recovery subgoal, request replanning when the plan itself is invalid, request reobservation when the scene "
-            "cannot be judged, or abort only if the run cannot continue. Do not output a generic stage router."
+            "cannot be judged, or abort only if the run cannot continue. Do not output a generic stage router. "
+            "Any repaired or inserted subgoal instruction must follow this action-policy language contract: "
+            f"{_vla_subgoal_instruction_style()}"
         ),
         payload={
             "task_instruction": blackboard.task_instruction,
@@ -76,6 +79,7 @@ def decide_recovery(request: SkillRequest, context: SkillContext) -> SkillResult
             "current_subgoal": to_dict(current_subgoal),
             "verification_report": to_dict(verification),
             "execution_report": to_dict(execution_report),
+            "instruction_style_examples": _task_plan_style_examples(),
             "required_schema": {
                 "recoverable": True,
                 "failure_diagnosis": "short concrete visual or execution failure diagnosis",

@@ -18,7 +18,12 @@ from clawvla.components.motion import _vla_prompt, execute_action
 from clawvla.components.recovery import build_retry_request, decide_recovery
 from clawvla.components.safety import preflight_action
 from clawvla.components.scheduler import (
+    _scheduler_instruction,
+    _task_plan_full_few_shots,
+    _task_plan_hard_constraints,
     _task_plan_instruction,
+    _task_plan_schema,
+    _task_plan_style_examples,
     _validate_task_plan_completeness,
     advance_subgoal,
     build_task_plan,
@@ -26,7 +31,7 @@ from clawvla.components.scheduler import (
     repair_stage_transition,
 )
 from clawvla.components.verifier import _subgoal_verification_contract, _verifier_blackboard_context, verify_progress
-from clawvla.envs import build_env_adapter, normalize_libero_observation
+from clawvla.envs import build_env_adapter, normalize_calvin_observation, normalize_libero_observation
 from clawvla.envs.robotwin_session import prepare_task_args
 from clawvla.components.vision import localize_task_objects
 from clawvla.loop_types import LoopDecision, LoopStepRecord
@@ -52,14 +57,19 @@ from clawvla.rl.openrlhf_runtime_patches import (
     _split_indices_by_modality,
     _shape_episode_rewards,
 )
-from clawvla.rl.rollout_worker import _append_episode_terminal_reward, _should_run_environment, _write_agent_config
+from clawvla.rl.rollout_worker import (
+    _append_episode_terminal_reward,
+    _populate_episode_from_result,
+    _should_run_environment,
+    _write_agent_config,
+)
 from clawvla.rl.policy_proxy import PolicyProxy, StaticPolicyBackend
 from clawvla.rl.reward_registry import build_reward_registry
+from clawvla.rewards.robotwin_reward import TASK_REWARD_SPECS, RewardSnapshot, compute_robotwin_reward
 from clawvla.scripts.run_loop import _apply_runtime_environment
 from clawvla.schema import (
     ActionChunk,
     CameraView,
-    MotionGoal,
     ObservationBundle,
     PerceptionResult,
     RobotArmState,
@@ -72,6 +82,7 @@ from clawvla.schema import (
     WorldState,
 )
 from clawvla.skills.base import SkillContext
+from clawvla.task_semantics import task_requires_target
 from clawvla.rl.trajectory import (
     EpisodeRecord,
     PolicyCallTrace,
@@ -138,6 +149,16 @@ def test_load_libero_config_and_env_factory() -> None:
     assert adapter.preflight_spec()["action"]["types"]["libero_ee_delta"] == 7
 
 
+def test_load_calvin_config_and_env_factory() -> None:
+    config = load_config("configs/calvin_xvla_enabled_probe.json")
+    adapter = build_env_adapter(config)
+
+    assert config.environment.type == "calvin"
+    assert adapter.metadata()["backend"] == "calvin"
+    assert adapter.preflight_spec()["state"]["source"] == "calvin_proprio"
+    assert adapter.preflight_spec()["action"]["types"]["calvin_ee_pose_10d"] == 10
+
+
 def test_libero_observation_normalization_fake_raw(tmp_path) -> None:
     raw = {
         "agentview_image": [
@@ -175,6 +196,40 @@ def test_libero_observation_normalization_fake_raw(tmp_path) -> None:
     assert saved.getpixel((0, 0)) == (255, 255, 0)
 
 
+def test_calvin_observation_normalization_fake_raw(tmp_path) -> None:
+    import numpy as np
+
+    from clawvla.artifacts import ArtifactStore
+
+    static = np.zeros((8, 8, 3), dtype=np.uint8)
+    gripper = np.ones((8, 8, 3), dtype=np.uint8) * 127
+    raw = {
+        "rgb_obs": {
+            "rgb_static": static,
+            "rgb_gripper": gripper,
+        },
+        "depth_obs": {
+            "depth_static": np.zeros((8, 8), dtype=np.float32),
+            "depth_gripper": np.ones((8, 8), dtype=np.float32),
+        },
+        "robot_obs": [0.1, 0.2, 0.3, 0.0, 0.0, 1.57, 0.08, *([0.0] * 7), 1.0],
+        "scene_obs": [0.0] * 24,
+    }
+
+    observation = normalize_calvin_observation(
+        raw,
+        task_instruction="move the slider left",
+        artifacts=ArtifactStore(tmp_path),
+        artifact_prefix="fake",
+    )
+
+    assert sorted(observation.camera_views) == ["gripper", "static"]
+    assert len(observation.raw["calvin_proprio"]) == 20
+    assert observation.robot_arms["panda"].metadata["calvin_proprio"] == observation.raw["calvin_proprio"]
+    assert Path(observation.camera_views["static"].rgb_path).exists()
+    assert Path(observation.camera_views["gripper"].depth_path).exists()
+
+
 def test_libero_action_validation_accepts_7d_backend() -> None:
     class Backend:
         def action_spec(self):
@@ -199,6 +254,85 @@ def test_libero_action_validation_accepts_7d_backend() -> None:
     assert report["checks"]["action_chunk"]["expected_command_dim"] == 7
 
 
+def test_calvin_action_validation_accepts_10d_backend() -> None:
+    class Backend:
+        def action_spec(self):
+            return {"types": {"calvin_ee_pose_10d": 10}}
+
+    blackboard = Blackboard()
+    blackboard.write("action_backend", Backend())
+    blackboard.write("observation", ObservationBundle(observation_id="obs"))
+    blackboard.write("current_subgoal", Subgoal(subgoal_id="S1", type="act", instruction="move the slider left"))
+    blackboard.write(
+        "action_chunk",
+        ActionChunk(
+            action_type="calvin_ee_pose_10d",
+            commands=[[0.0] * 10],
+            metadata={"observation_id": "obs", "subgoal_id": "S1", "stale": False, "consumed": False},
+        ),
+    )
+
+    report = importlib.import_module("clawvla.components.motion")._validate_action_chunk_report(blackboard)
+
+    assert report["allowed"] is True
+    assert report["checks"]["action_chunk"]["expected_command_dim"] == 10
+
+
+def test_calvin_http_backend_builds_chunk_from_real_response(monkeypatch, tmp_path) -> None:
+    import numpy as np
+
+    from clawvla.action_backends.calvin import CalvinHttpActionBackend
+    from clawvla.artifacts import ArtifactStore
+
+    raw = {
+        "rgb_obs": {
+            "rgb_static": np.zeros((4, 4, 3), dtype=np.uint8),
+            "rgb_gripper": np.ones((4, 4, 3), dtype=np.uint8),
+        },
+        "robot_obs": [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, 0.08, *([0.0] * 7), 1.0],
+        "scene_obs": [0.0] * 24,
+    }
+    observation = normalize_calvin_observation(raw, artifacts=ArtifactStore(tmp_path), artifact_prefix="fake")
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"action": [[float(i) for i in range(20)], [float(i + 20) for i in range(20)]]}
+
+    calls = []
+
+    def post(url, json, timeout):
+        calls.append({"url": url, "json": json, "timeout": timeout})
+        return Response()
+
+    monkeypatch.setitem(sys.modules, "requests", SimpleNamespace(post=post))
+    backend = CalvinHttpActionBackend(
+        {
+            "type": "calvin_http",
+            "enabled": True,
+            "url": "http://127.0.0.1:8000/act",
+            "serialization": "list",
+            "horizon": 2,
+        }
+    )
+
+    result = backend.build_action_chunk(
+        None,
+        None,
+        observation,
+        {"motion_plan": {"vla_prompt": "move the slider left."}},
+    )
+
+    assert result.success is True
+    assert result.action_chunk.action_type == "calvin_ee_pose_10d"
+    assert result.action_chunk.commands == [[float(i) for i in range(10)], [float(i + 20) for i in range(10)]]
+    assert calls[0]["json"]["language_instruction"] == "move the slider left."
+    assert calls[0]["json"]["steps"] == 2
+    assert len(calls[0]["json"]["proprio"]) == 20
+
+
 def test_pi05_libero_checkpoint_diagnosis() -> None:
     from clawvla.action_backends.pi05 import Pi05ActionBackend
 
@@ -216,6 +350,58 @@ def test_pi05_libero_checkpoint_diagnosis() -> None:
     assert diagnosis["policy_summary"]["checkpoint_format"] == "lerobot"
     assert diagnosis["lerobot_adapter"]["compatible_for_execution"] is True
     assert backend.action_spec()["types"]["libero_ee_delta"] == 7
+
+
+def test_pi05_converted_openpi_config_is_not_misclassified_as_lerobot(tmp_path) -> None:
+    from clawvla.action_backends.pi05 import Pi05ActionBackend
+
+    checkpoint = tmp_path / "openpi_pytorch"
+    norm_stats_dir = checkpoint / "assets" / "robotwin_expert_subtasks_50x50"
+    norm_stats_dir.mkdir(parents=True)
+    (checkpoint / "model.safetensors").write_bytes(b"placeholder")
+    (checkpoint / "config.json").write_text(
+        json.dumps(
+            {
+                "format": "openpi_pytorch",
+                "pi05": True,
+                "action_dim": 32,
+                "action_horizon": 32,
+                "max_token_len": 256,
+                "paligemma_variant": "gemma_2b",
+                "action_expert_variant": "gemma_300m",
+                "precision": "bfloat16",
+            }
+        ),
+        encoding="utf-8",
+    )
+    stats = [0.0] * 14
+    (norm_stats_dir / "norm_stats.json").write_text(
+        json.dumps(
+            {
+                "norm_stats": {
+                    "state": {"mean": stats, "std": stats, "q01": stats, "q99": stats},
+                    "actions": {"mean": stats, "std": stats, "q01": stats, "q99": stats},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    backend = Pi05ActionBackend(
+        {
+            "enabled": True,
+            "pretrained_path": str(checkpoint),
+            "openpi_src": str(tmp_path),
+            "robotwin_adapter": {"mode": "openpi_robotwin2", "action_type": "qpos"},
+        }
+    )
+
+    summary = backend.diagnose()["policy_summary"]
+
+    assert summary["checkpoint_format"] == "openpi"
+    assert summary["format"] == "openpi_pytorch"
+    assert summary["max_token_len"] == 256
+    assert summary["asset_id"] == "robotwin_expert_subtasks_50x50"
+    assert backend.action_spec()["types"] == {"qpos": 14}
 
 
 def test_groot_robocasa_action_spec_separates_model_and_env_dims(tmp_path) -> None:
@@ -306,6 +492,192 @@ def test_reward_registry_requires_configured_task() -> None:
     config = load_rl_config("configs/rl/qwen3vl_pi05_grpo.yaml")
     registry = build_reward_registry(config.reward.registry, config.reward.task_map)
     assert registry.handler_for_task("place_container_plate").name == "robotwin"
+
+
+def _reward_actor(position, *, quaternion=None, contacts=0, functional_points=None):
+    return {
+        "position": list(position),
+        "quaternion": list(quaternion or [1.0, 0.0, 0.0, 0.0]),
+        "gripper_contact_count": contacts,
+        "gripper_contact_positions": [[0.0, 0.0, 0.0]] * contacts,
+        "functional_points": dict(functional_points or {}),
+        "contact_points": {},
+    }
+
+
+def test_robotwin_dense_reward_specs_cover_all_50_training_tasks() -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_multitask_1update.yaml")
+    task_names = {spec.task_name for spec in build_rollout_episode_specs(config)}
+
+    assert len(task_names) == 50
+    assert task_names == set(TASK_REWARD_SPECS)
+    assert all(spec.family != "terminal_only" for spec in TASK_REWARD_SPECS.values())
+
+
+def test_dual_bottle_spatial_reward_tracks_lift_and_target_progress() -> None:
+    before = RewardSnapshot(
+        task_name="pick_dual_bottles",
+        success=False,
+        actors={
+            "bottle1": _reward_actor([-0.25, 0.05, 0.75], functional_points={0: [-0.25, 0.05, 0.75]}),
+            "bottle2": _reward_actor([0.25, 0.05, 0.75], functional_points={0: [0.25, 0.05, 0.75]}),
+        },
+        grippers={"left": {"closed": False}, "right": {"closed": False}},
+        metadata={
+            "task_fields": {
+                "left_target_pose": [-0.06, -0.105, 1.0, 0.0, 1.0, 0.0, 0.0],
+                "right_target_pose": [0.06, -0.105, 1.0, 0.0, 1.0, 0.0, 0.0],
+            }
+        },
+    )
+    after = RewardSnapshot(
+        task_name="pick_dual_bottles",
+        success=False,
+        actors={
+            "bottle1": _reward_actor([-0.08, -0.09, 0.93], contacts=1, functional_points={0: [-0.08, -0.09, 0.93]}),
+            "bottle2": _reward_actor([0.08, -0.09, 0.93], contacts=1, functional_points={0: [0.08, -0.09, 0.93]}),
+        },
+        grippers={"left": {"closed": True}, "right": {"closed": True}},
+        metadata=before.metadata,
+    )
+
+    reward = compute_robotwin_reward(before, after, task_name="pick_dual_bottles")
+
+    assert reward.family == "spatial"
+    assert reward.reward > 4.0
+    assert reward.events["goal_0_satisfied"] is True
+    assert reward.events["goal_1_satisfied"] is True
+    assert reward.metrics["goals_satisfied"] == 2.0
+
+
+def test_container_lift_reward_uses_actor_contact_uprightness_and_start_heights() -> None:
+    metadata = {
+        "task_fields": {"object_start_height": 0.74, "start_height": 0.74},
+        "actor_contacts": {"can|basket": True},
+    }
+    before = RewardSnapshot(
+        task_name="place_can_basket",
+        success=False,
+        actors={
+            "can": _reward_actor([0.2, 0.0, 0.74]),
+            "basket": _reward_actor([0.0, 0.0, 0.74], quaternion=[0.707, 0.707, 0.0, 0.0]),
+        },
+        metadata={"task_fields": metadata["task_fields"], "actor_contacts": {"can|basket": False}},
+    )
+    after = RewardSnapshot(
+        task_name="place_can_basket",
+        success=False,
+        actors={
+            "can": _reward_actor([0.01, 0.0, 0.80]),
+            "basket": _reward_actor([0.0, 0.0, 0.80], quaternion=[0.707, 0.707, 0.0, 0.0]),
+        },
+        metadata=metadata,
+    )
+
+    reward = compute_robotwin_reward(before, after, task_name="place_can_basket")
+
+    assert reward.family == "container_lift"
+    assert reward.events["source_in_container"] is True
+    assert reward.events["source_lifted"] is True
+    assert reward.events["container_lifted"] is True
+    assert reward.events["container_upright"] is True
+    assert reward.reward > 4.0
+
+
+def test_tool_contact_reward_uses_real_actor_contact_signal() -> None:
+    before = RewardSnapshot(
+        task_name="beat_block_hammer",
+        success=False,
+        actors={
+            "hammer": _reward_actor([0.2, 0.0, 0.8], functional_points={0: [0.2, 0.0, 0.8]}),
+            "block": _reward_actor([0.0, 0.0, 0.75], functional_points={1: [0.0, 0.0, 0.75]}),
+        },
+        metadata={"actor_contacts": {"hammer|block": False}},
+    )
+    after = RewardSnapshot(
+        task_name="beat_block_hammer",
+        success=False,
+        actors={
+            "hammer": _reward_actor([0.01, 0.0, 0.78], contacts=1, functional_points={0: [0.01, 0.0, 0.78]}),
+            "block": _reward_actor([0.0, 0.0, 0.75], functional_points={1: [0.0, 0.0, 0.75]}),
+        },
+        grippers={"left": {"closed": True}},
+        metadata={"actor_contacts": {"hammer|block": True}},
+    )
+
+    reward = compute_robotwin_reward(before, after, task_name="beat_block_hammer")
+
+    assert reward.events["tool_target_aligned"] is True
+    assert reward.events["tool_target_contact"] is True
+    assert reward.reward > 4.0
+
+
+def test_robotwin_success_bonus_is_an_episode_milestone() -> None:
+    first = compute_robotwin_reward(
+        RewardSnapshot(task_name="unknown_task", success=False),
+        RewardSnapshot(task_name="unknown_task", success=True),
+        task_name="unknown_task",
+    )
+    repeated = compute_robotwin_reward(
+        RewardSnapshot(
+            task_name="unknown_task",
+            success=False,
+            metadata={"reward_milestones": {"task_success": True}},
+        ),
+        RewardSnapshot(task_name="unknown_task", success=True),
+        task_name="unknown_task",
+    )
+
+    assert first.reward == pytest.approx(9.95)
+    assert first.milestones["task_success"] is True
+    assert repeated.reward == pytest.approx(-0.05)
+    assert repeated.milestones["task_success"] is True
+
+
+def test_relative_place_potential_cycle_is_negative_after_step_costs() -> None:
+    far = RewardSnapshot(
+        task_name="place_a2b_right",
+        success=False,
+        actors={
+            "object": _reward_actor([0.35, 0.0, 0.75]),
+            "target_object": _reward_actor([0.0, 0.0, 0.75]),
+        },
+    )
+    near = RewardSnapshot(
+        task_name="place_a2b_right",
+        success=False,
+        actors={
+            "object": _reward_actor([0.15, 0.0, 0.75]),
+            "target_object": _reward_actor([0.0, 0.0, 0.75]),
+        },
+    )
+
+    toward = compute_robotwin_reward(far, near, task_name="place_a2b_right")
+    near.metadata["reward_milestones"] = toward.milestones
+    away = compute_robotwin_reward(near, far, task_name="place_a2b_right")
+
+    assert toward.reward + away.reward == pytest.approx(-0.1)
+
+
+def test_contact_press_bonus_cannot_repeat_after_milestone() -> None:
+    before = RewardSnapshot(
+        task_name="click_bell",
+        success=False,
+        actors={"bell": _reward_actor([0.0, 0.0, 0.75], contacts=1)},
+        grippers={"left": {"closed": True}},
+        metadata={"reward_milestones": {"pressed": True}},
+    )
+    after = RewardSnapshot(
+        task_name="click_bell",
+        success=False,
+        actors={"bell": _reward_actor([0.0, 0.0, 0.75], contacts=1)},
+        grippers={"left": {"closed": True}},
+    )
+
+    reward = compute_robotwin_reward(before, after, task_name="click_bell")
+
+    assert reward.events["pressed_with_closed_gripper"] is True
+    assert reward.reward == pytest.approx(-0.05)
 
 
 def test_policy_proxy_static_backend(tmp_path) -> None:
@@ -814,6 +1186,23 @@ def test_openrlhf_runner_resolves_preset_config() -> None:
     assert path.name == "qwen3vl_pi05_libero_multitask_1update.yaml"
     assert path.exists()
 
+    calvin_path = _resolve_config_path(None, "calvin-xvla")
+    assert calvin_path.name == "qwen3vl_calvin_xvla_1update.yaml"
+    assert calvin_path.exists()
+
+    rynnbrain_path = _resolve_config_path(None, "rynnbrain-train-smoke")
+    assert rynnbrain_path.name == "rynnbrain2b_pi05_train_smoke.yaml"
+    assert rynnbrain_path.exists()
+
+
+def test_rynnbrain_smoke_uses_openrlhf_overrides() -> None:
+    config = load_rl_config("configs/rl/rynnbrain2b_pi05_train_smoke.yaml")
+
+    assert config.openrlhf.rollout_n == 2
+    assert config.openrlhf.max_model_len == 12288
+    assert config.openrlhf.actor_ppo_max_token_len_per_gpu == 12288
+    assert config.openrlhf.total_training_steps == 1
+
 
 def test_openrlhf_train_command_uses_agent_entrypoint_and_full_zero3(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CLAWVLA_OPENRLHF_ADAM_OFFLOAD", raising=False)
@@ -1007,6 +1396,7 @@ def test_terminal_reward_lightly_penalizes_recoverable_preflight_refresh(tmp_pat
     config = load_rl_config("configs/rl/qwen3vl_pi05_grpo.yaml")
     episode = EpisodeRecord.new(task_name="place_container_plate", instruction="place the container on the plate")
     episode.status = "finished"
+    episode.metadata["task_status"] = {"available": True, "success": True}
     episode.skill_calls = [
         SkillCallTrace(
             step_index=0,
@@ -1036,6 +1426,58 @@ def test_terminal_reward_lightly_penalizes_recoverable_preflight_refresh(tmp_pat
     assert payload["reward"]["metrics"]["failed_skills"] == 0.0
     assert payload["reward"]["metrics"]["recoverable_preflight_failures"] == 1.0
     assert payload["reward"]["events"]["recoverable_preflight_failure_seen"] is True
+
+
+def test_terminal_reward_rejects_early_loop_finish_without_official_success(tmp_path) -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_grpo.yaml")
+    episode = EpisodeRecord.new(task_name="pick_dual_bottles", instruction="pick both bottles")
+    episode.status = "finished"
+    episode.metadata["task_status"] = {"available": True, "success": False, "done": False}
+    reward_path = tmp_path / "episode_reward.jsonl"
+
+    _append_episode_terminal_reward(episode, reward_path, config)
+
+    payload = json.loads(reward_path.read_text(encoding="utf-8"))
+    assert episode.reward_score == -4.0
+    assert payload["reward"]["events"]["loop_finished"] is True
+    assert payload["reward"]["events"]["official_task_success"] is False
+    assert payload["reward"]["events"]["episode_incomplete"] is True
+    assert payload["reward"]["events"]["premature_finish"] is True
+    assert payload["reward"]["metrics"]["premature_finish"] == 1.0
+    assert "premature_finish=1" in payload["reward"]["reason"]
+    assert payload["reward"]["metadata"]["success_source"] == "environment_task_status"
+
+
+def test_terminal_reward_accepts_official_success_even_if_loop_hits_limit(tmp_path) -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_grpo.yaml")
+    episode = EpisodeRecord.new(task_name="click_bell", instruction="click the bell")
+    episode.status = "max_steps_reached"
+    episode.metadata["task_status"] = {"available": True, "success": True, "done": True}
+    reward_path = tmp_path / "episode_reward.jsonl"
+
+    _append_episode_terminal_reward(episode, reward_path, config)
+
+    payload = json.loads(reward_path.read_text(encoding="utf-8"))
+    assert episode.reward_score == 0.0
+    assert payload["reward"]["events"]["loop_finished"] is False
+    assert payload["reward"]["events"]["official_task_success"] is True
+    assert payload["reward"]["events"]["episode_incomplete"] is False
+
+
+def test_rollout_result_archives_official_task_status() -> None:
+    episode = EpisodeRecord.new(task_name="click_bell", instruction="click the bell")
+
+    _populate_episode_from_result(
+        episode,
+        {
+            "loop": {"status": "finished", "steps": []},
+            "task_status": {"available": True, "backend": "robotwin", "success": False},
+        },
+    )
+
+    assert episode.status == "finished"
+    assert episode.metadata["official_task_success"] is False
+    assert episode.metadata["task_status"]["backend"] == "robotwin"
 
 
 def test_run_loop_applies_runtime_environment(monkeypatch) -> None:
@@ -1166,15 +1608,232 @@ def test_task_plan_accepts_non_place_terminal_action() -> None:
     assert errors == []
 
 
+def test_task_plan_accepts_direct_contact_without_target_candidate() -> None:
+    task_plan = TaskPlan(
+        task="click the bell",
+        subgoals=[
+            Subgoal(
+                "S1",
+                "approach",
+                instruction="move close to the bell",
+                source_candidate_id="C1",
+                target_candidate_id=None,
+                completion_criteria={"natural_language": "the gripper is close to the bell"},
+            ),
+            Subgoal(
+                "S2",
+                "press",
+                instruction="click the bell top",
+                source_candidate_id="C1",
+                target_candidate_id=None,
+                completion_criteria={"natural_language": "the bell top has been clicked"},
+            ),
+        ],
+        current_subgoal_id="S1",
+    )
+
+    errors = _validate_task_plan_completeness(task_plan, "click the bell", "C1", "C2")
+
+    assert "missing_target_candidate_in_subgoals" not in errors
+    assert errors == []
+
+
 def test_task_plan_instruction_prefers_atomic_multi_step_subgoals() -> None:
     instruction = _task_plan_instruction()
+    examples = _task_plan_style_examples()
+    full_few_shots = _task_plan_full_few_shots()
+    hard_constraints = _task_plan_hard_constraints()
+    schema = _task_plan_schema("C1", "C2")
 
-    assert "four or more subgoals" in instruction
-    assert "reasonably atomic" in instruction
-    assert "Do not combine transport" in instruction
-    assert "released or otherwise visibly stable" in instruction
-    assert "not merely held above" in instruction
+    assert "VLA receives only that current command plus current images and robot state" in instruction
+    assert "do not add a separate approach subgoal" in instruction
+    assert "continuous single-arm lift, move, rotate, shake, or place command may omit the arm name" in instruction
+    assert "left arm to object X and right arm to object Y" in instruction
+    assert "both arms act symmetrically on one shared object" in instruction
+    assert "Never serialize two fully independent arm plans" in instruction
+    assert "securely" in instruction
+    assert "short lowercase action label" in instruction
+    assert "confirmation-only subgoals" in instruction
+    assert "target_candidate_id to null" in instruction
     assert "completion_criteria.natural_language" in instruction
+    assert len(schema["subgoals"]) == 1
+    assert "repeat this item" in schema["subgoals"][0]["subgoal_id"]
+    assert [example["pattern"] for example in examples] == [
+        "single_arm_pick_place",
+        "dual_arm_two_objects",
+        "shared_object_dual_arm",
+        "direct_press_without_grasp",
+        "handover",
+    ]
+    assert examples[0]["subgoals"][0]["instruction"] == (
+        "Use the left arm to grasp the bowl-shaped container."
+    )
+    assert "left arm" in examples[1]["subgoals"][0]["instruction"]
+    assert "right arm" in examples[1]["subgoals"][0]["instruction"]
+    assert all("move the gripper close" not in str(example).lower() for example in examples)
+    assert [constraint["name"] for constraint in hard_constraints] == [
+        "final_place_absorbs_transport",
+        "independent_dual_objects_use_paired_stages",
+    ]
+    single_plan = full_few_shots[0]["correct_output"]["subgoals"]
+    dual_plan = full_few_shots[1]["correct_output"]["subgoals"]
+    assert [subgoal["type"] for subgoal in single_plan] == ["grasp", "lift", "place", "retract"]
+    assert all("toward the round plate" not in subgoal["instruction"] for subgoal in single_plan)
+    assert [subgoal["type"] for subgoal in dual_plan] == ["grasp", "lift", "place"]
+    assert all("left arm" in subgoal["instruction"] and "right arm" in subgoal["instruction"] for subgoal in dual_plan)
+    assert dual_plan[2]["metadata"]["arm_candidate_bindings"]["right"] == {
+        "source_candidate_id": "C2",
+        "target_candidate_id": "C4",
+    }
+
+
+def test_task_plan_accepts_task_instruction_alias_from_model_output() -> None:
+    plan = TaskPlan.from_payload(
+        {
+            "task_instruction": "Click the glossy blue bell with the right gripper.",
+            "subgoals": [],
+        }
+    )
+
+    assert plan.task == "Click the glossy blue bell with the right gripper."
+
+
+def test_bell_and_handover_plans_do_not_invent_separate_target_candidates() -> None:
+    bell = TaskPlan(
+        task="Click the glossy blue bell with the right gripper.",
+        subgoals=[
+            Subgoal(
+                "S1",
+                "approach",
+                instruction="Move the right gripper above the glossy blue bell's top center and close it.",
+                source_candidate_id="C1",
+                completion_criteria={"natural_language": "The right gripper is above the bell."},
+            ),
+            Subgoal(
+                "S2",
+                "press",
+                instruction="Lower the right gripper onto the glossy blue bell's top center.",
+                source_candidate_id="C1",
+                completion_criteria={"natural_language": "The bell top is depressed."},
+            ),
+        ],
+        current_subgoal_id="S1",
+    )
+    handover = TaskPlan(
+        task="Hand the microphone from the right arm to the left arm.",
+        subgoals=[
+            Subgoal(
+                "S1",
+                "grasp",
+                instruction="Use the right arm to grasp the microphone.",
+                source_candidate_id="C1",
+                completion_criteria={"natural_language": "The right gripper holds the microphone."},
+            ),
+            Subgoal(
+                "S2",
+                "release",
+                instruction="Open the right gripper to release the microphone.",
+                source_candidate_id="C1",
+                completion_criteria={"natural_language": "The right gripper no longer holds the microphone."},
+            ),
+        ],
+        current_subgoal_id="S1",
+    )
+
+    assert _validate_task_plan_completeness(bell, bell.task, "C1", None) == []
+    assert _validate_task_plan_completeness(handover, handover.task, "C1", None) == []
+    assert task_requires_target("Move the red bottle to the left target.") is True
+    assert task_requires_target(handover.task) is False
+
+
+def test_build_task_plan_passes_training_style_examples_and_images(monkeypatch) -> None:
+    captured = {}
+
+    def fake_call_component_json(context, *, instruction, payload, image_paths, render_format):
+        captured.update(
+            {
+                "instruction": instruction,
+                "payload": payload,
+                "image_paths": image_paths,
+                "render_format": render_format,
+            }
+        )
+        return {
+            "task": "place the container on the plate",
+            "subgoals": [
+                {
+                    "subgoal_id": "S1",
+                    "type": "grasp",
+                    "instruction": "Use the left arm to grasp the gray container.",
+                    "source_candidate_id": "C1",
+                    "target_candidate_id": None,
+                    "status": "pending",
+                    "completion_criteria": {"natural_language": "The left gripper holds the gray container."},
+                },
+                {
+                    "subgoal_id": "S2",
+                    "type": "place",
+                    "instruction": "Place the gray container on the round plate and release it.",
+                    "source_candidate_id": "C1",
+                    "target_candidate_id": "C2",
+                    "status": "pending",
+                    "completion_criteria": {"natural_language": "The gray container rests on the round plate."},
+                },
+            ],
+            "current_subgoal_id": "S1",
+            "status": "pending",
+        }
+
+    monkeypatch.setattr("clawvla.components.scheduler.call_component_json", fake_call_component_json)
+    blackboard = Blackboard(task_instruction="place the container on the plate")
+    blackboard.write(
+        "world_state",
+        WorldState(
+            task_instruction="place the container on the plate",
+            source_candidate_id="C1",
+            target_candidate_id="C2",
+        ),
+    )
+
+    result = build_task_plan(
+        SkillRequest(
+            component="scheduler",
+            skill="build_task_plan",
+            payload={"use_model": True, "image_paths": ["head.png", "left.png"]},
+            stage="plan",
+        ),
+        SkillContext("scheduler", blackboard, SimpleNamespace(enabled=True)),
+    )
+
+    assert result.success is True
+    assert captured["image_paths"] == ["head.png", "left.png"]
+    assert captured["payload"]["instruction_style_examples"] == _task_plan_style_examples()
+    assert captured["payload"]["hard_planning_constraints"] == _task_plan_hard_constraints()
+    assert captured["payload"]["full_plan_few_shots"] == _task_plan_full_few_shots()
+    assert len(captured["payload"]["required_schema"]["subgoals"]) == 1
+    assert blackboard.read("task_plan").subgoals[0].instruction == (
+        "Use the left arm to grasp the gray container."
+    )
+
+
+def test_task_plan_rejects_schema_explanation_as_subgoal_type() -> None:
+    task_plan = TaskPlan(
+        task="press the button",
+        subgoals=[
+            Subgoal(
+                "S1",
+                "first short-horizon stage, e.g. approach or grasp",
+                instruction="move close to the button",
+                source_candidate_id="C1",
+                completion_criteria={"natural_language": "the gripper is close to the button"},
+            )
+        ],
+        current_subgoal_id="S1",
+    )
+
+    errors = _validate_task_plan_completeness(task_plan, "press the button", "C1", None)
+
+    assert "placeholder_subgoal_type:S1" in errors
 
 
 def test_task_plan_rejects_missing_natural_language_completion_criteria() -> None:
@@ -1482,6 +2141,38 @@ def test_localize_task_objects_accepts_semantic_binding_without_bbox() -> None:
     assert perception.source_candidate_id == "C1"
     assert perception.target_candidate_id == "C2"
     assert all(candidate.bbox_by_view == {} for candidate in perception.candidates)
+
+
+def test_localize_task_objects_accepts_direct_contact_without_target() -> None:
+    existing = PerceptionResult(
+        observation_id="obs_test",
+        candidates=[SceneCandidate(candidate_id="C1", label="bell", visibility="yes", confidence=0.9)],
+        source_candidate_id="C1",
+    )
+    response = json.dumps(
+        {
+            "candidates": [
+                {"candidate_id": "C1", "label": "bell", "visibility": "yes", "confidence": 0.9},
+            ],
+            "source_candidate_id": "C1",
+            "target_candidate_id": "C1",
+            "uncertainty": {"needs_reobserve": False, "reasons": []},
+        }
+    )
+    blackboard = Blackboard(task_instruction="click the bell")
+    blackboard.write("observation", ObservationBundle(observation_id="obs_test"))
+    blackboard.write("perception", existing)
+    model_runtime = SimpleNamespace(enabled=True, generate_text=lambda **kwargs: response)
+
+    result = localize_task_objects(
+        SkillRequest(component="vision", skill="localize_task_objects", payload={"use_model": True}),
+        SkillContext("vision", blackboard, model_runtime=model_runtime),
+    )
+
+    assert result.success is True
+    perception = blackboard.read("perception")
+    assert perception.source_candidate_id == "C1"
+    assert perception.target_candidate_id is None
 
 
 def test_localize_task_objects_repairs_missing_robocasa_target_from_env_semantics() -> None:
@@ -1936,7 +2627,7 @@ def test_agent_loop_requires_explicit_emit_action_horizon() -> None:
         stage="execute",
         next_component="motion",
         next_skill="emit_action_chunk",
-        payload={"horizon": 51},
+        payload={"horizon": 33},
     )
     minimum = LoopDecision(
         control="run_skill",
@@ -1950,17 +2641,21 @@ def test_agent_loop_requires_explicit_emit_action_horizon() -> None:
         stage="execute",
         next_component="motion",
         next_skill="emit_action_chunk",
-        payload={"horizon": 50},
+        payload={"horizon": 32},
     )
 
     assert loop._validate_run_skill_decision(missing) == "missing_horizon_before_emit_action_chunk"
     assert (
         loop._validate_run_skill_decision(too_short)
-        == "horizon_out_of_range_before_emit_action_chunk:9:expected_10_to_50"
+        == "horizon_out_of_range_before_emit_action_chunk:9:expected_10_to_32"
     )
-    assert loop._validate_run_skill_decision(too_long) == "horizon_out_of_range_before_emit_action_chunk:51:expected_10_to_50"
+    assert loop._validate_run_skill_decision(too_long) == "horizon_out_of_range_before_emit_action_chunk:33:expected_10_to_32"
     assert loop._validate_run_skill_decision(minimum) is None
     assert loop._validate_run_skill_decision(normal) is None
+    scheduler_instruction = _scheduler_instruction(loop_mode=True)
+    assert "integer horizon from 10 to 32" in scheduler_instruction
+    assert "Never request more than 32 actions" in scheduler_instruction
+    assert "horizon=50" not in scheduler_instruction
 
 
 def test_agent_loop_rejects_run_skill_stage_jump() -> None:
@@ -2120,6 +2815,37 @@ def test_agent_loop_runtime_state_reports_visual_freshness_after_stale_preflight
     assert summary["observe_complete"] is True
 
 
+def test_agent_loop_observe_complete_allows_missing_target_for_direct_contact_task() -> None:
+    candidates = [SceneCandidate(candidate_id="C1", label="bell", visibility="yes")]
+    blackboard = Blackboard(task_instruction="click the bell")
+    blackboard.write("observation", SimpleNamespace(observation_id="obs_new"))
+    blackboard.write(
+        "perception",
+        PerceptionResult(observation_id="obs_new", candidates=candidates, source_candidate_id="C1"),
+    )
+    blackboard.write(
+        "world_state",
+        WorldState(
+            task_instruction="click the bell",
+            candidates=candidates,
+            source_candidate_id="C1",
+            target_candidate_id=None,
+            metadata={"observation_id": "obs_new"},
+        ),
+    )
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.runtime = SimpleNamespace(blackboard=blackboard)
+
+    summary = loop._runtime_state_summary()
+    required = loop._next_required_decision_summary("observe", None)
+
+    assert summary["target_candidate_required"] is False
+    assert summary["world_state_ready"] is True
+    assert summary["world_state_ready_error"] is None
+    assert summary["observe_complete"] is True
+    assert required["control"] == "advance_stage"
+
+
 def test_phase_policy_allows_preflight_observation_refresh_only_in_preflight() -> None:
     policy = PhasePolicy()
 
@@ -2274,6 +3000,37 @@ def test_verify_progress_uses_fresh_verify_images(tmp_path) -> None:
     assert loop._prepare_payload(verifier)["image_paths"] == [str(image_path)]
     assert loop._validate_run_skill_decision(verifier) is None
     assert loop._validate_run_skill_decision(capture) == "verify_observation_already_captured_run_verify_progress"
+
+
+def test_build_task_plan_payload_uses_current_planner_images(tmp_path) -> None:
+    head_path = tmp_path / "head.png"
+    wrist_path = tmp_path / "wrist.png"
+    head_path.write_bytes(b"head")
+    wrist_path.write_bytes(b"wrist")
+    blackboard = Blackboard(task_instruction="place the container on the plate")
+    blackboard.write(
+        "observation",
+        ObservationBundle(
+            observation_id="obs_plan",
+            camera_views={
+                "head_camera": CameraView(name="head_camera", rgb_path=str(head_path)),
+                "left_camera": CameraView(name="left_camera", rgb_path=str(wrist_path)),
+            },
+        ),
+    )
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.runtime = SimpleNamespace(blackboard=blackboard)
+    decision = LoopDecision(
+        control="run_skill",
+        stage="plan",
+        next_component="scheduler",
+        next_skill="build_task_plan",
+    )
+
+    payload = loop._prepare_payload(decision)
+
+    assert payload["use_model"] is True
+    assert payload["image_paths"] == [str(head_path), str(wrist_path)]
 
 
 def test_verifier_rejects_text_only_verification() -> None:

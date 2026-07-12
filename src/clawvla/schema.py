@@ -238,8 +238,9 @@ class TaskPlan(DictSerializable):
             if subgoals
             else None
         )
+        task_value = payload.get("task") if payload.get("task") is not None else payload.get("task_instruction")
         return cls(
-            task=str(payload["task"]) if payload.get("task") is not None else None,
+            task=str(task_value) if task_value is not None else None,
             subgoals=subgoals,
             current_subgoal_id=current_subgoal_id,
             status=str(payload.get("status", "pending")),

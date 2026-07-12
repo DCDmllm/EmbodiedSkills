@@ -316,6 +316,7 @@ def _print_result(runtime: AgentRuntime, loop_payload: dict[str, object], output
     payload = _jsonable(
         {
             "loop": loop_payload,
+            "task_status": _safe_task_status(runtime),
             "blackboard": runtime.blackboard.compact_context(),
             "history_length": len(runtime.history),
             "model_calls": _model_call_summary(runtime),
@@ -338,6 +339,28 @@ def _print_result(runtime: AgentRuntime, loop_payload: dict[str, object], output
         file=sys.stderr,
         flush=True,
     )
+
+
+def _safe_task_status(runtime: AgentRuntime) -> dict[str, object]:
+    adapter = runtime.blackboard.read("env_adapter")
+    status_fn = getattr(adapter, "task_status", None)
+    if not callable(status_fn):
+        return {"available": False, "success": False, "reason": "task_status_unavailable"}
+    try:
+        status = status_fn()
+    except Exception as exc:
+        return {
+            "available": False,
+            "success": False,
+            "reason": f"task_status_failed:{type(exc).__name__}:{exc}",
+        }
+    if not isinstance(status, dict):
+        return {
+            "available": False,
+            "success": False,
+            "reason": f"task_status_invalid_type:{type(status).__name__}",
+        }
+    return {"available": True, **status, "success": bool(status.get("success", False))}
 
 
 def _bootstrap_observe(runtime: AgentRuntime, instruction: str, artifact_prefix: str, run_environment: bool):
@@ -410,6 +433,8 @@ def _reward_registry_defaults(config: AgentConfig, task_name: str) -> tuple[list
         return ["clawvla.rl.reward_registry:register_builtin_libero"], {task_name: "libero"}
     if env_type in {"robocasa", "robo_casa"}:
         return ["clawvla.rl.reward_registry:register_builtin_robocasa"], {task_name: "robocasa"}
+    if env_type in {"calvin", "calvin_env"}:
+        return ["clawvla.rl.reward_registry:register_builtin_calvin"], {task_name: "calvin"}
     return ["clawvla.rl.reward_registry:register_builtin_robotwin"], {task_name: "robotwin"}
 
 

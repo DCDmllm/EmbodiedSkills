@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
-from typing import Any, Callable
+from typing import Any, Callable, Dict
 
 from .trajectory import EpisodeRecord, RewardRecord
 
 
 SnapshotFn = Callable[[Any, Any], Any]
-ComputeFn = Callable[[Any, Any, dict[str, Any]], Any]
+ComputeFn = Callable[[Any, Any, Dict[str, Any]], Any]
 FinalizeFn = Callable[[EpisodeRecord], RewardRecord]
 
 
@@ -171,6 +171,57 @@ def register_builtin_robocasa(registry: RewardRegistry) -> None:
         )
 
     registry.register(RewardHandler("robocasa", snapshot=snapshot, compute=compute))
+
+
+def register_builtin_calvin(registry: RewardRegistry) -> None:
+    from clawvla.rewards.robotwin_reward import RewardResult, RewardSnapshot
+
+    def snapshot(env: Any, blackboard: Any) -> RewardSnapshot:
+        _ = blackboard
+        if env is None or not hasattr(env, "task_status"):
+            raise RuntimeError("CALVIN reward snapshot requires env.task_status().")
+        status = env.task_status()
+        if not isinstance(status, dict):
+            raise RuntimeError("CALVIN env.task_status() must return a dict.")
+        return RewardSnapshot(
+            task_name=str(status.get("task_name") or status.get("subtask") or "calvin"),
+            success=status.get("success") if isinstance(status.get("success"), bool) else None,
+            metadata=dict(status),
+        )
+
+    def compute(before: RewardSnapshot, after: RewardSnapshot, context: dict[str, Any]) -> RewardResult:
+        step_cost = float(context.get("step_cost", 0.05))
+        task_name = str(context.get("task_name") or after.task_name or before.task_name or "calvin")
+        success = bool(after.success)
+        newly_successful = success and not bool(before.success)
+        reward = -step_cost
+        if newly_successful:
+            reward += 10.0
+        elif success:
+            reward += 2.0
+        return RewardResult(
+            reward=reward,
+            events={
+                "task_success": success,
+                "new_success": newly_successful,
+                "episode_done": bool(after.metadata.get("done")),
+                "action_executed": int(after.metadata.get("step_count") or 0) > int(before.metadata.get("step_count") or 0),
+            },
+            metrics={
+                "step_count": float(after.metadata.get("step_count") or 0.0),
+                "env_reward": float(after.metadata.get("reward") or 0.0)
+                if after.metadata.get("reward") is not None
+                else None,
+                "sequence_index": float(after.metadata.get("sequence_index") or 0.0),
+                "subtask_index": float(after.metadata.get("subtask_index") or 0.0),
+            },
+            milestones={"task_success": success},
+            reason="calvin_success_delta" if newly_successful else "calvin_step",
+            family="calvin_terminal",
+            task_name=task_name,
+        )
+
+    registry.register(RewardHandler("calvin", snapshot=snapshot, compute=compute))
 
 
 def reward_record_from_result(step_index: int | None, result: Any) -> RewardRecord:

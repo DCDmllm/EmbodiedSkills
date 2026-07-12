@@ -9,6 +9,7 @@ from ..model_calls import call_component_json
 from ..notices import emit_runtime_event
 from ..schema import GroundingOverlay, PerceptionResult, SkillRequest, SkillResult
 from ..skills.base import SkillContext, SkillRegistry
+from ..task_semantics import task_requires_target
 from .skill_helpers import get_attr, ok, register_skill, to_dict, unavailable
 from .vision_geometry import LiftGeometryConfig, lift_perception_geometry
 
@@ -33,7 +34,7 @@ def register_vision_skills(registry: SkillRegistry) -> None:
         registry,
         "vision",
         "localize_task_objects",
-        "Bind task source_candidate_id and target_candidate_id to existing visual candidates.",
+        "Bind task source_candidate_id and optional target_candidate_id to existing visual candidates.",
         localize_task_objects,
     )
     register_skill(
@@ -258,16 +259,20 @@ def localize_task_objects(request: SkillRequest, context: SkillContext) -> Skill
         raw = call_component_json(
             context,
             instruction=(
-                "Bind the task source object and target object to semantic visual candidates. Output only the required schema object. "
-                "Do not echo task_instruction, observation, current_perception, required_schema, or any input object. "
-                "Top-level keys must be candidates, source_candidate_id, target_candidate_id, and uncertainty. "
-                "Keep stable candidate ids when possible. Do not estimate image coordinates. The source is the movable "
-                "object being picked, grasped, moved, or manipulated. The target is the destination object, receptacle, "
-                "support surface, or fixture named by the task. For 'place it in the cabinet', the cabinet is the "
-                "target candidate, not the movable object. If current_candidates contains only the source but the "
-                "target destination is visible in the images or listed in task_role_hints, add a separate target "
-                "candidate with a new stable id and bind target_candidate_id to it. Never set source_candidate_id "
-                "and target_candidate_id to the same candidate."
+                "Bind the task source object and optional target object to semantic visual candidates. Output only "
+                "the required schema object. Do not echo task_instruction, observation, current_perception, "
+                "required_schema, or any input object. Top-level keys must be candidates, source_candidate_id, "
+                "target_candidate_id, and uncertainty. Keep stable candidate ids when possible. Do not estimate "
+                "image coordinates. The source is the primary object, fixture, tool, control, or surface being "
+                "picked, grasped, clicked, pressed, opened, closed, moved, or otherwise manipulated. The target is "
+                "optional: use it only for a separate destination object, receptacle, support surface, fixture, "
+                "relation object, or contacted object named by the task. For 'place it in the cabinet', the cabinet "
+                "is the target candidate, not the movable object. For direct contact or articulation tasks like "
+                "click/press/open/close/pull/push/lift/rotate/shake with no separate target, set target_candidate_id "
+                "to null. If current_candidates contains only the source but a required target destination is visible "
+                "in the images or listed in task_role_hints, add a separate target candidate with a new stable id and "
+                "bind target_candidate_id to it. Never set source_candidate_id and target_candidate_id to the same "
+                "candidate."
             ),
             payload={
                 "task_instruction": blackboard.task_instruction,
@@ -285,7 +290,7 @@ def localize_task_objects(request: SkillRequest, context: SkillContext) -> Skill
                         }
                     ],
                     "source_candidate_id": "candidate id or null",
-                    "target_candidate_id": "candidate id or null",
+                    "target_candidate_id": "candidate id or null when no separate target is semantically required",
                     "uncertainty": {"needs_reobserve": False, "reasons": []},
                 },
             },
@@ -319,8 +324,19 @@ def localize_task_objects(request: SkillRequest, context: SkillContext) -> Skill
             )
         if localized.observation_id is None:
             localized.observation_id = get_attr(blackboard.read("observation"), "observation_id")
-        localized = _repair_localization_from_environment_hints(localized, perception, blackboard.read("observation"))
-        contract_errors = _localization_contract_errors(localized)
+        localized = _repair_localization_from_environment_hints(
+            localized,
+            perception,
+            blackboard.read("observation"),
+            blackboard.task_instruction,
+        )
+        if (
+            not task_requires_target(blackboard.task_instruction)
+            and localized.source_candidate_id
+            and localized.target_candidate_id == localized.source_candidate_id
+        ):
+            localized.target_candidate_id = None
+        contract_errors = _localization_contract_errors(localized, blackboard.task_instruction)
         if contract_errors:
             _emit_invalid_model_output("vision.localize_task_objects", "localization_contract_failed", raw)
             blackboard.write(
@@ -648,11 +664,15 @@ def _task_role_hints(blackboard: Blackboard, perception: PerceptionResult | None
     source_hint = task_roles.get("source") if isinstance(task_roles.get("source"), dict) else None
     target_hint = task_roles.get("target") if isinstance(task_roles.get("target"), dict) else None
     return {
-        "source_role": "the movable object to grasp or pick up",
-        "target_role": "the destination, receptacle, support surface, or fixture to place into/on",
+        "source_role": "the primary object, fixture, tool, control, or surface to manipulate or contact",
+        "target_role": (
+            "optional separate destination, receptacle, support surface, fixture, relation object, or contacted object"
+        ),
+        "target_required": task_requires_target(blackboard.task_instruction),
         "instruction_source_target_rule": (
             "For tasks like 'pick/place/put X in/on Y', source_candidate_id must be X and "
-            "target_candidate_id must be Y. Do not use the same candidate for both roles."
+            "target_candidate_id must be Y. For direct click/press/open/close/pull/push tasks without a separate "
+            "target, target_candidate_id should be null. Do not use the same candidate for both roles."
         ),
         "environment_source_hint": source_hint,
         "environment_target_hint": target_hint,
@@ -679,6 +699,7 @@ def _repair_localization_from_environment_hints(
     localized: PerceptionResult,
     existing: PerceptionResult,
     observation: object | None,
+    task_instruction: object | None = None,
 ) -> PerceptionResult:
     semantics = _environment_semantics(observation)
     task_roles = semantics.get("task_roles", {}) if isinstance(semantics.get("task_roles"), dict) else {}
@@ -697,7 +718,8 @@ def _repair_localization_from_environment_hints(
             localized.source_candidate_id = candidate.candidate_id
             applied.append("source")
 
-    if not localized.target_candidate_id:
+    target_required = task_requires_target(task_instruction)
+    if target_required and not localized.target_candidate_id:
         target_hint = task_roles.get("target")
         candidate = _candidate_from_environment_hint(target_hint, role="target", candidate_id=f"C{next_index}")
         if candidate is not None:
@@ -706,7 +728,7 @@ def _repair_localization_from_environment_hints(
             localized.target_candidate_id = candidate.candidate_id
             applied.append("target")
 
-    if applied and localized.source_candidate_id and localized.target_candidate_id:
+    if applied and localized.source_candidate_id and (localized.target_candidate_id or not target_required):
         localized = _merge_perception_update(existing, localized)[0]
 
     if applied:
@@ -747,20 +769,21 @@ def _next_candidate_index(by_id: dict[str, object]) -> int:
     return index
 
 
-def _localization_contract_errors(perception: PerceptionResult) -> list[str]:
+def _localization_contract_errors(perception: PerceptionResult, task_instruction: object | None = None) -> list[str]:
     errors: list[str] = []
     candidate_ids = {candidate.candidate_id for candidate in perception.candidates}
     source_id = perception.source_candidate_id
     target_id = perception.target_candidate_id
+    target_required = task_requires_target(task_instruction)
     if not source_id:
         errors.append("missing_source_candidate_id")
-    if not target_id:
+    if target_required and not target_id:
         errors.append("missing_target_candidate_id")
     if source_id and source_id not in candidate_ids:
         errors.append("source_candidate_not_found")
     if target_id and target_id not in candidate_ids:
         errors.append("target_candidate_not_found")
-    if source_id and target_id and source_id == target_id:
+    if target_required and source_id and target_id and source_id == target_id:
         errors.append("source_target_same_candidate")
     by_id = {candidate.candidate_id: candidate for candidate in perception.candidates}
     for role, candidate_id in (("source", source_id), ("target", target_id)):

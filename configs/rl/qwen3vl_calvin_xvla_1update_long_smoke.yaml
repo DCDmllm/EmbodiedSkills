@@ -1,0 +1,29 @@
+extends:
+  - qwen3vl_calvin_xvla_1update.yaml
+
+name: qwen3vl_calvin_xvla_1update_long_smoke
+
+policy:
+  max_new_tokens: 512
+
+rollout:
+  max_steps: 20
+  group_size: 1
+  episodes: 1
+  seeds:
+    - 0
+  artifact_prefix: clawvla_rl_calvin_xvla_long
+  episode_timeout_s: 2400.0
+
+openrlhf:
+  rollout_n: 1
+  max_response_length: 512
+  max_model_len: 12288
+  max_num_batched_tokens: 12288
+  max_num_seqs: 2
+
+cluster:
+  policy_gpus:
+    - 2
+  robotwin_gpus:
+    - 7

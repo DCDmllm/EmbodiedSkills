@@ -8,11 +8,14 @@ from pathlib import Path
 import socket
 import subprocess
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..notices import emit_status_notice
 from ..schema import ActionChunk, MotionGoal, ObservationBundle, WorldState
 from .base import ActionBackendResult
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class Pi05ActionBackend:
@@ -141,6 +144,13 @@ class Pi05ActionBackend:
                 "pretrained_path": str(pretrained_path),
             }
         if summary.get("checkpoint_format") == "openpi":
+            if not summary.get("model_path_exists", False):
+                return {
+                    "ok": False,
+                    "backend": self.name,
+                    "reason": "openpi_model_safetensors_missing",
+                    "policy_summary": summary,
+                }
             robotwin = self._robotwin_adapter_summary(summary)
             if not robotwin.get("compatible_for_execution", False):
                 return {
@@ -330,12 +340,18 @@ class Pi05ActionBackend:
         policy_kwargs = policy_kwargs if isinstance(policy_kwargs, dict) else {}
         model_config = SimpleNamespace(
             pi05=True,
-            dtype=str(policy_kwargs.get("dtype") or "bfloat16"),
-            paligemma_variant=str(policy_kwargs.get("paligemma_variant") or "gemma_2b"),
-            action_expert_variant=str(policy_kwargs.get("action_expert_variant") or "gemma_300m"),
+            dtype=str(summary.get("precision") or policy_kwargs.get("dtype") or "bfloat16"),
+            paligemma_variant=str(
+                summary.get("paligemma_variant") or policy_kwargs.get("paligemma_variant") or "gemma_2b"
+            ),
+            action_expert_variant=str(
+                summary.get("action_expert_variant")
+                or policy_kwargs.get("action_expert_variant")
+                or "gemma_300m"
+            ),
             action_horizon=int(summary.get("action_horizon") or policy_kwargs.get("action_horizon") or 32),
-            action_dim=int(policy_kwargs.get("internal_action_dim") or 32),
-            max_token_len=int(policy_kwargs.get("max_token_len") or 200),
+            action_dim=int(summary.get("action_dim") or policy_kwargs.get("internal_action_dim") or 32),
+            max_token_len=int(summary.get("max_token_len") or policy_kwargs.get("max_token_len") or 200),
         )
 
         with _openpi_torch_only_import_hooks(str(openpi_src)):
@@ -398,6 +414,9 @@ class Pi05ActionBackend:
         )
         num_steps = int(request.get("num_steps") or self.config.get("policy_kwargs", {}).get("sample_num_steps") or 10)
         horizon = int(request.get("horizon") or self.config.get("policy_kwargs", {}).get("n_action_steps") or 10)
+        model_horizon = int(model_config.action_horizon)
+        if horizon < 1 or horizon > model_horizon:
+            raise ValueError(f"pi05_action_horizon_out_of_range:{horizon}:expected_1_to_{model_horizon}")
         with torch.inference_mode(), _openpi_torch_only_import_hooks(str(self._openpi_src())):
             raw_actions = model.sample_actions(torch.device(device), obs, num_steps=num_steps)
         raw_np = raw_actions.detach().float().cpu().numpy()[0]
@@ -735,7 +754,6 @@ class Pi05ActionBackend:
 
         from openpi.models import pi0_config
         from openpi.policies import policy_config as openpi_policy_config
-        from openpi.training import config as openpi_config
         from openpi.training import optimizer as openpi_optimizer
         from openpi.training import weight_loaders
         import openpi.transforms as openpi_transforms
@@ -826,9 +844,15 @@ class Pi05ActionBackend:
         if not pretrained_path:
             return {"status": "pretrained_path_missing"}
         root = Path(str(pretrained_path))
+        openpi_summary = self._openpi_checkpoint_summary(root)
+        if (
+            openpi_summary.get("status") != "openpi_checkpoint_missing"
+            and openpi_summary.get("model_path_exists")
+            and openpi_summary.get("norm_stats", {}).get("available")
+        ):
+            return openpi_summary
         config_path = root / "config.json"
         if not config_path.exists():
-            openpi_summary = self._openpi_checkpoint_summary(root)
             if openpi_summary["status"] != "openpi_checkpoint_missing":
                 return openpi_summary
             return {"status": "config_json_missing", "config_path": str(config_path)}
@@ -854,6 +878,16 @@ class Pi05ActionBackend:
         if not model_path.exists() and not norm_stats_candidates:
             return {"status": "openpi_checkpoint_missing", "checkpoint_format": "unknown"}
 
+        conversion_config: dict[str, Any] = {}
+        conversion_config_path = root / "config.json"
+        if conversion_config_path.is_file():
+            try:
+                loaded_config = json.loads(conversion_config_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_config, dict):
+                    conversion_config = loaded_config
+            except (OSError, json.JSONDecodeError):
+                conversion_config = {}
+
         norm_summary: dict[str, Any] = {"available": False}
         action_shape = None
         state_shape = None
@@ -870,6 +904,7 @@ class Pi05ActionBackend:
             "status": "openpi_checkpoint_loaded",
             "checkpoint_format": "openpi",
             "policy_type": self.config.get("policy_type", "pi05"),
+            "format": conversion_config.get("format") or "openpi_pytorch",
             "model_path": str(model_path),
             "model_path_exists": model_path.exists(),
             "metadata_path": str(metadata_path),
@@ -885,7 +920,12 @@ class Pi05ActionBackend:
                 "prompt": {"type": "text", "shape": None},
             },
             "output_features": {"action": {"type": "action", "shape": action_shape}},
-            "action_horizon": 32,
+            "action_dim": conversion_config.get("action_dim") or 32,
+            "action_horizon": conversion_config.get("action_horizon") or 32,
+            "max_token_len": conversion_config.get("max_token_len"),
+            "paligemma_variant": conversion_config.get("paligemma_variant"),
+            "action_expert_variant": conversion_config.get("action_expert_variant"),
+            "precision": conversion_config.get("precision"),
             "image_resolution": [224, 224],
             "uses_delta_joint_actions": True,
             "action_semantics_after_policy_output": "absolute_qpos_after_openpi_absolute_actions_transform",

@@ -7,6 +7,8 @@ from typing import Any
 RUN_SKILL = "run_skill"
 ADVANCE_STAGE = "advance_stage"
 FINISH_RUN = "finish_run"
+MIN_ACTION_HORIZON = 10
+MAX_ACTION_HORIZON = 32
 
 
 @dataclass

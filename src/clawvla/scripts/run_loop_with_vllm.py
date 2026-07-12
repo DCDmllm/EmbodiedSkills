@@ -17,7 +17,10 @@ from clawvla.terminal_ui import TerminalRenderer
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run ClawVLA with a temporary local vLLM OpenAI-compatible server.")
-    parser.add_argument("--base-config", default="/mnt/wangwai/vla/clawvla/configs/robotwin_pi05_worker_probe.json")
+    parser.add_argument(
+        "--base-config",
+        default="/mnt/linyutong/wangwai_mirror/vla/clawvla/configs/robotwin_pi05_subtasks_25k.json",
+    )
     parser.add_argument("--model", required=True, help="Local HF path or model id served by vLLM.")
     parser.add_argument("--served-model-name", default="local-scheduler")
     parser.add_argument(

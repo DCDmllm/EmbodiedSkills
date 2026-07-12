@@ -26,12 +26,17 @@ Presets:
   libero-single        configs/rl/qwen3vl_pi05_libero_multitask_1update_single_gpu.yaml
   robocasa-rollout     configs/rl/qwen3vl_groot_robocasa_rollout_smoke.yaml
   robocasa-1update     configs/rl/qwen3vl_groot_robocasa_1update.yaml
+  calvin-xvla          configs/rl/qwen3vl_calvin_xvla_1update.yaml
+  calvin-long-smoke    configs/rl/qwen3vl_calvin_xvla_1update_long_smoke.yaml
+  rynnbrain-real1      configs/rl/rynnbrain2b_pi05_real_1update.yaml
+  rynnbrain-train-smoke configs/rl/rynnbrain2b_pi05_train_smoke.yaml
   train-smoke          configs/rl/qwen3vl_pi05_train_smoke.yaml
   rollout-smoke        configs/rl/qwen3vl_pi05_rollout_smoke.yaml
 
 Examples:
   scripts/run_clawvla_rl.sh --preset robotwin-real5 --mode train --run-id robotwin_smoke
   scripts/run_clawvla_rl.sh --preset libero-multitask --mode train --run-id libero_smoke
+  scripts/run_clawvla_rl.sh --preset calvin-xvla --mode dry-run --run-id calvin_smoke
   scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_multitask_1update.yaml --mode dry-run
 
 Environment:
@@ -50,6 +55,10 @@ preset_config() {
     libero-single) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_pi05_libero_multitask_1update_single_gpu.yaml" ;;
     robocasa-rollout) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_groot_robocasa_rollout_smoke.yaml" ;;
     robocasa-1update) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_groot_robocasa_1update.yaml" ;;
+    calvin-xvla) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_calvin_xvla_1update.yaml" ;;
+    calvin-long-smoke) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_calvin_xvla_1update_long_smoke.yaml" ;;
+    rynnbrain-real1) printf '%s\n' "$REPO_ROOT/configs/rl/rynnbrain2b_pi05_real_1update.yaml" ;;
+    rynnbrain-train-smoke) printf '%s\n' "$REPO_ROOT/configs/rl/rynnbrain2b_pi05_train_smoke.yaml" ;;
     train-smoke) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_pi05_train_smoke.yaml" ;;
     rollout-smoke) printf '%s\n' "$REPO_ROOT/configs/rl/qwen3vl_pi05_rollout_smoke.yaml" ;;
     "")
