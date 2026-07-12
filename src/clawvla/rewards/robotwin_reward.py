@@ -5,6 +5,10 @@ from math import sqrt
 from typing import Any, Callable
 
 
+OFFICIAL_SUCCESS_BONUS = 20.0
+MAX_SHAKE_REWARDS = 3
+
+
 @dataclass
 class RewardSpec:
     task_name: str
@@ -636,7 +640,7 @@ def _pick_place_reward(before: RewardSnapshot, after: RewardSnapshot, spec: Rewa
     if placed and not _milestone(before, "released_on_target"):
         reward += release_bonus
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     if progress is not None and carried_seen:
         reward += progress
 
@@ -712,7 +716,7 @@ def _stack_reward(before: RewardSnapshot, after: RewardSnapshot, spec: RewardSpe
     if stacked and not _milestone(before, "stacked_and_released"):
         reward += stack_bonus
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
 
     events = {
         "top_contact": bool(contact),
@@ -763,7 +767,7 @@ def _articulation_reward(before: RewardSnapshot, after: RewardSnapshot, spec: Re
     if reached and not _milestone(before, "target_open_ratio_reached"):
         reward += target_bonus
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
 
     events = {
         "articulation_contact": bool(contact),
@@ -838,7 +842,7 @@ def _handover_reward(before: RewardSnapshot, after: RewardSnapshot, spec: Reward
     if transferred and not _milestone(before, "handover_or_target_release"):
         reward += 4.0
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
 
     events = {
         "object_contact": bool(contact),
@@ -887,7 +891,7 @@ def _contact_press_reward(before: RewardSnapshot, after: RewardSnapshot, spec: R
     if pressed and not _milestone(before, "pressed"):
         reward += 2.0
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
 
     events = {
         "approached_press_point": bool(approached),
@@ -929,7 +933,7 @@ def _dual_lift_reward(before: RewardSnapshot, after: RewardSnapshot, spec: Rewar
     if high_enough and both_closed and not _milestone(before, "height_reached"):
         reward += 3.0
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
 
     events = {
         "bilateral_contact": bool(bilateral_contact),
@@ -970,7 +974,7 @@ def _ordering_reward(before: RewardSnapshot, after: RewardSnapshot, spec: Reward
     if order_correct and pair_aligned and all_released and not _milestone(before, "released_order"):
         reward += 3.0
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
 
     events = {
         "objects_aligned": bool(pair_aligned),
@@ -1039,7 +1043,8 @@ def _spatial_reward(before: RewardSnapshot, after: RewardSnapshot, spec: RewardS
         if before_orientation_error is not None and orientation_error is not None:
             reward += before_orientation_error - orientation_error
         lift_delta = _z_delta(source_point_before, source_point_after)
-        if grasped and lift_delta is not None:
+        grasp_seen = bool(_milestone(before, grasp_key) or grasped)
+        if grasp_seen and lift_delta is not None:
             reward += lift_delta * 4.0
         if satisfied and not _milestone(before, satisfied_key):
             reward += 2.0 + (1.0 if require_release else 0.0)
@@ -1073,7 +1078,7 @@ def _spatial_reward(before: RewardSnapshot, after: RewardSnapshot, spec: RewardS
 
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events["task_success"] = success
     milestones["task_success"] = bool(_milestone(before, "task_success") or success)
     metrics["goals_satisfied"] = float(sum(bool(events.get(f"goal_{i}_satisfied")) for i in range(len(goals))))
@@ -1102,13 +1107,14 @@ def _axis_lift_reward(before: RewardSnapshot, after: RewardSnapshot, spec: Rewar
     if before_signed is not None and after_signed is not None:
         reward += (after_signed - before_signed) * 2.0
     lift_delta = _z_delta(before_point, after_point)
-    if grasped and lift_delta is not None:
+    grasp_seen = bool(_milestone(before, "object_grasped") or grasped)
+    if grasp_seen and lift_delta is not None:
         reward += lift_delta * 4.0
     if side_reached and height_reached and not _milestone(before, "axis_goal_reached"):
         reward += 3.0
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events = {"object_grasped": grasped, "side_reached": side_reached, "height_reached": height_reached, "task_success": success}
     milestones = {"object_grasped": bool(_milestone(before, "object_grasped") or grasped), "axis_goal_reached": bool(_milestone(before, "axis_goal_reached") or (side_reached and height_reached)), "task_success": bool(_milestone(before, "task_success") or success)}
     metrics = {"signed_axis_position": after_signed, "height": _coord(after_point, 2), "lift_delta": lift_delta}
@@ -1135,7 +1141,7 @@ def _axis_away_reward(before: RewardSnapshot, after: RewardSnapshot, spec: Rewar
         reward += 3.0
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events = {"moved_away": reached, "released": released, "task_success": success}
     milestones = {
         "object_grasped": bool(_milestone(before, "object_grasped") or grasped),
@@ -1174,7 +1180,7 @@ def _relative_place_reward(before: RewardSnapshot, after: RewardSnapshot, spec: 
         reward += 3.0
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events = {"relative_relation_ok": relation_ok, "released": released, "task_success": success}
     milestones = {
         "source_grasped": bool(_milestone(before, "source_grasped") or grasped),
@@ -1202,7 +1208,7 @@ def _tool_contact_reward(before: RewardSnapshot, after: RewardSnapshot, spec: Re
         reward += 4.0
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events = {"tool_grasped": grasped, "tool_target_aligned": aligned, "tool_target_contact": actor_contact, "task_success": success}
     milestones = {
         "tool_grasped": bool(_milestone(before, "tool_grasped") or grasped),
@@ -1242,7 +1248,7 @@ def _collection_place_reward(before: RewardSnapshot, after: RewardSnapshot, spec
         reward += 3.0
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events = {"collection_all_placed": all_placed, "released": released, "task_success": success}
     milestones = {"collection_placed": bool(_milestone(before, "collection_placed") or all_placed), "task_success": bool(_milestone(before, "task_success") or success)}
     metrics = {"items_placed": float(after_count), "item_count": float(len(after_keys))}
@@ -1276,7 +1282,7 @@ def _container_lift_reward(before: RewardSnapshot, after: RewardSnapshot, spec: 
         reward += 3.0
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events = {"source_in_container": source_in_container, "source_lifted": source_lifted, "container_lifted": container_lifted, "container_upright": upright, "task_success": success}
     milestones = {"source_in_container": bool(_milestone(before, "source_in_container") or source_in_container), "loaded_container_lifted": bool(_milestone(before, "loaded_container_lifted") or (container_lifted and source_lifted and upright)), "task_success": bool(_milestone(before, "task_success") or success)}
     metrics = {"source_container_distance": relative_distance, "source_lift": source_lift, "container_lift": target_lift, "container_vertical_axis": _local_axis_vertical(target_after_payload.get("quaternion"), axis=1)}
@@ -1304,7 +1310,7 @@ def _cabinet_place_reward(before: RewardSnapshot, after: RewardSnapshot, spec: R
         reward += 3.0
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events = {"cabinet_open_progress": bool(after_ratio is not None and float(after_ratio) > 0.1), "object_near_cabinet_target": near_target, "object_released": released, "task_success": success}
     milestones = {"cabinet_object_placed": bool(_milestone(before, "cabinet_object_placed") or (near_target and released)), "task_success": bool(_milestone(before, "task_success") or success)}
     metrics = {"cabinet_qpos_ratio": _float_or_none(after_ratio), "object_target_xy_distance": after_distance}
@@ -1339,7 +1345,7 @@ def _stack_multi_reward(before: RewardSnapshot, after: RewardSnapshot, spec: Rew
         reward += 3.0
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events = {**{f"stack_pair_{index}": value for index, value in enumerate(pair_ok)}, "stack_ready": stack_ready, "released": released, "task_success": success}
     milestones = {**{f"stack_pair_{index}": bool(_milestone(before, f"stack_pair_{index}") or value) for index, value in enumerate(pair_ok)}, "stack_complete": bool(_milestone(before, "stack_complete") or (stack_ready and released)), "task_success": bool(_milestone(before, "task_success") or success)}
     metrics = {"stack_chain_error": after_error, "aligned_pairs": float(sum(pair_ok))}
@@ -1359,7 +1365,8 @@ def _dump_reward(before: RewardSnapshot, after: RewardSnapshot, spec: RewardSpec
     grasped = bool(_has_gripper_contact(after, spec.object) and _any_gripper_closed(after))
     reward = -step_cost + (after_count - before_count) * 1.0
     lift_delta = _z_delta(before_container, after_container)
-    if grasped and lift_delta is not None:
+    grasp_seen = bool(_milestone(before, "container_grasped") or grasped)
+    if grasp_seen and lift_delta is not None:
         reward += lift_delta * 3.0
     if container_high and not _milestone(before, "pour_container_high"):
         reward += 1.5
@@ -1368,9 +1375,9 @@ def _dump_reward(before: RewardSnapshot, after: RewardSnapshot, spec: RewardSpec
         reward += 4.0
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events = {"container_grasped": grasped, "container_high": container_high, "all_items_dumped": all_dumped, "task_success": success}
-    milestones = {"pour_container_high": bool(_milestone(before, "pour_container_high") or container_high), "all_items_dumped": bool(_milestone(before, "all_items_dumped") or all_dumped), "task_success": bool(_milestone(before, "task_success") or success)}
+    milestones = {"container_grasped": grasp_seen, "pour_container_high": bool(_milestone(before, "pour_container_high") or container_high), "all_items_dumped": bool(_milestone(before, "all_items_dumped") or all_dumped), "task_success": bool(_milestone(before, "task_success") or success)}
     metrics = {"items_dumped": float(after_count), "item_count": float(len(_collection_keys(after, collection_name))), "container_height": _coord(after_container, 2)}
     return RewardResult(reward, events, metrics, milestones, _reason(events), spec.family, spec.task_name)
 
@@ -1395,7 +1402,7 @@ def _scan_reward(before: RewardSnapshot, after: RewardSnapshot, spec: RewardSpec
         reward += 4.0
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events = {"scanner_and_object_held": both_held, "scan_ray_aligned": aligned, "task_success": success}
     milestones = {
         "scanner_and_object_held": bool(_milestone(before, "scanner_and_object_held") or both_held),
@@ -1416,24 +1423,36 @@ def _shake_reward(before: RewardSnapshot, after: RewardSnapshot, spec: RewardSpe
     height_reached = bool(_coord(after_pos, 2) is not None and _coord(after_pos, 2) > min_height)
     held = bool(_has_gripper_contact(after, spec.object) and _any_gripper_closed(after))
     shake_motion = bool(held and height_reached and axis_motion is not None and axis_motion >= threshold)
+    shake_reward_count = sum(
+        int(_milestone(before, f"shake_reward_{index}"))
+        for index in range(1, MAX_SHAKE_REWARDS + 1)
+    )
+    shake_reward_earned = bool(shake_motion and shake_reward_count < MAX_SHAKE_REWARDS)
     reward = -step_cost
     if held and not _milestone(before, "bottle_held"):
         reward += 0.5
     if height_reached and held and not _milestone(before, "bottle_lifted"):
         reward += 0.8
-    if shake_motion:
+    if shake_reward_earned:
         reward += 1.0
     success = bool(after.success)
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
-    events = {"bottle_held": held, "height_reached": height_reached, "shake_axis_motion": shake_motion, "task_success": success}
+        reward += OFFICIAL_SUCCESS_BONUS
+    events = {"bottle_held": held, "height_reached": height_reached, "shake_axis_motion": shake_motion, "shake_reward_earned": shake_reward_earned, "task_success": success}
     milestones = {
         "bottle_held": bool(_milestone(before, "bottle_held") or held),
         "bottle_lifted": bool(_milestone(before, "bottle_lifted") or (height_reached and held)),
         "shake_seen": bool(_milestone(before, "shake_seen") or shake_motion),
+        **{
+            f"shake_reward_{index}": bool(
+                _milestone(before, f"shake_reward_{index}")
+                or (shake_reward_earned and shake_reward_count + 1 == index)
+            )
+            for index in range(1, MAX_SHAKE_REWARDS + 1)
+        },
         "task_success": bool(_milestone(before, "task_success") or success),
     }
-    metrics = {"axis_motion": axis_motion, "bottle_height": _coord(after_pos, 2)}
+    metrics = {"axis_motion": axis_motion, "bottle_height": _coord(after_pos, 2), "shake_reward_count": float(shake_reward_count + int(shake_reward_earned))}
     return RewardResult(reward, events, metrics, milestones, _reason(events), spec.family, spec.task_name)
 
 
@@ -1441,7 +1460,7 @@ def _terminal_only_reward(before: RewardSnapshot, after: RewardSnapshot, task_na
     success = bool(after.success)
     reward = -step_cost
     if success and not _milestone(before, "task_success"):
-        reward += 10.0
+        reward += OFFICIAL_SUCCESS_BONUS
     events = {"task_success": success}
     milestones = {"task_success": bool(_milestone(before, "task_success") or success)}
     return RewardResult(reward, events, {}, milestones, _reason(events), "terminal_only", task_name)

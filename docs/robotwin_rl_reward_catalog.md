@@ -116,7 +116,7 @@ segment instruction 重建成完整 plan。推荐先把它用于 Planner SFT/beh
 不建议把“与某一句参考文本的字符串相似度”直接作为主奖励：同一物理子任务有多种正确表达，模型也可能
 通过复读模板刷分。如果后续需要文本先验，应只在首次 `build_task_plan` 时发一次、总额限制在 `0~0.5`，
 并比较任务条件下的结构与语义特征（JSON合法性、subgoal数量、动作动词序列、对象/左右臂映射、双臂同步性、
-sentence embedding），其权重必须显著低于官方成功 `+10`。当前实现尚未启用任何文本相似度奖励。
+sentence embedding），其权重必须显著低于官方成功 `+20`。当前实现尚未启用任何文本相似度奖励。
 
 ## 3. 奖励在什么时刻计算
 
@@ -171,11 +171,11 @@ after motion.execute_action
 
 | 项目 | 数值 |
 | --- | ---: |
-| 本 episode 首次官方 success | `+10.0` |
+| 本 episode 首次官方 success | `+20.0` |
 | 已成功后继续动作，或破坏后再次成功 | `+0.0` success bonus；仍计算 step cost 与物理进展/退步 |
 
 Terminal record 本身不再额外重复加成功分，只负责 penalty 与官方完成状态。
-`task_success` 是只增不减的 episode milestone，因此成功→破坏→再成功也不能重复领取 `+10.0`。
+`task_success` 是只增不减的 episode milestone，因此成功→破坏→再成功也不能重复领取 `+20.0`。
 
 ## 6. 奖励族公式
 
@@ -212,7 +212,7 @@ reward = -step_cost
 | 首次 held+lifted+与TCP同向移动 | `+1.0` |
 | carried后首次在目标附近释放 | `+3.0` |
 | 持物时source-target距离势能差 | `distance_before-distance_after` |
-| 本episode首次官方成功 | `+10` |
+| 本episode首次官方成功 | `+20` |
 
 ### 6.3 `relative_place`
 
@@ -382,10 +382,11 @@ TCP 到指定 contact point 的距离势能差  distance_before-distance_after
 ```text
 首次真实持瓶                          +0.5
 首次持瓶达到目标高度                  +0.8
-每个chunk产生足够目标轴位移            +1.0
+前3个产生足够目标轴位移的chunk          每次+1.0
 ```
 
-水平任务检查 x 轴位移，竖直任务检查 z 轴位移。只有实际运动可重复获得 shake 增量，静止持瓶不能反复刷分。
+水平任务检查 x 轴位移，竖直任务检查 z 轴位移。只有实际运动可获得 shake 增量，且整局最多3次；
+之后继续摇动只有 step cost，不能靠未完成任务时无限摇动累积分数。
 
 ## 7. 50类任务逐项映射
 
@@ -433,8 +434,8 @@ TCP 到指定 contact point 的距离势能差  distance_before-distance_after
 | 40 | `put_object_cabinet` | cabinet_place | cabinet qpos；object→cabinet FP0 | 奖励开柜进展、xy`<0.05`、物体释放；官方成功补充相对初始高度范围。 |
 | 41 | `rotate_qrcode` | spatial | qrcode姿态 | 目标四元数`[0.707,0.707,0,0]`误差`<0.1`、高度`<0.75`并释放。 |
 | 42 | `scan_object` | scan | scanner FP0射线 → object | object到扫描线误差`<0.025`、深度`(0,0.07)`且双臂均持物。 |
-| 43 | `shake_bottle` | shake-z | bottle | 持瓶高度`>0.8`；每个chunk的z位移`>=0.025`才给shake增量。 |
-| 44 | `shake_bottle_horizontally` | shake-x | bottle | 持瓶高度`>0.8`；每个chunk的x位移`>=0.025`才给shake增量。 |
+| 43 | `shake_bottle` | shake-z | bottle | 持瓶高度`>0.8`；chunk的z位移`>=0.025`才给shake增量，整局最多3次。 |
+| 44 | `shake_bottle_horizontally` | shake-x | bottle | 持瓶高度`>0.8`；chunk的x位移`>=0.025`才给shake增量，整局最多3次。 |
 | 45 | `stack_blocks_three` | stack_multi | block1→2→3 | 相邻xy`<0.025`、z offset`0.05±0.012`，全部释放。 |
 | 46 | `stack_blocks_two` | stack | block2 → block1 | xy`<0.035`、目标z offset约`0.05`，含抓取/搬运/堆叠。 |
 | 47 | `stack_bowls_three` | stack_multi | bowl1/2/3按高度排序 | 相邻xy`<0.04`，z offsets约`[0.03,0.04]`，全部释放。 |
@@ -447,9 +448,11 @@ TCP 到指定 contact point 的距离势能差  distance_before-distance_after
 | 风险 | 当前处理 |
 | --- | --- |
 | 模型直接宣称任务完成 | terminal success 必须来自 RoboTwin `check_success()`。 |
-| 官方成功后破坏再恢复 | `task_success` 是只增不减的 episode milestone，`+10` 整局只能领取一次。 |
+| 官方成功后破坏再恢复 | `task_success` 是只增不减的 episode milestone，`+20` 整局只能领取一次。 |
 | 原地保持抓取/目标状态反复刷分 | 所有绝对状态 bonus 采用milestone，只在首次达到时给分。 |
 | 靠近—远离或打开—关闭往返刷分 | 距离、姿态、关节、计数和高度 shaping 使用未逐步裁剪的正负对称势能差；完整循环严格相消。 |
+| 抓住抬高、松手降低后重新抓取 | 首次抓取后继续计算高度势能，松手下降也会等额扣回；适用于 spatial、axis_lift 和 dump。 |
+| 失败时持续摇瓶刷动作分 | shake增量整局最多发3次，之后继续摇动只产生step cost。 |
 | 通过无效动作拖延 | 每个action chunk有`-0.05` step cost。 |
 | 官方失败时提前finish省步骤 | incomplete `-1` 再叠加 premature finish `-3`。 |
 | 反复输出非法JSON或非法技能 | invalid decision和skill failure按episode累计惩罚。 |

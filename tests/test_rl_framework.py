@@ -628,7 +628,7 @@ def test_robotwin_success_bonus_is_an_episode_milestone() -> None:
         task_name="unknown_task",
     )
 
-    assert first.reward == pytest.approx(9.95)
+    assert first.reward == pytest.approx(19.95)
     assert first.milestones["task_success"] is True
     assert repeated.reward == pytest.approx(-0.05)
     assert repeated.milestones["task_success"] is True
@@ -678,6 +678,107 @@ def test_contact_press_bonus_cannot_repeat_after_milestone() -> None:
 
     assert reward.events["pressed_with_closed_gripper"] is True
     assert reward.reward == pytest.approx(-0.05)
+
+
+def test_spatial_height_potential_is_repaid_after_release() -> None:
+    milestones = {"goal_0_contact": True, "goal_0_grasped": True}
+    low = RewardSnapshot(
+        task_name="place_object_scale",
+        success=False,
+        actors={
+            "object": _reward_actor([0.0, 0.0, 0.75]),
+            "scale": _reward_actor([1.0, 0.0, 0.75]),
+        },
+        metadata={"reward_milestones": milestones},
+    )
+    high_held = RewardSnapshot(
+        task_name="place_object_scale",
+        success=False,
+        actors={
+            "object": _reward_actor([0.0, 0.0, 0.85], contacts=1),
+            "scale": _reward_actor([1.0, 0.0, 0.75]),
+        },
+        grippers={"left": {"closed": True}},
+    )
+
+    up = compute_robotwin_reward(low, high_held, task_name="place_object_scale")
+    high_held.metadata["reward_milestones"] = up.milestones
+    down_released = compute_robotwin_reward(high_held, low, task_name="place_object_scale")
+
+    assert up.reward + down_released.reward == pytest.approx(-0.1)
+
+
+def test_axis_lift_height_potential_is_repaid_after_release() -> None:
+    low = RewardSnapshot(
+        task_name="adjust_bottle",
+        success=False,
+        actors={"bottle": _reward_actor([0.0, 0.0, 0.75])},
+        metadata={
+            "reward_milestones": {"object_grasped": True},
+            "task_fields": {"qpose_tag": 1},
+        },
+    )
+    high_held = RewardSnapshot(
+        task_name="adjust_bottle",
+        success=False,
+        actors={"bottle": _reward_actor([0.0, 0.0, 0.85], contacts=1)},
+        grippers={"left": {"closed": True}},
+        metadata={"task_fields": {"qpose_tag": 1}},
+    )
+
+    up = compute_robotwin_reward(low, high_held, task_name="adjust_bottle")
+    high_held.metadata["reward_milestones"] = up.milestones
+    down_released = compute_robotwin_reward(high_held, low, task_name="adjust_bottle")
+
+    assert up.reward + down_released.reward == pytest.approx(-0.1)
+
+
+def test_dump_height_potential_is_repaid_after_release() -> None:
+    low = RewardSnapshot(
+        task_name="dump_bin_bigbin",
+        success=False,
+        actors={"deskbin": _reward_actor([0.0, 0.0, 0.6])},
+        metadata={"reward_milestones": {"container_grasped": True}},
+    )
+    high_held = RewardSnapshot(
+        task_name="dump_bin_bigbin",
+        success=False,
+        actors={"deskbin": _reward_actor([0.0, 0.0, 0.8], contacts=1)},
+        grippers={"left": {"closed": True}},
+    )
+
+    up = compute_robotwin_reward(low, high_held, task_name="dump_bin_bigbin")
+    high_held.metadata["reward_milestones"] = up.milestones
+    down_released = compute_robotwin_reward(high_held, low, task_name="dump_bin_bigbin")
+
+    assert up.reward + down_released.reward == pytest.approx(-0.1)
+
+
+def test_shake_motion_bonus_is_capped_at_three_chunks() -> None:
+    milestones: dict[str, bool] = {}
+    positions = [0.0, 0.03, 0.0, 0.03, 0.0]
+    rewards = []
+    for before_x, after_x in zip(positions[:-1], positions[1:], strict=True):
+        before = RewardSnapshot(
+            task_name="shake_bottle_horizontally",
+            success=False,
+            actors={"bottle": _reward_actor([before_x, 0.0, 0.9], contacts=1)},
+            grippers={"left": {"closed": True}},
+            metadata={"reward_milestones": dict(milestones)},
+        )
+        after = RewardSnapshot(
+            task_name="shake_bottle_horizontally",
+            success=False,
+            actors={"bottle": _reward_actor([after_x, 0.0, 0.9], contacts=1)},
+            grippers={"left": {"closed": True}},
+        )
+        result = compute_robotwin_reward(before, after, task_name="shake_bottle_horizontally")
+        rewards.append(result)
+        milestones.update(result.milestones)
+
+    assert [item.events["shake_reward_earned"] for item in rewards] == [True, True, True, False]
+    assert rewards[-1].metrics["shake_reward_count"] == 3.0
+    assert rewards[-1].reward == pytest.approx(-0.05)
 
 
 def test_policy_proxy_static_backend(tmp_path) -> None:
