@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
+import netrc
 import os
 from pathlib import Path
+import shutil
 from typing import Any
 
-from .config import RLConfig, build_rollout_episode_specs, dump_resolved_config, load_rl_config
+from .config import PROJECT_ROOT, RLConfig, build_rollout_episode_specs, dump_resolved_config, load_rl_config
+from .persistent_services import persistent_rollout_services, rollout_service_specs
 from .service_pool import run_logged_subprocess
 
 
 OPENRLHF_TRAINER_MODULE = "openrlhf.cli.train_ppo_ray"
-DEFAULT_OPENRLHF_PYTHON = Path("/mnt/wangwai/vla/clawvla/.venv-openrlhf-py310-cu128/bin/python")
+DEFAULT_OPENRLHF_PYTHON = Path(PROJECT_ROOT) / ".venv-openrlhf-py310-cu128/bin/python"
 RL_CONFIG_PRESETS = {
     "robotwin-multitask": "configs/rl/qwen3vl_pi05_multitask_1update.yaml",
     "robotwin-real5": "configs/rl/qwen3vl_pi05_real_5step_1update.yaml",
@@ -76,19 +80,25 @@ def main() -> None:
 
     print(" ".join(command))
     if args.mode == "dry-run":
+        for spec in rollout_service_specs(config, run_dir):
+            print(
+                f"persistent_service={spec.kind}[{spec.index}] "
+                f"gpu={spec.gpu} port={spec.port} log={spec.log_path}"
+            )
         print(f"run_dir={run_dir}")
         print(f"dataset={train_file}")
         return
 
-    completed = run_logged_subprocess(
-        command,
-        cwd=config.trainer.cwd,
-        log_path=run_dir / "logs" / "openrlhf_train.log",
-        env=env,
-        timeout=None,
-        writer=None,
-        event_prefix="clawvla_openrlhf_train",
-    )
+    with persistent_rollout_services(config, run_dir, env):
+        completed = run_logged_subprocess(
+            command,
+            cwd=config.trainer.cwd,
+            log_path=run_dir / "logs" / "openrlhf_train.log",
+            env=env,
+            timeout=None,
+            writer=None,
+            event_prefix="clawvla_openrlhf_train",
+        )
     if completed.returncode != 0:
         raise SystemExit(completed.returncode)
 
@@ -125,6 +135,8 @@ def _write_prompt_dataset(config: RLConfig, run_dir: Path) -> Path:
                 "task_name": spec.task_name,
                 "instruction": spec.instruction,
                 "params": dict(spec.params),
+                "source": spec.source,
+                "planner_reference_available": spec.planner_reference_available,
             }
             row = {
                 "input": (
@@ -207,14 +219,18 @@ def _openrlhf_train_command(config: RLConfig, *, python: Path, run_dir: Path, tr
         "--train.max_epochs",
         "1",
         "--train.num_episodes",
-        str(max(1, config.openrlhf.total_epochs)),
+        str(max(1, config.openrlhf.total_training_steps or config.openrlhf.total_epochs)),
         "--algo.advantage.estimator",
         "group_norm" if group_size > 1 else "reinforce",
         "--algo.kl.init_coef",
-        "0",
+        str(float(config.openrlhf.kl_init_coef)),
         "--actor.num_nodes",
         "1",
         "--actor.num_gpus_per_node",
+        str(max(1, len(policy_gpus))),
+        "--ref.num_nodes",
+        "1",
+        "--ref.num_gpus_per_node",
         str(max(1, len(policy_gpus))),
         "--vllm.num_engines",
         str(num_engines),
@@ -223,7 +239,6 @@ def _openrlhf_train_command(config: RLConfig, *, python: Path, run_dir: Path, tr
         "--vllm.gpu_memory_utilization",
         str(gpu_memory_utilization),
         "--vllm.enable_prefix_caching",
-        "--vllm.enforce_eager",
         "--train.colocate_all",
         "--ds.zero_stage",
         "2",
@@ -241,6 +256,8 @@ def _openrlhf_train_command(config: RLConfig, *, python: Path, run_dir: Path, tr
         str(run_dir / "checkpoints"),
         "--ckpt.save_steps",
         str(config.checkpoint.save_freq),
+        "--ckpt.max_num",
+        str(_checkpoint_max_num(config)),
         "--logger.logging_steps",
         "1",
         "--logger.wandb.project",
@@ -248,6 +265,9 @@ def _openrlhf_train_command(config: RLConfig, *, python: Path, run_dir: Path, tr
         "--logger.wandb.run_name",
         run_dir.name,
     ]
+    if _env_bool("CLAWVLA_OPENRLHF_VLLM_ENFORCE_EAGER", default=bool(config.openrlhf.enforce_eager)):
+        command.append("--vllm.enforce_eager")
+    command.extend(_wandb_command_args(config))
     if _env_bool("CLAWVLA_OPENRLHF_VLLM_ENABLE_SLEEP", default=True):
         command.append("--vllm.enable_sleep")
     if _env_bool("CLAWVLA_OPENRLHF_DS_ENABLE_SLEEP", default=bool(config.openrlhf.fsdp_param_offload)):
@@ -293,6 +313,50 @@ def _openrlhf_zero_stage(config: RLConfig) -> int:
     return 3 if config.openrlhf.train_mode == "full" else 2
 
 
+def _checkpoint_max_num(config: RLConfig) -> int:
+    keep_last = config.checkpoint.keep_last
+    if keep_last is None:
+        # OpenRLHF requires an integer and has no explicit unlimited sentinel.
+        # Its eviction check is count-based, so this effectively disables it.
+        return 2_147_483_647
+    value = int(keep_last)
+    if value <= 0:
+        raise ValueError(f"checkpoint.keep_last must be positive or null, got {keep_last}")
+    return value
+
+
+def _wandb_command_args(config: RLConfig) -> list[str]:
+    mode = str(config.logging.wandb_mode or "disabled").strip().lower()
+    if mode == "disabled":
+        return []
+    if mode not in {"online", "offline"}:
+        raise ValueError(f"logging.wandb_mode must be disabled, online, or offline, got {mode!r}")
+    if mode == "online" and not _wandb_auth_available():
+        raise RuntimeError(
+            "WandB online logging is enabled but no credentials were found. Run "
+            "`.venv-openrlhf-py310-cu128/bin/python -m wandb login` or export WANDB_API_KEY."
+        )
+    # OpenRLHF uses this argument as the logger enable switch. The actual
+    # credential remains in WANDB_API_KEY/~/.netrc and is never exposed in the
+    # printed subprocess command or process list.
+    args = ["--logger.wandb.key", "clawvla-auth-is-preconfigured"]
+    if config.logging.wandb_entity:
+        args.extend(["--logger.wandb.org", str(config.logging.wandb_entity)])
+    if config.logging.wandb_group:
+        args.extend(["--logger.wandb.group", str(config.logging.wandb_group)])
+    return args
+
+
+def _wandb_auth_available() -> bool:
+    if os.environ.get("WANDB_API_KEY"):
+        return True
+    try:
+        credentials = netrc.netrc().authenticators("api.wandb.ai")
+    except (FileNotFoundError, netrc.NetrcParseError, OSError):
+        return False
+    return bool(credentials and credentials[2])
+
+
 def _openrlhf_ds_tensor_parallel_size(config: RLConfig) -> int:
     del config
     override = os.environ.get("CLAWVLA_OPENRLHF_DS_TENSOR_PARALLEL_SIZE")
@@ -318,16 +382,29 @@ def _env_bool(name: str, *, default: bool) -> bool:
 def _vllm_gpu_memory_utilization(config: RLConfig) -> float:
     override = os.environ.get("CLAWVLA_OPENRLHF_VLLM_GPU_MEMORY_UTILIZATION")
     if override is not None:
-        return float(override)
-    cap = 0.5 if int(config.openrlhf.tensor_parallel_size) == 1 else 0.25
-    return min(float(config.openrlhf.gpu_memory_utilization), cap)
+        value = float(override)
+    else:
+        value = float(config.openrlhf.gpu_memory_utilization)
+    if not 0.0 < value <= 1.0:
+        raise ValueError(f"vLLM gpu_memory_utilization must be in (0, 1], got {value}")
+    return value
 
 
 def _openrlhf_env(config: RLConfig, run_dir: Path, resolved_config_path: Path) -> dict[str, str]:
-    tmp_dir = Path("/tmp") / "cvla_openrlhf" / hashlib.sha1(str(run_dir).encode("utf-8")).hexdigest()[:10]
+    tmp_override = os.environ.get("CLAWVLA_OPENRLHF_TMPDIR")
+    tmp_dir = (
+        Path(tmp_override).expanduser()
+        if tmp_override
+        else Path("/dev/shm")
+        / "cvla_openrlhf"
+        / hashlib.sha1(str(run_dir).encode("utf-8")).hexdigest()[:10]
+    )
     tmp_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env.update(config.trainer.env)
+    _ensure_ninja_on_path(env)
+    wandb_dir = run_dir / "wandb"
+    wandb_dir.mkdir(parents=True, exist_ok=True)
     env.update(
         {
             "PYTHONPATH": str(Path(config.trainer.cwd) / "src"),
@@ -338,12 +415,21 @@ def _openrlhf_env(config: RLConfig, run_dir: Path, resolved_config_path: Path) -
             "CLAWVLA_OPENRLHF_RL_CONFIG": str(resolved_config_path),
             "CLAWVLA_OPENRLHF_RUN_DIR": str(run_dir),
             "WANDB_MODE": config.logging.wandb_mode,
+            "WANDB_DIR": str(wandb_dir),
+            "WANDB_RUN_ID": hashlib.sha1(run_dir.name.encode("utf-8")).hexdigest()[:16],
+            "WANDB_RESUME": "allow",
+            "CLAWVLA_WANDB_SAMPLE_LOG_FREQ": str(max(0, int(config.logging.wandb_sample_log_freq))),
             "TMPDIR": str(tmp_dir),
             "TMP": str(tmp_dir),
             "TEMP": str(tmp_dir),
+            "RAY_TMPDIR": str(tmp_dir),
             "TRITON_CACHE_DIR": str(tmp_dir / "triton"),
         }
     )
+    if str(config.logging.wandb_mode).strip().lower() == "offline":
+        env.setdefault("WANDB_API_KEY", "clawvla-offline")
+    if config.logging.wandb_tags:
+        env["WANDB_TAGS"] = ",".join(str(tag) for tag in config.logging.wandb_tags)
     env.setdefault("RAY_CGRAPH_submit_timeout", "300")
     env.setdefault("RAY_CGRAPH_get_timeout", "300")
     if _env_bool("CLAWVLA_OPENRLHF_VLLM_ENABLE_SLEEP", default=True):
@@ -353,6 +439,31 @@ def _openrlhf_env(config: RLConfig, run_dir: Path, resolved_config_path: Path) -
     else:
         env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     return env
+
+
+def _ensure_ninja_on_path(env: dict[str, str]) -> None:
+    """Expose the ninja executable bundled with the active Python environment.
+
+    The RL launcher intentionally invokes its venv's Python directly instead of
+    activating the venv.  On the shared training machines, Python packages can
+    also be supplied by a base conda environment.  In both cases the matching
+    ``bin`` directory may be absent from PATH, which makes FlashInfer JIT fail
+    even though the ``ninja`` Python package is installed.
+    """
+    path = env.get("PATH", os.defpath)
+    if shutil.which("ninja", path=path):
+        return
+
+    candidates = [Path(os.sys.executable).resolve().parent / "ninja"]
+    spec = importlib.util.find_spec("ninja")
+    if spec is not None and spec.origin:
+        origin = Path(spec.origin).resolve()
+        candidates.extend(parent / "bin" / "ninja" for parent in origin.parents)
+
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            env["PATH"] = f"{candidate.parent}{os.pathsep}{path}"
+            return
 
 
 if __name__ == "__main__":

@@ -36,6 +36,8 @@ class RuntimeRewardTracker:
         self.output_path.touch(exist_ok=True)
         self._before: dict[int, Any] = {}
         self._milestones: dict[str, bool] = {}
+        self.last_reward_payload: dict[str, Any] | None = None
+        self.last_progress: bool | None = None
 
     def before_skill(self, *, blackboard: Any, component: str, skill: str, step_index: int | None) -> None:
         if component != "motion" or skill != "execute_action":
@@ -95,7 +97,25 @@ class RuntimeRewardTracker:
             )
             return
         reward_payload = reward.to_dict() if hasattr(reward, "to_dict") else dict(reward)
+        previous_milestones = dict(self._milestones)
         self._milestones.update(dict(reward_payload.get("milestones") or {}))
+        new_milestone = any(
+            bool(value) and not bool(previous_milestones.get(key))
+            for key, value in dict(reward_payload.get("milestones") or {}).items()
+        )
+        reward_value = float(reward_payload.get("reward", -self.step_cost))
+        self.last_progress = bool(new_milestone or reward_value > -float(self.step_cost) + 1e-6)
+        self.last_reward_payload = dict(reward_payload)
+        blackboard.write(
+            "rl_last_reward_progress",
+            {
+                "step_index": step_index,
+                "progress": self.last_progress,
+                "new_milestone": new_milestone,
+                "reward": reward_value,
+            },
+            event_type="rl.reward_progress",
+        )
         payload = {
             "step_index": step_index,
             "reward": reward_payload,

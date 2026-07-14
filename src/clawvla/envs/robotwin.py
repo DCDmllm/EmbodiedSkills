@@ -173,6 +173,36 @@ class RoboTwinAdapter(RobotEnvAdapter):
             "step_count": None,
         }
 
+    def close(self) -> None:
+        task_envs = []
+        if self.session is not None and self.session.task_env is not None:
+            task_envs.append(self.session.task_env)
+        if self.bound_task_env is not None and all(self.bound_task_env is not item for item in task_envs):
+            task_envs.append(self.bound_task_env)
+        first_error: Exception | None = None
+        for task_env in task_envs:
+            try:
+                close_env = getattr(task_env, "close_env", None)
+                if callable(close_env):
+                    close_env()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+            finally:
+                viewer = getattr(task_env, "viewer", None)
+                close_viewer = getattr(viewer, "close", None)
+                if callable(close_viewer):
+                    try:
+                        close_viewer()
+                    except Exception as exc:
+                        if first_error is None:
+                            first_error = exc
+        self.session = None
+        self.bound_task_env = None
+        self.last_observation = None
+        if first_error is not None:
+            raise first_error
+
 
 def normalize_robotwin_observation(
     raw_observation: dict[str, Any],

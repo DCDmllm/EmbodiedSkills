@@ -20,6 +20,10 @@ if TYPE_CHECKING:
 
 class Pi05ActionBackend:
     name = "pi05"
+    # PI0.5 is conditioned directly on current images, robot state, and the
+    # natural-language subgoal. Candidate ids/geometry are useful metadata but
+    # must not prevent an otherwise executable action request.
+    requires_candidate_bindings = False
 
     def __init__(self, config: dict[str, Any] | None = None):
         self.config = dict(config or {})

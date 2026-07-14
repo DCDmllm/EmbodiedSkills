@@ -8,7 +8,7 @@ from ..loop_types import MAX_ACTION_HORIZON, MIN_ACTION_HORIZON, LoopDecision
 from ..model_calls import call_component_json
 from ..schema import SchedulerDecision, SkillRequest, SkillResult, Subgoal, TaskPlan
 from ..skills.base import SkillContext, SkillRegistry
-from ..task_semantics import task_plan_requires_target
+from ..task_semantics import action_backend_requires_candidate_bindings, task_plan_requires_target
 from .skill_helpers import ok, register_skill, to_dict, unavailable
 
 
@@ -31,7 +31,15 @@ def register_scheduler_skills(registry: SkillRegistry) -> None:
 def select_next_component(request: SkillRequest, context: SkillContext) -> SkillResult:
     blackboard = context.blackboard
     world_state = blackboard.read("world_state")
-    if world_state is None or getattr(world_state, "needs_reobserve", False):
+    require_candidate_bindings = action_backend_requires_candidate_bindings(blackboard.read("action_backend"))
+    if not require_candidate_bindings and blackboard.read("observation") is not None:
+        decision = SchedulerDecision(
+            "motion",
+            "build_motion_goal",
+            "Direct VLA execution uses the current images, robot state, and subgoal text.",
+            stage="execute",
+        )
+    elif world_state is None or getattr(world_state, "needs_reobserve", False):
         decision = SchedulerDecision("vision", "capture_views", "World state is missing or requested reobservation.", stage="observe")
     elif not getattr(world_state, "source_candidate_id", None):
         decision = SchedulerDecision("vision", "localize_task_objects", "Task source is not localized yet.", stage="observe")
@@ -146,11 +154,12 @@ def choose_next_skill(request: SkillRequest, context: SkillContext) -> SkillResu
 def build_task_plan(request: SkillRequest, context: SkillContext) -> SkillResult:
     blackboard = context.blackboard
     world_state = blackboard.read("world_state")
-    if world_state is None:
+    require_candidate_bindings = action_backend_requires_candidate_bindings(blackboard.read("action_backend"))
+    if world_state is None and require_candidate_bindings:
         return unavailable("task_plan_unavailable", "missing_world_state", {})
     source_id = getattr(world_state, "source_candidate_id", None)
     target_id = getattr(world_state, "target_candidate_id", None)
-    if not source_id:
+    if not source_id and require_candidate_bindings:
         return unavailable("task_plan_unavailable", "missing_source_candidate", {"world_state": to_dict(world_state)})
 
     if context.has_model and request.payload.get("use_model", True):
@@ -160,7 +169,11 @@ def build_task_plan(request: SkillRequest, context: SkillContext) -> SkillResult
             payload={
                 "original_task_instruction": blackboard.task_instruction,
                 "world_state": to_dict(world_state),
-                "required_schema": _task_plan_schema(source_id, target_id),
+                "required_schema": _task_plan_schema(
+                    source_id,
+                    target_id,
+                    candidate_bindings_required=require_candidate_bindings,
+                ),
                 "hard_planning_constraints": _task_plan_hard_constraints(),
                 "instruction_style_examples": _task_plan_style_examples(),
                 "full_plan_few_shots": _task_plan_full_few_shots(),
@@ -169,7 +182,13 @@ def build_task_plan(request: SkillRequest, context: SkillContext) -> SkillResult
             render_format=request.payload.get("render_format", "json"),
         )
         plan = TaskPlan.from_payload(raw)
-        validation_errors = _validate_task_plan_completeness(plan, blackboard.task_instruction, source_id, target_id)
+        validation_errors = _validate_task_plan_completeness(
+            plan,
+            blackboard.task_instruction,
+            source_id,
+            target_id,
+            candidate_bindings_required=require_candidate_bindings,
+        )
         if not validation_errors:
             plan.metadata["source"] = "scheduler_model"
         else:
@@ -769,10 +788,17 @@ def _task_plan_full_few_shots() -> list[dict[str, Any]]:
     ]
 
 
-def _task_plan_schema(source_id: str | None, target_id: str | None) -> dict[str, Any]:
+def _task_plan_schema(
+    source_id: str | None,
+    target_id: str | None,
+    *,
+    candidate_bindings_required: bool = True,
+) -> dict[str, Any]:
     source_rule = (
         f"{source_id} or another existing candidate id for the object/fixture/tool controlled by this subgoal; "
         "null only if no visual candidate is involved"
+        if candidate_bindings_required
+        else "optional existing candidate id; null is valid because the VLA executes from images and subgoal text"
     )
     target_rule = (
         (
@@ -785,6 +811,11 @@ def _task_plan_schema(source_id: str | None, target_id: str | None) -> dict[str,
             "otherwise null because no separate target is currently bound"
         )
     )
+    if not candidate_bindings_required:
+        target_rule = (
+            "optional existing candidate id for a separate destination; null is valid because the natural-language "
+            "subgoal carries the destination for direct VLA execution"
+        )
     return {
         "task": "copy the task instruction",
         "subgoals": [
@@ -814,8 +845,10 @@ def _task_plan_schema(source_id: str | None, target_id: str | None) -> dict[str,
 def _validate_task_plan_completeness(
     plan: TaskPlan,
     task_instruction: str | None,
-    source_id: str,
+    source_id: str | None,
     target_id: str | None,
+    *,
+    candidate_bindings_required: bool = True,
 ) -> list[str]:
     errors: list[str] = []
     if not plan.subgoals:
@@ -838,18 +871,19 @@ def _validate_task_plan_completeness(
         if criteria_error is not None:
             errors.append(criteria_error)
 
-    if not any(subgoal.source_candidate_id == source_id for subgoal in plan.subgoals):
-        errors.append("missing_source_candidate_in_subgoals")
-    target_required = task_plan_requires_target(task_instruction, plan.subgoals)
-    if target_required and not target_id:
-        errors.append("missing_target_candidate_for_target_required_task")
-    if (
-        target_required
-        and target_id
-        and target_id != source_id
-        and not any(subgoal.target_candidate_id == target_id for subgoal in plan.subgoals)
-    ):
-        errors.append("missing_target_candidate_in_subgoals")
+    if candidate_bindings_required:
+        if not source_id or not any(subgoal.source_candidate_id == source_id for subgoal in plan.subgoals):
+            errors.append("missing_source_candidate_in_subgoals")
+        target_required = task_plan_requires_target(task_instruction, plan.subgoals)
+        if target_required and not target_id:
+            errors.append("missing_target_candidate_for_target_required_task")
+        if (
+            target_required
+            and target_id
+            and target_id != source_id
+            and not any(subgoal.target_candidate_id == target_id for subgoal in plan.subgoals)
+        ):
+            errors.append("missing_target_candidate_in_subgoals")
 
     return errors
 
@@ -941,13 +975,18 @@ def _scheduler_instruction(loop_mode: bool) -> str:
         "In observe, runtime_state.observe_complete and runtime_state.world_state_ready are authoritative. "
         "If runtime_state.observation_present is false, choose vision.capture_views first; do not choose "
         "perceive_scene, localize_task_objects, state.update_world_state, or any non-observe skill before images exist. "
+        "runtime_state.candidate_bindings_required is authoritative. When it is false, the direct VLA needs only "
+        "current images, robot state, and the natural-language subgoal: perception, candidate ids, metric geometry, "
+        "and world_state are optional hints and must not be produced merely to fill schema fields. After the current "
+        "images exist, obey next_required_decision and advance from observe without extra grounding calls. "
         "If either shows the task objects are already bound and fresh, choose control=advance_stage with stage=null. "
         "Do not call localize_task_objects again when runtime_state.world_state_source_candidate_id is set and "
         "either runtime_state.target_candidate_required is false or runtime_state.world_state_target_candidate_id is set. "
         "Metric geometry is optional evidence for this "
         "agent and is not required to leave observe because the PI0.5/OpenPI execution backend receives images. "
         "Do not call lift_depth_cluster or lift_geometry merely because metric_geometry is unavailable. "
-        "In observe, the visual state is built in strict semantic order: capture_views obtains images; "
+        "Only when runtime_state.candidate_bindings_required is true, the visual state is built in strict semantic "
+        "order: capture_views obtains images; "
         "perceive_scene detects candidate objects only and does not produce source_candidate_id or optional "
         "target_candidate_id; localize_task_objects is the required skill that binds top-level source_candidate_id "
         "and binds target_candidate_id only when the task has a separate target/destination/relation object. "
@@ -994,12 +1033,12 @@ def _scheduler_instruction(loop_mode: bool) -> str:
         "If last_action_validation_report failed in execute, rebuild the stale or invalid motion artifacts "
         "from the earliest invalid artifact instead of retrying execute_action unchanged. "
         "Task planning artifacts are task_plan then current_subgoal. Motion artifacts are motion_goal, "
-        "motion_plan, action_chunk, then execute_action. When choosing motion.emit_action_chunk, payload "
-        f"must include an integer horizon from {MIN_ACTION_HORIZON} to {MAX_ACTION_HORIZON}. "
-        "Use horizon=10 for precise grasp, place, release, or "
-        "stability checks; horizon=20 for approach, align, lift, press, open, close, pull, push, insert, or pour; "
-        "horizon=30 for normal transport; use horizon=32 only for clearly longer moves. Never request more than "
-        "32 actions because the deployed PI0.5 policy has action_horizon=32; continue a longer motion only after "
+        "motion_plan, action_chunk, then execute_action. When choosing motion.emit_action_chunk, payload.horizon "
+        f"is optional and defaults to {MAX_ACTION_HORIZON}. If provided, it must be an integer from "
+        f"{MIN_ACTION_HORIZON} to {MAX_ACTION_HORIZON}. Prefer the default horizon=32 because the deployed PI0.5 "
+        "was trained with action_horizon=32. Use a shorter value from 15 to 31 only for an explicit cautious "
+        "correction or recovery near contact; do not shorten ordinary grasp, place, transport, or bimanual motions. "
+        "Never request more than 32 actions; continue a longer motion only after "
         "executing the chunk, observing again, and replanning from the fresh state. "
         "After execute_action succeeds, verify the current "
         "subgoal before advancing, continuing execution, replanning, reobserving, recovering, or finishing. "

@@ -38,6 +38,8 @@ RLConfig:
   policy: PolicyConfig
   rollout: RolloutConfig
   reward: RewardConfig
+  planner_aux: PlannerAuxConfig
+  rollout_seed_mix: RolloutSeedMixConfig
   openrlhf: OpenRLHFConfig
   cluster: ClusterConfig
   logging: LoggingConfig
@@ -107,6 +109,13 @@ start_openpi_worker
 
 如果配置了 `rollout.tasks`，每个 task/seed 会生成一行 OpenRLHF prompt dataset；否则沿用单任务 `task_name/instruction/episodes/seeds`。`group_size` 和 `openrlhf.rollout_n` 共同决定每个 prompt 的 rollout samples 数；`max_steps` 是 agent loop 最大步数，action horizon 由 motion payload 控制。
 
+### RolloutSeedMixConfig
+
+RoboTwin 可直接把 expert 子任务 episode 和官方有效 seed 混成在线 RL prompt，不需要离线 grounding JSON。
+expert 样本按 task + seed 精确启用首次 Planner 调用的语义辅助分；官方有效 seed 只使用在线视觉与环境奖励，
+Planner 分直接 mask。当前 `qwen3vl_pi05_online_seed_mix_grpo.yaml` 使用 2236 个 expert train seed 和
+1491 个 grounding-only seed，`rollout_n=4` 时共 14908 条 rollout。
+
 ### RewardConfig
 
 ```python
@@ -115,6 +124,7 @@ task_map
 step_cost
 incomplete_episode_penalty
 premature_finish_penalty
+stalled_loop_penalty
 invalid_decision_penalty
 skill_failure_penalty
 recoverable_preflight_penalty
@@ -145,6 +155,7 @@ gpu_memory_utilization
 gradient_checkpointing
 use_remove_padding
 learning_rate
+kl_init_coef
 actor_ppo_mini_batch_size
 actor_ppo_micro_batch_size_per_gpu
 actor_ppo_max_token_len_per_gpu
@@ -184,7 +195,19 @@ ray_num_workers
 CUDA_VISIBLE_DEVICES = ",".join(policy_gpus)
 ```
 
-rollout worker 写临时 agent config 时，会把 OpenPI worker 的 `cuda_visible_devices` 改成 `openpi_gpus`。RoboTwin rollout 子进程环境会设置 `CUDA_VISIBLE_DEVICES=robotwin_gpus`。
+在线 RoboTwin 主配置使用 4+2+2：policy GPU 0–3、OpenPI GPU 4–5、RoboTwin GPU 6–7。rollout
+按分配到的端口 lane 轮转选择单张 OpenPI 和单张 RoboTwin GPU，例如连续四条对应 4/5/4/5 与
+6/7/6/7，避免所有子进程都落到列表第一张卡。当前 vLLM utilization 为 0.7，TP=1、4 个 engine，
+并配合 ZeRO-3、Adam offload、vLLM/DeepSpeed sleep；KL 初始系数为 0.001，agent tool loop 上限为 150，
+同时由 5 次重复失败与 6 次成功无进展的 stall watchdog 提前终止无效长轨迹。
+PI0.5 action chunk 的 `horizon` 可省略，省略时在调用 backend 前补为 32；模型显式输出时只接受 15–32。
+普通动作默认执行完整 32 步，较短前缀只用于明确的谨慎纠错或恢复。
+正式在线配置每 10 个外层 GRPO 更新保存一次 checkpoint，`keep_last: null` 保留全部周期 checkpoint。
+
+配置文件中的 `${PROJECT_ROOT}` 和 `${WORKSPACE_ROOT}` 由 ClawVLA loader 在读取 YAML 时展开。
+`PROJECT_ROOT` 默认从 `src/clawvla/rl/config.py` 的仓库位置推导，也可通过
+`CLAWVLA_PROJECT_ROOT=/path/to/clawvla` 覆盖；`WORKSPACE_ROOT` 是包含 `vla/` 和 `pi0.5/` 的工作区根目录，
+非标准目录布局可通过 `CLAWVLA_WORKSPACE_ROOT=/path/to/workspace` 单独覆盖。
 
 ## 入口模式
 

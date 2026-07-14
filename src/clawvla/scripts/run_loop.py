@@ -36,27 +36,66 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(args.config)
+    run_agent_loop(
+        config_path=args.config,
+        instruction=args.instruction,
+        artifact_prefix=args.artifact_prefix,
+        initial_stage=args.initial_stage,
+        max_steps=args.max_steps,
+        result_output=args.result_output,
+        run_environment=bool(args.run),
+        initial_observe=bool(args.initial_observe and not args.no_initial_observe),
+    )
+
+
+def run_agent_loop(
+    *,
+    config_path: str,
+    instruction: str,
+    artifact_prefix: str,
+    initial_stage: str,
+    max_steps: int,
+    result_output: str | Path | None,
+    run_environment: bool,
+    initial_observe: bool = False,
+) -> Path:
+    """Run one complete agent episode, safely releasing its environment scene."""
+    config = load_config(config_path)
     _apply_runtime_environment(config)
-    result_output = Path(args.result_output) if args.result_output else _default_run_path(config, args.artifact_prefix, "result.json")
-    with _action_worker_lifecycle(config, args.config, args.artifact_prefix):
+    output_path = (
+        Path(result_output)
+        if result_output
+        else _default_run_path(config, artifact_prefix, "result.json")
+    )
+    with _action_worker_lifecycle(config, config_path, artifact_prefix):
         runtime = AgentRuntime(config)
         adapter = build_env_adapter(config)
-        runtime.blackboard.write("env_adapter", adapter)
-        runtime.blackboard.write("run_environment", bool(args.run))
-        runtime.blackboard.write("run_robotwin", bool(args.run))
-        runtime.blackboard.write("artifact_prefix", args.artifact_prefix)
-        runtime.blackboard.task_instruction = args.instruction
-        _install_rl_reward_tracker(runtime, config)
+        try:
+            runtime.blackboard.write("env_adapter", adapter)
+            runtime.blackboard.write("run_environment", bool(run_environment))
+            runtime.blackboard.write("run_robotwin", bool(run_environment))
+            runtime.blackboard.write("artifact_prefix", artifact_prefix)
+            runtime.blackboard.task_instruction = instruction
+            _install_rl_reward_tracker(runtime, config)
 
-        if args.initial_observe and not args.no_initial_observe:
-            bootstrap = _bootstrap_observe(runtime, args.instruction, args.artifact_prefix, args.run)
-            if not bootstrap.success:
-                _print_result(runtime, {"status": bootstrap.status, "reason": bootstrap.errors[0] if bootstrap.errors else None}, result_output)
-                return
+            if initial_observe:
+                bootstrap = _bootstrap_observe(runtime, instruction, artifact_prefix, run_environment)
+                if not bootstrap.success:
+                    _print_result(
+                        runtime,
+                        {
+                            "status": bootstrap.status,
+                            "reason": bootstrap.errors[0] if bootstrap.errors else None,
+                        },
+                        output_path,
+                    )
+                    return output_path
 
-        result = runtime.run_loop(max_steps=args.max_steps, initial_stage=args.initial_stage)
-        _print_result(runtime, result.to_dict(), result_output)
+            result = runtime.run_loop(max_steps=max_steps, initial_stage=initial_stage)
+            _print_result(runtime, result.to_dict(), output_path)
+            return output_path
+        finally:
+            _close_env_adapter(adapter)
 
 
 @contextmanager
@@ -161,6 +200,21 @@ def _apply_runtime_environment(config: AgentConfig) -> None:
     env = getattr(config.runtime_environment, "env", {})
     for key, value in env.items():
         os.environ[str(key)] = str(value)
+
+
+def _close_env_adapter(adapter: object) -> None:
+    close = getattr(adapter, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception as exc:
+            emit_status_notice(
+                "environment_close_failed",
+                success=False,
+                source="run_loop",
+                reason=f"{type(exc).__name__}: {exc}",
+                always=True,
+            )
 
 
 def _start_openpi_worker(

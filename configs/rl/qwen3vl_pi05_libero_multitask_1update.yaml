@@ -5,6 +5,9 @@ extends:
 
 name: qwen3vl_pi05_libero_multitask_1update
 
+planner_aux:
+  enabled: false
+
 environment:
   python: /mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python
   cwd: /mnt/wangwai/vla/clawvla

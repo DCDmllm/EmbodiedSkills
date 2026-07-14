@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from typing import Any
 
 from .blackboard_utils import current_observation_id, metadata_value
@@ -18,7 +19,7 @@ from .notices import emit_human_trace, emit_runtime_event, emit_status_notice
 from .phase_policy import PhasePolicy
 from .runtime import AgentRuntime
 from .schema import SkillResult
-from .task_semantics import task_requires_target
+from .task_semantics import action_backend_requires_candidate_bindings, task_requires_target
 
 
 REPAIR_TARGET_STAGES = {"observe", "plan", "preflight", "recover"}
@@ -30,6 +31,8 @@ class AgentLoopConfig:
     initial_stage: str = "observe"
     stop_on_skill_error: bool = False
     allow_same_decision_repeats: int = 3
+    failed_skill_stall_limit: int = 5
+    no_progress_action_stall_limit: int = 6
     scheduler_payload: dict[str, Any] = field(default_factory=dict)
 
 
@@ -48,7 +51,12 @@ class AgentLoop:
         stage = self.policy.normalize_stage(self.runtime.blackboard.read("stage") or self.config.initial_stage)
         self.runtime.blackboard.write("stage", stage, event_type="loop.stage_initialized")
         records: list[LoopStepRecord] = []
-        repeat_state: dict[str, Any] = {"last_key": None, "count": 0}
+        stall_state: dict[str, Any] = {
+            "last_failed_key": None,
+            "failed_count": 0,
+            "no_progress_action_count": 0,
+            "last_action_subgoal": None,
+        }
 
         for step_index in range(self.config.max_steps):
             stage_before = stage
@@ -72,6 +80,9 @@ class AgentLoop:
                 )
                 records.append(LoopStepRecord(step_index, stage_before, decision, decision_result.status, decision_result.to_dict()))
                 self._write_loop_history(records)
+                stall_reason = self._stall_reason(decision, decision_result, stall_state)
+                if stall_reason:
+                    return LoopRunResult("stalled_loop", stage, records, reason=stall_reason)
                 if self.config.stop_on_skill_error:
                     return LoopRunResult("scheduler_failed", stage, records, reason=decision_result.status)
                 continue
@@ -136,8 +147,6 @@ class AgentLoop:
                 continue
 
             error = self._validate_run_skill_decision(decision)
-            if error is None:
-                error = self._check_repeat(decision, repeat_state)
             if error is not None:
                 emit_runtime_event(
                     "clawvla_decision_blocked",
@@ -152,6 +161,10 @@ class AgentLoop:
                 )
                 records.append(LoopStepRecord(step_index, stage_before, decision, "invalid_decision", decision_result.to_dict(), error))
                 self._write_loop_history(records)
+                invalid_result = SkillResult(success=False, status="invalid_decision", errors=[error])
+                stall_reason = self._stall_reason(decision, invalid_result, stall_state)
+                if stall_reason:
+                    return LoopRunResult("stalled_loop", stage, records, reason=stall_reason)
                 if self.config.stop_on_skill_error:
                     return LoopRunResult("invalid_decision", stage, records, reason=error)
                 continue
@@ -169,6 +182,9 @@ class AgentLoop:
             record = LoopStepRecord(step_index, stage_before, decision, result.status, result.to_dict())
             records.append(record)
             self._write_loop_history(records)
+            stall_reason = self._stall_reason(decision, result, stall_state)
+            if stall_reason:
+                return LoopRunResult("stalled_loop", stage, records, reason=stall_reason)
             if not result.success:
                 emit_runtime_event(
                     "clawvla_skill_failure_recorded",
@@ -189,6 +205,53 @@ class AgentLoop:
             stage = self.policy.normalize_stage(self.runtime.blackboard.read("stage") or decision.stage or stage)
 
         return self._max_steps_result(stage, records)
+
+    def _stall_reason(
+        self,
+        decision: LoopDecision,
+        result: SkillResult,
+        state: dict[str, Any],
+    ) -> str | None:
+        if not result.success:
+            key = self._failed_skill_signature(decision, result)
+            state["failed_count"] = int(state.get("failed_count", 0)) + 1 if state.get("last_failed_key") == key else 1
+            state["last_failed_key"] = key
+            if int(state["failed_count"]) >= int(self.config.failed_skill_stall_limit):
+                return (
+                    "repeated_failed_skill:"
+                    f"{decision.next_component}.{decision.next_skill}:"
+                    f"count={state['failed_count']}"
+                )
+            return None
+
+        state["last_failed_key"] = None
+        state["failed_count"] = 0
+        if decision.next_component != "motion" or decision.next_skill != "execute_action":
+            return None
+        subgoal = self.runtime.blackboard.read("current_subgoal")
+        subgoal_id = getattr(subgoal, "subgoal_id", None)
+        if state.get("last_action_subgoal") not in {None, subgoal_id}:
+            state["no_progress_action_count"] = 0
+        state["last_action_subgoal"] = subgoal_id
+        progress_payload = self.runtime.blackboard.read("rl_last_reward_progress")
+        progressed = bool(progress_payload.get("progress")) if isinstance(progress_payload, dict) else True
+        state["no_progress_action_count"] = 0 if progressed else int(state.get("no_progress_action_count", 0)) + 1
+        if int(state["no_progress_action_count"]) >= int(self.config.no_progress_action_stall_limit):
+            return (
+                "successful_actions_without_progress:"
+                f"subgoal={subgoal_id}:count={state['no_progress_action_count']}"
+            )
+        return None
+
+    @staticmethod
+    def _failed_skill_signature(decision: LoopDecision, result: SkillResult) -> str:
+        payload = json.dumps(decision.payload, sort_keys=True, ensure_ascii=True, default=str)
+        errors = tuple(str(error) for error in (result.errors or [])[:3])
+        return json.dumps(
+            [decision.stage, decision.next_component, decision.next_skill, payload, result.status, errors],
+            ensure_ascii=True,
+            default=str,
+        )
 
     def _choose_decision(self, stage: str) -> SkillResult:
         allowed_skills = self._state_gated_allowed_skills(
@@ -301,6 +364,9 @@ class AgentLoop:
                 "estimate_uncertainty",
             }
         )
+        should_update_world_state = (
+            should_update_world_state and self.runtime.blackboard.read("perception") is not None
+        )
         if should_update_world_state:
             self.runtime.run_skill("state", "update_world_state", {"stage": decision.stage}, stage=decision.stage)
         if is_execute_action and result.status == "action_executed":
@@ -343,6 +409,8 @@ class AgentLoop:
         if decision.next_component == "recovery" and decision.next_skill == "decide_recovery":
             payload.setdefault("use_model", True)
             payload.setdefault("image_paths", self._recovery_evidence_image_paths())
+        if decision.next_component == "motion" and decision.next_skill == "emit_action_chunk":
+            payload.setdefault("horizon", MAX_ACTION_HORIZON)
         return payload
 
     def _before_skill(self, decision: LoopDecision, step_index: int) -> None:
@@ -470,7 +538,7 @@ class AgentLoop:
             if skill == "build_motion_goal":
                 if blackboard.read("current_subgoal") is None:
                     return "missing_current_subgoal_before_build_motion_goal"
-                if blackboard.read("world_state") is None:
+                if self._candidate_bindings_required() and blackboard.read("world_state") is None:
                     return "missing_world_state_before_build_motion_goal"
             if skill == "plan_motion" and not self._motion_goal_fresh():
                 return "missing_fresh_motion_goal_before_plan_motion"
@@ -533,6 +601,10 @@ class AgentLoop:
         return None
 
     def _world_state_ready_error(self) -> str | None:
+        if not self._candidate_bindings_required():
+            if self.runtime.blackboard.read("observation") is None:
+                return "missing_observation"
+            return None
         world_state = self.runtime.blackboard.read("world_state")
         if world_state is None:
             return "missing_world_state"
@@ -547,6 +619,11 @@ class AgentLoop:
         ):
             return "missing_target_candidate"
         return None
+
+    def _candidate_bindings_required(self) -> bool:
+        return action_backend_requires_candidate_bindings(
+            self.runtime.blackboard.read("action_backend")
+        )
 
     def _runtime_state_summary(self) -> dict[str, Any]:
         obs_id = current_observation_id(self.runtime.blackboard)
@@ -572,7 +649,15 @@ class AgentLoop:
         preflight_errors = list(getattr(self.runtime.blackboard.read("preflight_report"), "errors", []) or [])
         stale_visual_errors = {"stale_perception", "stale_world_state"} & {str(error) for error in preflight_errors}
         next_required_decision = self._next_required_decision_summary(current_stage, preflight_error)
-        target_candidate_required = task_requires_target(self.runtime.blackboard.task_instruction)
+        candidate_bindings_required = self._candidate_bindings_required()
+        target_candidate_required = candidate_bindings_required and task_requires_target(
+            self.runtime.blackboard.task_instruction
+        )
+        visual_state_fresh = (
+            perception_fresh and world_state_fresh
+            if candidate_bindings_required
+            else obs_id is not None
+        )
         return {
             "observation_id": obs_id,
             "observation_present": obs_id is not None,
@@ -585,17 +670,18 @@ class AgentLoop:
             "world_state_observation_id": str(world_state_obs_id) if world_state_obs_id is not None else None,
             "perception_fresh_for_current_observation": perception_fresh,
             "world_state_fresh_for_current_observation": world_state_fresh,
-            "visual_state_fresh_for_current_observation": perception_fresh and world_state_fresh,
-            "stale_visual_state_unresolved": bool(stale_visual_errors) and not (perception_fresh and world_state_fresh),
+            "visual_state_fresh_for_current_observation": visual_state_fresh,
+            "stale_visual_state_unresolved": bool(stale_visual_errors) and not visual_state_fresh,
             "perception_source_candidate_id": getattr(perception, "source_candidate_id", None),
             "perception_target_candidate_id": getattr(perception, "target_candidate_id", None),
             "world_state_source_candidate_id": getattr(world_state, "source_candidate_id", None),
             "world_state_target_candidate_id": getattr(world_state, "target_candidate_id", None),
             "target_candidate_required": target_candidate_required,
+            "candidate_bindings_required": candidate_bindings_required,
             "world_state_needs_reobserve": getattr(world_state, "needs_reobserve", None),
             "world_state_ready": world_state_ready_error is None,
             "world_state_ready_error": world_state_ready_error,
-            "observe_complete": world_state_ready_error is None and perception_fresh and world_state_fresh,
+            "observe_complete": world_state_ready_error is None and visual_state_fresh,
             "grounding_overlay_fresh": self._grounding_overlay_fresh(),
             "task_plan_present": task_plan is not None,
             "task_plan_status": getattr(task_plan, "status", None),
@@ -643,6 +729,12 @@ class AgentLoop:
             perception = blackboard.read("perception")
             if observation is None:
                 return _required_decision("run_skill", current_stage, "vision", "capture_views", reason="missing_observation")
+            if not self._candidate_bindings_required():
+                return _required_decision(
+                    "advance_stage",
+                    None,
+                    reason="current_images_ready_for_direct_vla",
+                )
             if perception is None:
                 return _required_decision("run_skill", current_stage, "vision", "perceive_scene", reason="missing_perception")
             target_required = task_requires_target(self.runtime.blackboard.task_instruction)
@@ -911,6 +1003,7 @@ class AgentLoop:
         if current_stage == "plan" and world_state_error in {
             "missing_world_state",
             "world_state_requires_reobserve",
+            "missing_observation",
             "missing_source_candidate",
             "missing_target_candidate",
         }:
@@ -924,7 +1017,7 @@ class AgentLoop:
     def _emit_action_horizon_error(self, decision: LoopDecision) -> str | None:
         horizon = decision.payload.get("horizon")
         if horizon is None:
-            return "missing_horizon_before_emit_action_chunk"
+            return None
         try:
             horizon_value = int(horizon)
         except (TypeError, ValueError):

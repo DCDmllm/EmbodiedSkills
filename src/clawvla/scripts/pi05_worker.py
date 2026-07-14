@@ -91,6 +91,7 @@ def main() -> None:
                     "status": "pi05_worker_ready",
                     "host": args.host,
                     "port": args.port,
+                    "pid": os.getpid(),
                     "runtime": "openpi_torch_cached",
                 },
                 ensure_ascii=True,

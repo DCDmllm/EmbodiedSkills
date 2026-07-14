@@ -5,6 +5,9 @@ extends:
 
 name: qwen3vl_calvin_xvla_1update
 
+planner_aux:
+  enabled: false
+
 environment:
   python: /mnt/wangwai/miniconda3/envs/calvin-py38/bin/python
   cwd: /mnt/wangwai/vla/clawvla

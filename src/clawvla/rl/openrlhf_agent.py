@@ -4,6 +4,7 @@ import asyncio
 from copy import deepcopy
 import os
 from pathlib import Path
+import re
 import zlib
 from typing import Any
 
@@ -12,6 +13,11 @@ from openrlhf.utils.vlm_utils import process_prompt_with_images
 
 from clawvla.rl.config import load_rl_config
 from clawvla.rl.policy_proxy import PolicyBackend, PolicyGeneration, PolicyProxy
+from clawvla.rl.planner_similarity import (
+    is_build_task_plan_call,
+    load_planner_reference_index,
+    score_predicted_plan,
+)
 from clawvla.rl.rollout_worker import run_rollout_episode
 from clawvla.rl.trajectory import TrajectoryWriter, build_policy_call_adapter
 
@@ -67,12 +73,21 @@ class AgentExecutor(AgentExecutorBase):
             invalid_decision_penalty=self.rl_config.reward.invalid_decision_penalty,
             skill_failure_penalty=self.rl_config.reward.skill_failure_penalty,
         )
+        planner_scores = _planner_call_scores(
+            episode,
+            self.rl_config.planner_aux,
+            enabled_for_sample=bool(metadata.get("planner_reference_available", False)),
+        )
         return _episode_to_call_samples(
             prompt=prompt,
             label=label,
             episode=episode,
             reward_score=reward_score,
             group_uid=_stable_uid(f"{episode.task_name}:{episode.instruction}:{episode.seed}"),
+            planner_scores=planner_scores,
+            planner_advantage_weight=float(self.rl_config.planner_aux.advantage_weight),
+            task_index=int(metadata.get("task_index", 0) or 0),
+            source=str(metadata.get("source") or "configured"),
         )
 
 
@@ -134,7 +149,18 @@ class _OpenRLHFPolicyBackend(PolicyBackend):
         )
 
 
-def _episode_to_call_samples(*, prompt: str, label: str, episode: Any, reward_score: float, group_uid: int) -> list[dict[str, Any]]:
+def _episode_to_call_samples(
+    *,
+    prompt: str,
+    label: str,
+    episode: Any,
+    reward_score: float,
+    group_uid: int,
+    planner_scores: dict[str, float] | None = None,
+    planner_advantage_weight: float = 0.0,
+    task_index: int = 0,
+    source: str = "configured",
+) -> list[dict[str, Any]]:
     if episode.status == "infra_failure":
         raise RuntimeError(f"Episode infra failure must not be used for policy update: {episode.errors}")
     if not episode.policy_calls:
@@ -143,6 +169,13 @@ def _episode_to_call_samples(*, prompt: str, label: str, episode: Any, reward_sc
     episode_uid = _stable_uid(episode.episode_id)
     policy_calls = len(episode.policy_calls)
     samples = []
+    planner_scores = dict(planner_scores or {})
+    episode_logs = _episode_extra_logs(
+        episode,
+        reward_score=reward_score,
+        task_index=task_index,
+        source=source,
+    )
     for call_index, call in enumerate(episode.policy_calls):
         adapter = build_policy_call_adapter(call, require_multimodal_payload=True)
         prompt_ids = adapter["prompt_ids"]
@@ -174,18 +207,110 @@ def _episode_to_call_samples(*, prompt: str, label: str, episode: Any, reward_sc
                 "action_ranges": [(len(prompt_ids), len(prompt_ids) + len(response_ids))],
                 "rollout_log_probs": rollout_log_probs,
                 "extra_logs": {
+                    **episode_logs,
                     "clawvla_group_uid": int(group_uid),
                     "clawvla_episode_uid": int(episode_uid),
                     "clawvla_call_index": int(call_index),
                     "clawvla_policy_calls": int(policy_calls),
                     "clawvla_has_images": int(bool(call.image_refs)),
                     "clawvla_image_count": int(len(call.image_refs)),
+                    "clawvla_is_build_task_plan": int(call.call_id in planner_scores),
+                    "clawvla_plan_score_available": int(call.call_id in planner_scores),
+                    "clawvla_plan_score": float(planner_scores.get(call.call_id, 0.0)),
+                    "clawvla_plan_advantage_weight": float(planner_advantage_weight),
                 },
             }
         )
     if not samples:
         raise ValueError(f"OpenRLHF episode produced no trainable policy calls: episode_id={episode.episode_id}")
     return samples
+
+
+def _episode_extra_logs(
+    episode: Any,
+    *,
+    reward_score: float,
+    task_index: int,
+    source: str,
+) -> dict[str, float | int]:
+    """Build numeric, call-repeated metadata for episode-deduplicated logging."""
+    terminal = next(
+        (reward for reward in reversed(episode.rewards) if reward.family == "episode_terminal"),
+        None,
+    )
+    terminal_metrics = dict(getattr(terminal, "metrics", {}) or {})
+    terminal_events = dict(getattr(terminal, "events", {}) or {})
+    official_success = bool(
+        terminal_events.get(
+            "official_task_success",
+            episode.metadata.get("official_task_success", False),
+        )
+    )
+    family_rewards: dict[str, float] = {}
+    for reward in episode.rewards:
+        family = _safe_metric_component(str(reward.family or "unclassified"))
+        family_rewards[family] = family_rewards.get(family, 0.0) + float(reward.reward)
+
+    terminal_reward = family_rewards.get("episode_terminal", 0.0)
+    logs: dict[str, float | int] = {
+        "clawvla_task_index": int(task_index),
+        "clawvla_official_task_success": int(official_success),
+        "clawvla_task_status_available": int(bool(episode.metadata.get("task_status_available", False))),
+        "clawvla_episode_incomplete": int(terminal_events.get("episode_incomplete", not official_success)),
+        "clawvla_premature_finish": int(terminal_events.get("premature_finish", False)),
+        "clawvla_stalled_loop": int(terminal_events.get("stalled_loop", episode.status == "stalled_loop")),
+        "clawvla_budget_exhausted": int(
+            terminal_events.get(
+                "budget_exhausted",
+                episode.status in {"max_steps_reached", "max_steps_reached_with_failures"},
+            )
+        ),
+        "clawvla_invalid_decisions": float(terminal_metrics.get("invalid_decisions", 0.0) or 0.0),
+        "clawvla_failed_skills": float(terminal_metrics.get("failed_skills", 0.0) or 0.0),
+        "clawvla_recoverable_preflight_failures": float(
+            terminal_metrics.get("recoverable_preflight_failures", 0.0) or 0.0
+        ),
+        "clawvla_skill_calls": float(terminal_metrics.get("skill_calls", len(episode.skill_calls)) or 0.0),
+        "clawvla_episode_reward": float(reward_score),
+        "clawvla_dense_reward": float(reward_score) - terminal_reward,
+        "clawvla_terminal_reward": terminal_reward,
+        "clawvla_source_expert_subgoals": int(source == "expert_subgoals"),
+        "clawvla_source_official_valid_grounding": int(source == "official_valid_grounding"),
+    }
+    logs.update({f"clawvla_reward_family__{family}": value for family, value in family_rewards.items()})
+    return logs
+
+
+def _safe_metric_component(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9_]+", "_", value.strip()).strip("_").lower()
+    return normalized or "unknown"
+
+
+def _planner_call_scores(
+    episode: Any,
+    planner_aux: Any,
+    *,
+    enabled_for_sample: bool,
+) -> dict[str, float]:
+    if not enabled_for_sample or not bool(getattr(planner_aux, "enabled", False)):
+        return {}
+    references = load_planner_reference_index(
+        str(planner_aux.dataset_root),
+        str(planner_aux.repair_ledger),
+        str(planner_aux.split_manifest),
+        str(planner_aux.split_name),
+        int(planner_aux.max_reference_plans_per_task),
+    ).get(str(episode.task_name), ())
+    references = tuple(reference for reference in references if int(reference.seed) == int(episode.seed))
+    if not references:
+        return {}
+    for call in episode.policy_calls:
+        if is_build_task_plan_call(call):
+            score = score_predicted_plan(getattr(call, "parsed_json", None), references)
+            call.metadata["planner_reference_available"] = True
+            call.metadata["planner_semantic_score"] = float(score)
+            return {str(call.call_id): float(score)}
+    return {}
 
 
 def _messages_to_prompt_text(processor: Any, messages: list[dict[str, Any]]) -> str:

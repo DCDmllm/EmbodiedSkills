@@ -9,7 +9,7 @@ from typing import Any
 from ..blackboard_utils import current_observation_id, mark_motion_artifacts_stale
 from ..schema import SafetyReport, SkillRequest, SkillResult
 from ..skills.base import SkillContext, SkillRegistry
-from ..task_semantics import subgoal_requires_target
+from ..task_semantics import action_backend_requires_candidate_bindings, subgoal_requires_target
 from .skill_helpers import get_attr, ok, register_skill
 
 
@@ -77,16 +77,40 @@ def _build_preflight_report(blackboard: Any) -> SafetyReport:
     task_plan = blackboard.read("task_plan")
     current_subgoal = blackboard.read("current_subgoal")
     env = blackboard.read("env_adapter")
+    action_backend = blackboard.read("action_backend")
+    require_candidate_bindings = action_backend_requires_candidate_bindings(action_backend)
     preflight_spec = _preflight_spec(env)
     obs_id = current_observation_id(blackboard)
 
-    _check_task_state(checks, errors, observation, perception, world_state, task_plan, current_subgoal)
-    _check_observation_freshness(checks, errors, obs_id, perception, world_state)
-    _check_object_binding(checks, errors, world_state, current_subgoal)
+    _check_task_state(
+        checks,
+        errors,
+        observation,
+        perception,
+        world_state,
+        task_plan,
+        current_subgoal,
+        require_candidate_bindings=require_candidate_bindings,
+    )
+    _check_observation_freshness(
+        checks,
+        errors,
+        obs_id,
+        perception,
+        world_state,
+        require_candidate_bindings=require_candidate_bindings,
+    )
+    _check_object_binding(
+        checks,
+        errors,
+        world_state,
+        current_subgoal,
+        require_candidate_bindings=require_candidate_bindings,
+    )
     _check_camera_inputs(checks, errors, observation, preflight_spec)
     _check_robot_state(checks, errors, observation, preflight_spec)
     _check_environment(checks, errors, env)
-    _check_action_backend(checks, errors, blackboard.read("action_backend"))
+    _check_action_backend(checks, errors, action_backend)
 
     allowed = not errors
     return SafetyReport(
@@ -111,15 +135,18 @@ def _check_task_state(
     world_state: Any,
     task_plan: Any,
     current_subgoal: Any,
+    *,
+    require_candidate_bindings: bool = True,
 ) -> None:
     missing = []
-    for name, value in {
+    required_state = {
         "observation": observation,
-        "perception": perception,
-        "world_state": world_state,
         "task_plan": task_plan,
         "current_subgoal": current_subgoal,
-    }.items():
+    }
+    if require_candidate_bindings:
+        required_state.update({"perception": perception, "world_state": world_state})
+    for name, value in required_state.items():
         if value is None:
             missing.append(name)
             errors.append(f"missing_{name}")
@@ -129,7 +156,11 @@ def _check_task_state(
     if task_plan is not None and current_subgoal is not None and current_subgoal_id != plan_current_id:
         errors.append("current_subgoal_mismatch_task_plan")
 
-    if world_state is not None and bool(get_attr(world_state, "needs_reobserve", False)):
+    if (
+        require_candidate_bindings
+        and world_state is not None
+        and bool(get_attr(world_state, "needs_reobserve", False))
+    ):
         errors.append("world_state_requires_reobserve")
 
     checks["task_state"] = {
@@ -142,35 +173,77 @@ def _check_task_state(
         "current_subgoal_id": current_subgoal_id,
         "task_plan_current_subgoal_id": plan_current_id,
         "world_state_needs_reobserve": bool(get_attr(world_state, "needs_reobserve", False)),
+        "candidate_bindings_required": require_candidate_bindings,
     }
 
 
-def _check_observation_freshness(checks: dict[str, Any], errors: list[str], obs_id: str | None, perception: Any, world_state: Any) -> None:
+def _check_observation_freshness(
+    checks: dict[str, Any],
+    errors: list[str],
+    obs_id: str | None,
+    perception: Any,
+    world_state: Any,
+    *,
+    require_candidate_bindings: bool = True,
+) -> None:
     perception_obs_id = get_attr(perception, "observation_id")
     world_obs_id = get_attr(get_attr(world_state, "metadata", {}), "observation_id")
     if obs_id is None:
         errors.append("missing_observation_id")
-    if perception is not None and perception_obs_id != obs_id:
+    if require_candidate_bindings and perception is not None and perception_obs_id != obs_id:
         errors.append("stale_perception")
-    if world_state is not None and world_obs_id is not None and world_obs_id != obs_id:
+    if (
+        require_candidate_bindings
+        and world_state is not None
+        and world_obs_id is not None
+        and world_obs_id != obs_id
+    ):
         errors.append("stale_world_state")
     checks["observation_freshness"] = {
         "status": "passed"
         if obs_id is not None
-        and (perception is None or perception_obs_id == obs_id)
-        and (world_state is None or world_obs_id is None or world_obs_id == obs_id)
+        and (
+            not require_candidate_bindings
+            or (
+                (perception is None or perception_obs_id == obs_id)
+                and (world_state is None or world_obs_id is None or world_obs_id == obs_id)
+            )
+        )
         else "failed",
         "observation_id": obs_id,
         "perception_observation_id": perception_obs_id,
         "world_state_observation_id": world_obs_id,
+        "candidate_bindings_required": require_candidate_bindings,
     }
 
 
-def _check_object_binding(checks: dict[str, Any], errors: list[str], world_state: Any, current_subgoal: Any) -> None:
+def _check_object_binding(
+    checks: dict[str, Any],
+    errors: list[str],
+    world_state: Any,
+    current_subgoal: Any,
+    *,
+    require_candidate_bindings: bool = True,
+) -> None:
     subgoal_type = str(get_attr(current_subgoal, "type", "") or "").lower()
     source_id = get_attr(current_subgoal, "source_candidate_id") or get_attr(world_state, "source_candidate_id")
     target_id = get_attr(current_subgoal, "target_candidate_id") or get_attr(world_state, "target_candidate_id")
     target_required = subgoal_requires_target(subgoal_type, get_attr(current_subgoal, "instruction"))
+
+    source = _candidate_by_id(world_state, source_id)
+    target = _candidate_by_id(world_state, target_id)
+    if not require_candidate_bindings:
+        checks["object_binding"] = {
+            "status": "advisory",
+            "subgoal_type": subgoal_type,
+            "source_candidate_id": source_id,
+            "target_candidate_id": target_id,
+            "target_required": False,
+            "candidate_bindings_required": False,
+            "source": _candidate_summary(source),
+            "target": _candidate_summary(target),
+        }
+        return
 
     if not source_id:
         errors.append("missing_source_candidate")
@@ -179,8 +252,6 @@ def _check_object_binding(checks: dict[str, Any], errors: list[str], world_state
     if target_required and source_id and target_id and source_id == target_id:
         errors.append("source_target_same_candidate")
 
-    source = _candidate_by_id(world_state, source_id)
-    target = _candidate_by_id(world_state, target_id)
     _check_candidate("source", source, errors, required=bool(source_id))
     _check_candidate("target", target, errors, required=target_required and bool(target_id))
 
@@ -192,6 +263,7 @@ def _check_object_binding(checks: dict[str, Any], errors: list[str], world_state
         "source_candidate_id": source_id,
         "target_candidate_id": target_id,
         "target_required": target_required,
+        "candidate_bindings_required": True,
         "source": _candidate_summary(source),
         "target": _candidate_summary(target),
     }

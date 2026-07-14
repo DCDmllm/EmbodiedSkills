@@ -1,11 +1,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+import os
 from pathlib import Path
+import random
 from typing import Any
 from uuid import uuid4
 
 import yaml
+
+
+_PROJECT_ROOT_PATH = Path(
+    os.environ.get(
+        "CLAWVLA_PROJECT_ROOT",
+        Path(__file__).resolve().parents[3],
+    )
+).expanduser().resolve()
+_DEFAULT_WORKSPACE_ROOT = (
+    _PROJECT_ROOT_PATH.parent.parent
+    if _PROJECT_ROOT_PATH.parent.name == "vla"
+    else _PROJECT_ROOT_PATH.parent
+)
+PROJECT_ROOT = str(_PROJECT_ROOT_PATH)
+WORKSPACE_ROOT = str(
+    Path(os.environ.get("CLAWVLA_WORKSPACE_ROOT", _DEFAULT_WORKSPACE_ROOT))
+    .expanduser()
+    .resolve()
+)
 
 
 @dataclass
@@ -13,7 +35,7 @@ class EnvCommandConfig:
     python: str
     env: dict[str, str] = field(default_factory=dict)
     unset_env: list[str] = field(default_factory=list)
-    cwd: str = "/mnt/wangwai/vla/clawvla"
+    cwd: str = PROJECT_ROOT
 
 
 @dataclass
@@ -46,6 +68,8 @@ class RolloutEpisodeSpec:
     instruction: str
     seed: int
     params: dict[str, Any] = field(default_factory=dict)
+    source: str = "configured"
+    planner_reference_available: bool = False
 
 
 @dataclass
@@ -65,6 +89,23 @@ class RolloutConfig:
     episode_timeout_s: float = 1800.0
     openpi_port_base: int = 8765
     start_openpi_worker: bool = True
+    persistent_openpi_workers: bool = False
+    openpi_worker_count: int | None = None
+    persistent_robotwin_workers: bool = False
+    robotwin_worker_count: int | None = None
+    robotwin_worker_port_base: int = 18765
+
+
+@dataclass
+class RolloutSeedMixConfig:
+    enabled: bool = False
+    valid_seed_cache_dir: str = (
+        f"{PROJECT_ROOT}/runs/eval/robotwin_train_grounding_valid_seeds_seed2_30/valid_seeds"
+    )
+    expert_plan_ratio: float = 0.6
+    shuffle_seed: int = 42
+    max_grounding_seeds: int | None = None
+    max_prompts: int | None = None
 
 
 @dataclass
@@ -73,11 +114,29 @@ class RewardConfig:
     task_map: dict[str, str] = field(default_factory=dict)
     step_cost: float = 0.05
     incomplete_episode_penalty: float = -1.0
-    premature_finish_penalty: float = -3.0
+    premature_finish_penalty: float = -4.0
+    stalled_loop_penalty: float = -8.0
     invalid_decision_penalty: float = -2.0
     skill_failure_penalty: float = -1.0
     recoverable_preflight_penalty: float = -0.1
     infra_failure_reward: float | None = None
+
+
+@dataclass
+class PlannerAuxConfig:
+    enabled: bool = False
+    dataset_root: str = f"{PROJECT_ROOT}/runs/data/robotwin_expert_subtasks_train_50x50_merged"
+    repair_ledger: str = (
+        f"{PROJECT_ROOT}/runs/data/robotwin_expert_subtasks_train_50x50_merged/annotation_repairs/"
+        "subtask_repairs_gpt-5.6-sol_all_unpolished.jsonl"
+    )
+    split_manifest: str = (
+        f"{PROJECT_ROOT}/runs/data/robotwin_expert_subtasks_train_50x50_merged/splits/"
+        "task_stratified_seed42_val5.json"
+    )
+    split_name: str = "train"
+    advantage_weight: float = 0.2
+    max_reference_plans_per_task: int = 64
 
 
 @dataclass
@@ -94,6 +153,7 @@ class OpenRLHFConfig:
     dtype: str = "bfloat16"
     flash_attention: bool = True
     tensor_parallel_size: int = 2
+    enforce_eager: bool = True
     rollout_n: int = 4
     total_epochs: int = 1
     total_training_steps: int | None = None
@@ -107,6 +167,7 @@ class OpenRLHFConfig:
     gradient_checkpointing: bool = True
     use_remove_padding: bool = True
     learning_rate: float = 1e-6
+    kl_init_coef: float = 1e-3
     actor_ppo_mini_batch_size: int = 4
     actor_ppo_micro_batch_size_per_gpu: int = 1
     actor_ppo_max_token_len_per_gpu: int = 65536
@@ -129,21 +190,25 @@ class ClusterConfig:
 
 @dataclass
 class LoggingConfig:
-    run_root: str = "/mnt/wangwai/vla/clawvla/runs/rl"
-    tmp_root: str = "/mnt/wangwai/vla/clawvla/tmp_runs/rl"
+    run_root: str = f"{PROJECT_ROOT}/runs/rl"
+    tmp_root: str = f"{PROJECT_ROOT}/tmp_runs/rl"
     rich: bool = True
     wandb_mode: str = "disabled"
     wandb_project: str = "clawvla-agent-rl"
     wandb_entity: str | None = None
+    wandb_group: str | None = None
     wandb_tags: list[str] = field(default_factory=list)
+    wandb_sample_log_freq: int = 20
     upload_artifacts: bool = False
 
 
 @dataclass
 class CheckpointConfig:
-    output_dir: str = "/mnt/wangwai/vla/clawvla/checkpoints/rl"
+    output_dir: str = f"{PROJECT_ROOT}/checkpoints/rl"
     save_freq: int = 20
-    keep_last: int = 3
+    # None preserves every periodic checkpoint. A positive integer enables
+    # OpenRLHF's normal checkpoint rotation.
+    keep_last: int | None = 3
     resume: str | None = None
 
 
@@ -153,20 +218,20 @@ class RLConfig:
     run_id: str | None = None
     trainer: EnvCommandConfig = field(
         default_factory=lambda: EnvCommandConfig(
-            python="/mnt/wangwai/vla/clawvla/.venv-openrlhf-py310-cu128/bin/python"
+            python=f"{PROJECT_ROOT}/.venv-openrlhf-py310-cu128/bin/python"
         )
     )
     robotwin: EnvCommandConfig = field(
         default_factory=lambda: EnvCommandConfig(
             python="/mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python",
-            env={"PYTHONPATH": "/mnt/wangwai/tmp_pytorch3d_target:/mnt/wangwai/vla/clawvla/src"},
+            env={"PYTHONPATH": f"/mnt/wangwai/tmp_pytorch3d_target:{PROJECT_ROOT}/src"},
             unset_env=["PYTHONPATH"],
         )
     )
     environment: EnvCommandConfig = field(
         default_factory=lambda: EnvCommandConfig(
             python="/mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python",
-            env={"PYTHONPATH": "/mnt/wangwai/tmp_pytorch3d_target:/mnt/wangwai/vla/clawvla/src"},
+            env={"PYTHONPATH": f"/mnt/wangwai/tmp_pytorch3d_target:{PROJECT_ROOT}/src"},
             unset_env=["PYTHONPATH"],
         )
     )
@@ -174,10 +239,7 @@ class RLConfig:
         default_factory=lambda: EnvCommandConfig(
             python="/mnt/wangwai/miniconda3/envs/openpi-torch-py312/bin/python",
             env={
-                "PYTHONPATH": (
-                    "/mnt/linyutong/wangwai_mirror/vla/clawvla/src:"
-                    "/mnt/linyutong/wangwai_mirror/pi0.5/src"
-                )
+                "PYTHONPATH": f"{PROJECT_ROOT}/src:{WORKSPACE_ROOT}/pi0.5/src"
             },
         )
     )
@@ -186,13 +248,13 @@ class RLConfig:
     )
     rollout: RolloutConfig = field(
         default_factory=lambda: RolloutConfig(
-            base_config=(
-                "/mnt/linyutong/wangwai_mirror/vla/clawvla/configs/robotwin_pi05_subtasks_25k.json"
-            ),
+            base_config=f"{PROJECT_ROOT}/configs/robotwin_pi05_subtasks_25k.json",
             instruction="place the container on the plate",
         )
     )
     reward: RewardConfig = field(default_factory=RewardConfig)
+    planner_aux: PlannerAuxConfig = field(default_factory=PlannerAuxConfig)
+    rollout_seed_mix: RolloutSeedMixConfig = field(default_factory=RolloutSeedMixConfig)
     openrlhf: OpenRLHFConfig = field(default_factory=OpenRLHFConfig)
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
@@ -234,7 +296,23 @@ def _load_yaml(path: Path) -> dict[str, Any]:
         payload = yaml.safe_load(handle)
     if not isinstance(payload, dict):
         raise ValueError(f"RL config must be a YAML object: {path}")
-    return payload
+    return _expand_config_value(payload)
+
+
+def _expand_config_value(value: Any) -> Any:
+    """Resolve portable repository tokens and ordinary environment variables."""
+    if isinstance(value, dict):
+        return {key: _expand_config_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_config_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_expand_config_value(item) for item in value)
+    if not isinstance(value, str):
+        return value
+    expanded = value.replace("${PROJECT_ROOT}", PROJECT_ROOT).replace(
+        "${WORKSPACE_ROOT}", WORKSPACE_ROOT
+    )
+    return os.path.expandvars(expanded)
 
 
 def _rl_config(payload: dict[str, Any]) -> RLConfig:
@@ -250,6 +328,10 @@ def _rl_config(payload: dict[str, Any]) -> RLConfig:
         policy=_dataclass_from_dict(PolicyConfig, payload.get("policy"), RLConfig().policy),
         rollout=rollout,
         reward=_dataclass_from_dict(RewardConfig, payload.get("reward"), RLConfig().reward),
+        planner_aux=_dataclass_from_dict(PlannerAuxConfig, payload.get("planner_aux"), RLConfig().planner_aux),
+        rollout_seed_mix=_dataclass_from_dict(
+            RolloutSeedMixConfig, payload.get("rollout_seed_mix"), RLConfig().rollout_seed_mix
+        ),
         openrlhf=_dataclass_from_dict(OpenRLHFConfig, payload.get("openrlhf"), RLConfig().openrlhf),
         cluster=_dataclass_from_dict(ClusterConfig, payload.get("cluster"), RLConfig().cluster),
         logging=_dataclass_from_dict(LoggingConfig, payload.get("logging"), RLConfig().logging),
@@ -259,6 +341,8 @@ def _rl_config(payload: dict[str, Any]) -> RLConfig:
 
 
 def build_rollout_episode_specs(config: RLConfig) -> list[RolloutEpisodeSpec]:
+    if config.rollout_seed_mix.enabled:
+        return _build_online_seed_mix_specs(config)
     specs: list[RolloutEpisodeSpec] = []
     tasks = rollout_tasks(config)
     for task_index, task in enumerate(tasks):
@@ -290,6 +374,130 @@ def build_rollout_episode_specs(config: RLConfig) -> list[RolloutEpisodeSpec]:
         )
         for index in range(count)
     ]
+
+
+def _build_online_seed_mix_specs(config: RLConfig) -> list[RolloutEpisodeSpec]:
+    from .planner_similarity import load_planner_reference_index
+
+    ratio = float(config.rollout_seed_mix.expert_plan_ratio)
+    if not 0 < ratio <= 1:
+        raise ValueError(f"rollout_seed_mix.expert_plan_ratio must be in (0, 1], got {ratio}")
+    if not config.planner_aux.enabled:
+        raise ValueError("rollout_seed_mix requires planner_aux.enabled=true")
+
+    tasks = rollout_tasks(config)
+    task_indices = {task.task_name: index for index, task in enumerate(tasks)}
+    references = load_planner_reference_index(
+        config.planner_aux.dataset_root,
+        config.planner_aux.repair_ledger,
+        config.planner_aux.split_manifest,
+        config.planner_aux.split_name,
+        config.planner_aux.max_reference_plans_per_task,
+    )
+    expert_specs = [
+        RolloutEpisodeSpec(
+            index=0,
+            task_index=task_indices[reference.task_name],
+            task_name=reference.task_name,
+            instruction=reference.task_instruction,
+            seed=reference.seed,
+            params={},
+            source="expert_subgoals",
+            planner_reference_available=True,
+        )
+        for task_name in task_indices
+        for reference in references.get(task_name, ())
+    ]
+    if not expert_specs:
+        raise ValueError("rollout_seed_mix found no expert plan episodes in the configured split")
+
+    grounding_specs = _load_valid_seed_specs(
+        Path(config.rollout_seed_mix.valid_seed_cache_dir),
+        tasks,
+        shuffle_seed=int(config.rollout_seed_mix.shuffle_seed),
+    )
+    grounding_count = round(len(expert_specs) * (1.0 - ratio) / ratio)
+    if config.rollout_seed_mix.max_grounding_seeds is not None:
+        grounding_count = min(grounding_count, max(0, int(config.rollout_seed_mix.max_grounding_seeds)))
+    if grounding_count > len(grounding_specs):
+        raise ValueError(
+            "rollout_seed_mix does not have enough distinct grounding seeds: "
+            f"need={grounding_count} available={len(grounding_specs)}"
+        )
+
+    mixed = [*expert_specs, *grounding_specs[:grounding_count]]
+    random.Random(int(config.rollout_seed_mix.shuffle_seed)).shuffle(mixed)
+    if config.rollout_seed_mix.max_prompts is not None:
+        max_prompts = int(config.rollout_seed_mix.max_prompts)
+        if max_prompts <= 0:
+            raise ValueError(f"rollout_seed_mix.max_prompts must be positive, got {max_prompts}")
+        mixed = mixed[:max_prompts]
+    return [
+        RolloutEpisodeSpec(
+            index=index,
+            task_index=spec.task_index,
+            task_name=spec.task_name,
+            instruction=spec.instruction,
+            seed=spec.seed,
+            params=dict(spec.params),
+            source=spec.source,
+            planner_reference_available=spec.planner_reference_available,
+        )
+        for index, spec in enumerate(mixed)
+    ]
+
+
+def _load_valid_seed_specs(
+    cache_dir: Path,
+    tasks: list[RolloutTaskConfig],
+    *,
+    shuffle_seed: int,
+) -> list[RolloutEpisodeSpec]:
+    cache_dir = cache_dir.expanduser().resolve()
+    if (cache_dir / "valid_seeds").is_dir():
+        cache_dir = cache_dir / "valid_seeds"
+    per_task: dict[str, list[RolloutEpisodeSpec]] = {}
+    for task_index, task in enumerate(tasks):
+        path = cache_dir / f"{task.task_name}.json"
+        if not path.is_file():
+            raise FileNotFoundError(f"missing valid seed cache for {task.task_name}: {path}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        entries = payload.get("valid") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
+            raise ValueError(f"valid seed cache has no valid[] list: {path}")
+        task_specs = []
+        seen: set[int] = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or "seed" not in entry:
+                continue
+            seed = int(entry["seed"])
+            if seed in seen:
+                continue
+            seen.add(seed)
+            task_specs.append(
+                RolloutEpisodeSpec(
+                    index=0,
+                    task_index=task_index,
+                    task_name=task.task_name,
+                    instruction=str(entry.get("instruction") or task.instruction),
+                    seed=seed,
+                    params={},
+                    source="official_valid_grounding",
+                    planner_reference_available=False,
+                )
+            )
+        random.Random(int(shuffle_seed) + task_index).shuffle(task_specs)
+        per_task[task.task_name] = task_specs
+
+    # Round-robin keeps the selected grounding subset balanced over all tasks.
+    ordered: list[RolloutEpisodeSpec] = []
+    max_count = max((len(items) for items in per_task.values()), default=0)
+    for item_index in range(max_count):
+        for task in tasks:
+            items = per_task[task.task_name]
+            if item_index < len(items):
+                ordered.append(items[item_index])
+    return ordered
 
 
 def rollout_tasks(config: RLConfig) -> list[RolloutTaskConfig]:

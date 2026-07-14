@@ -91,6 +91,7 @@ Episode-level penalties are also explicit:
 ```text
 incomplete_episode_penalty
 premature_finish_penalty
+stalled_loop_penalty
 invalid_decision_penalty
 skill_failure_penalty
 recoverable_preflight_penalty
@@ -104,12 +105,18 @@ Infrastructure failures are separated from bad trajectories. Bad model decisions
 Main current OpenRLHF config:
 
 ```text
+configs/rl/qwen3vl_pi05_online_seed_mix_grpo.yaml
 configs/rl/qwen3vl_pi05_multitask_1update.yaml
 configs/rl/qwen3vl_pi05_libero_multitask_1update.yaml
 configs/rl/qwen3vl_groot_robocasa_1update.yaml
 configs/rl/qwen3vl_calvin_xvla_1update.yaml
 configs/rl/rynnbrain2b_pi05_real_1update.yaml
 ```
+
+The RoboTwin online seed-mix config needs no offline grounding dataset. It combines exact expert task/seed/instruction
+episodes (which have Planner references) with precomputed official valid seeds (grounding-only). Grounding-only groups
+still receive the complete environment reward, while the Planner auxiliary score is masked. The current 60:40 mix expands
+to 3727 prompts and 14908 rollouts at `rollout_n=4`.
 
 Useful smoke configs:
 
@@ -144,8 +151,9 @@ configs/rl/rewards/calvin.yaml
 Dry run:
 
 ```bash
-cd /mnt/wangwai/vla/clawvla
+cd /path/to/clawvla
 ./scripts/run_clawvla_rl.sh --mode dry-run
+./scripts/run_clawvla_rl.sh --config configs/rl/qwen3vl_pi05_online_seed_mix_grpo.yaml --mode dry-run
 ./scripts/run_clawvla_rl.sh --preset libero-multitask --mode dry-run
 ./scripts/run_clawvla_rl.sh --preset robocasa-rollout --mode dry-run
 ./scripts/run_clawvla_rl.sh --preset calvin-xvla --mode dry-run
@@ -199,7 +207,7 @@ Generated run directories, Hydra outputs, logs, checkpoints, W&B output, and pyc
 Focused local tests:
 
 ```bash
-cd /mnt/wangwai/vla/clawvla
+cd /path/to/clawvla
 PYTHONPATH=src /mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python -m pytest tests/test_rl_framework.py -q
 ```
 

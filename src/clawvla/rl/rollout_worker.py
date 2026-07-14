@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import os
 from pathlib import Path
+import socket
+import subprocess
 from typing import Any
 
 from .config import RLConfig, load_rl_config
@@ -37,7 +40,8 @@ def run_rollout_episode(
             "policy_base_url": policy_base_url,
         },
     )
-    openpi_port = _allocate_openpi_port(config, run_dir)
+    rollout_lane = _allocate_rollout_lane(config, run_dir)
+    openpi_port = _openpi_port_for_lane(config, rollout_lane)
     config_path = _write_agent_config(
         config,
         run_dir=run_dir,
@@ -46,6 +50,7 @@ def run_rollout_episode(
         seed=seed,
         policy_base_url=policy_base_url,
         openpi_port=openpi_port,
+        rollout_lane=rollout_lane,
         task_name=task_name,
         instruction=instruction,
         task_params=task_params,
@@ -84,17 +89,34 @@ def run_rollout_episode(
         "CLAWVLA_RL_REWARD_TASK_MAP": json.dumps(config.reward.task_map, ensure_ascii=True),
     }
     if config.cluster.robotwin_gpus:
-        env_extra["CUDA_VISIBLE_DEVICES"] = ",".join(str(item) for item in config.cluster.robotwin_gpus)
+        env_extra["CUDA_VISIBLE_DEVICES"] = _gpu_for_rollout_lane(config.cluster.robotwin_gpus, rollout_lane)
     env = command_env(environment_cmd, env_extra)
-    completed = run_logged_subprocess(
-        command,
-        cwd=environment_cmd.cwd,
-        log_path=log_path,
-        env=env,
-        timeout=config.rollout.episode_timeout_s,
-        writer=writer,
-        event_prefix="clawvla_rl_agent",
-    )
+    robotwin_ports = _service_pool_ports("CLAWVLA_ROBOTWIN_POOL_PORTS")
+    if robotwin_ports:
+        robotwin_port = robotwin_ports[rollout_lane % len(robotwin_ports)]
+        completed = _run_persistent_robotwin_episode(
+            port=robotwin_port,
+            config_path=config_path,
+            instruction=instruction,
+            artifact_prefix=artifact_prefix,
+            initial_stage=config.rollout.initial_stage,
+            max_steps=config.rollout.max_steps,
+            result_path=result_path,
+            log_path=log_path,
+            env_extra=env_extra,
+            run_environment=_should_run_environment(config),
+            timeout_s=config.rollout.episode_timeout_s,
+        )
+    else:
+        completed = run_logged_subprocess(
+            command,
+            cwd=environment_cmd.cwd,
+            log_path=log_path,
+            env=env,
+            timeout=config.rollout.episode_timeout_s,
+            writer=writer,
+            event_prefix="clawvla_rl_agent",
+        )
     episode.artifacts.update({
         "agent_log": str(log_path),
         "result_json": str(result_path),
@@ -113,8 +135,9 @@ def run_rollout_episode(
     if result_path.exists():
         payload = json.loads(result_path.read_text(encoding="utf-8"))
         _populate_episode_from_result(episode, payload)
-        _populate_episode_rewards(episode, reward_path)
-        _append_episode_terminal_reward(episode, reward_path, config)
+        if episode.status != "infra_failure":
+            _populate_episode_rewards(episode, reward_path)
+            _append_episode_terminal_reward(episode, reward_path, config)
     else:
         episode.status = "infra_failure"
         episode.errors.append(f"missing_result_json:{result_path}")
@@ -160,6 +183,7 @@ def _write_agent_config(
     seed: int,
     policy_base_url: str,
     openpi_port: int,
+    rollout_lane: int = 0,
     task_name: str,
     instruction: str,
     task_params: dict[str, Any] | None = None,
@@ -195,7 +219,7 @@ def _write_agent_config(
             "request_timeout": config.policy.request_timeout,
             "reasoning_effort": None,
         }
-    _override_action_backend_runtime(base, config, openpi_port)
+    _override_action_backend_runtime(base, config, openpi_port, rollout_lane)
     path = run_dir / "artifacts" / episode.episode_id / "agent_config.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(base, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
@@ -208,7 +232,8 @@ def _should_run_environment(config: RLConfig) -> bool:
     return bool(config.rollout.run_robotwin)
 
 
-def _allocate_openpi_port(config: RLConfig, run_dir: Path) -> int:
+def _allocate_rollout_lane(config: RLConfig, run_dir: Path) -> int:
+    del config
     artifact_dir = run_dir / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     lock_path = artifact_dir / "openpi_ports.lock"
@@ -217,43 +242,141 @@ def _allocate_openpi_port(config: RLConfig, run_dir: Path) -> int:
         handle.seek(0)
         text = handle.read().strip()
         next_offset = int(text) if text else 0
-        port = int(config.rollout.openpi_port_base) + next_offset
-        if port > 65535:
-            raise RuntimeError(f"openpi_port_range_exhausted: base={config.rollout.openpi_port_base}")
         handle.seek(0)
         handle.truncate()
         handle.write(str(next_offset + 1))
         handle.flush()
         fcntl.flock(handle, fcntl.LOCK_UN)
+    return next_offset
+
+
+def _allocate_openpi_port(config: RLConfig, run_dir: Path) -> int:
+    """Compatibility wrapper for callers that only need a unique/pool port."""
+    return _openpi_port_for_lane(config, _allocate_rollout_lane(config, run_dir))
+
+
+def _openpi_port_for_lane(config: RLConfig, rollout_lane: int) -> int:
+    ports = _service_pool_ports("CLAWVLA_OPENPI_POOL_PORTS")
+    if ports:
+        return ports[int(rollout_lane) % len(ports)]
+    port = int(config.rollout.openpi_port_base) + int(rollout_lane)
+    if port > 65535:
+        raise RuntimeError(f"openpi_port_range_exhausted: base={config.rollout.openpi_port_base}")
     return port
 
 
-def _override_action_backend_runtime(base: dict[str, Any], config: RLConfig, openpi_port: int) -> None:
+def _service_pool_ports(name: str) -> list[int]:
+    raw = str(os.environ.get(name) or "").strip()
+    if not raw:
+        return []
+    ports = [int(item.strip()) for item in raw.split(",") if item.strip()]
+    if not ports or any(port <= 0 or port > 65535 for port in ports):
+        raise ValueError(f"Invalid {name}: {raw!r}")
+    return ports
+
+
+def _run_persistent_robotwin_episode(
+    *,
+    port: int,
+    config_path: Path,
+    instruction: str,
+    artifact_prefix: str,
+    initial_stage: str,
+    max_steps: int,
+    result_path: Path,
+    log_path: Path,
+    env_extra: dict[str, str],
+    run_environment: bool,
+    timeout_s: float,
+) -> subprocess.CompletedProcess[str]:
+    request = {
+        "op": "run",
+        "config_path": str(config_path),
+        "instruction": instruction,
+        "artifact_prefix": artifact_prefix,
+        "initial_stage": initial_stage,
+        "max_steps": int(max_steps),
+        "result_output": str(result_path),
+        "log_path": str(log_path),
+        "run_environment": bool(run_environment),
+        "initial_observe": False,
+        "env": dict(env_extra),
+    }
+    command = ["persistent_robotwin_lane", f"127.0.0.1:{int(port)}"]
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=min(30.0, timeout_s)) as connection:
+            connection.settimeout(float(timeout_s))
+            stream = connection.makefile("rwb")
+            stream.write((json.dumps(request, ensure_ascii=True) + "\n").encode("utf-8"))
+            stream.flush()
+            line = stream.readline()
+        if not line:
+            raise ConnectionError(f"RoboTwin lane {port} closed without a response")
+        response = json.loads(line.decode("utf-8"))
+        if not response.get("ok"):
+            _append_lane_error(log_path, response)
+            return subprocess.CompletedProcess(command, 1, json.dumps(response), "")
+        return subprocess.CompletedProcess(command, 0, json.dumps(response), "")
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "status": "persistent_robotwin_request_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "port": int(port),
+        }
+        _append_lane_error(log_path, payload)
+        return subprocess.CompletedProcess(command, 1, json.dumps(payload), "")
+
+
+def _append_lane_error(log_path: Path, payload: dict[str, Any]) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+def _override_action_backend_runtime(
+    base: dict[str, Any],
+    config: RLConfig,
+    openpi_port: int,
+    rollout_lane: int,
+) -> None:
     action_backend = base.setdefault("metadata", {}).setdefault("action_backend", {})
     if not isinstance(action_backend, dict):
         return
     backend_type = str(action_backend.get("type", "pi05")).lower()
     if backend_type in {"pi05", "pi0.5", "pi_05"}:
-        _override_openpi_runtime(action_backend, config, openpi_port)
+        _override_openpi_runtime(action_backend, config, openpi_port, rollout_lane)
         return
     if backend_type in {"groot", "gr00t", "gr00t_n1_5", "gr00t-n1.5"}:
-        _override_groot_runtime(action_backend, config, openpi_port)
+        _override_groot_runtime(action_backend, config, openpi_port, rollout_lane)
         return
 
 
-def _override_openpi_runtime(action_backend: dict[str, Any], config: RLConfig, openpi_port: int) -> None:
+def _override_openpi_runtime(
+    action_backend: dict[str, Any],
+    config: RLConfig,
+    openpi_port: int,
+    rollout_lane: int,
+) -> None:
     runtime = action_backend.setdefault("openpi_runtime", {})
     if not isinstance(runtime, dict):
         return
     runtime["conda_env"] = "openpi-torch-py312"
-    runtime["auto_start"] = bool(config.rollout.start_openpi_worker)
+    runtime["auto_start"] = bool(config.rollout.start_openpi_worker) and not bool(
+        _service_pool_ports("CLAWVLA_OPENPI_POOL_PORTS")
+    )
     runtime["pythonpath"] = config.openpi.env.get("PYTHONPATH", runtime.get("pythonpath"))
     runtime["port"] = int(openpi_port)
     if config.cluster.openpi_gpus:
-        runtime["cuda_visible_devices"] = ",".join(str(item) for item in config.cluster.openpi_gpus)
+        runtime["cuda_visible_devices"] = _gpu_for_rollout_lane(config.cluster.openpi_gpus, rollout_lane)
 
 
-def _override_groot_runtime(action_backend: dict[str, Any], config: RLConfig, openpi_port: int) -> None:
+def _override_groot_runtime(
+    action_backend: dict[str, Any],
+    config: RLConfig,
+    openpi_port: int,
+    rollout_lane: int,
+) -> None:
     runtime = action_backend.setdefault("runtime", {})
     if not isinstance(runtime, dict):
         return
@@ -263,7 +386,13 @@ def _override_groot_runtime(action_backend: dict[str, Any], config: RLConfig, op
     if config.environment.env.get("PYTHONPATH"):
         runtime.setdefault("pythonpath", config.environment.env["PYTHONPATH"])
     if config.cluster.openpi_gpus:
-        runtime["cuda_visible_devices"] = ",".join(str(item) for item in config.cluster.openpi_gpus)
+        runtime["cuda_visible_devices"] = _gpu_for_rollout_lane(config.cluster.openpi_gpus, rollout_lane)
+
+
+def _gpu_for_rollout_lane(gpus: list[int], rollout_lane: int) -> str:
+    if not gpus:
+        raise ValueError("cannot select a rollout GPU from an empty list")
+    return str(gpus[int(rollout_lane) % len(gpus)])
 
 
 def _populate_episode_from_result(episode: EpisodeRecord, payload: dict[str, Any]) -> None:
@@ -273,6 +402,10 @@ def _populate_episode_from_result(episode: EpisodeRecord, payload: dict[str, Any
     episode.metadata["task_status"] = dict(task_status)
     episode.metadata["official_task_success"] = bool(task_status.get("success", False))
     episode.metadata["task_status_available"] = bool(task_status.get("available", bool(task_status)))
+    task_status_reason = str(task_status.get("reason") or "")
+    if not episode.metadata["task_status_available"] and task_status_reason.startswith("task_status_failed:"):
+        episode.status = "infra_failure"
+        episode.errors.append(task_status_reason)
     if loop.get("reason"):
         episode.metadata["loop_reason"] = loop.get("reason")
     for item in loop.get("steps") or []:
@@ -280,14 +413,20 @@ def _populate_episode_from_result(episode: EpisodeRecord, payload: dict[str, Any
             continue
         decision = item.get("decision") if isinstance(item.get("decision"), dict) else {}
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        record_status = str(item.get("status") or result.get("status") or "")
         episode.skill_calls.append(
             SkillCallTrace(
                 step_index=item.get("step_index"),
                 stage=item.get("stage_before"),
                 component=str(decision.get("next_component") or ""),
                 skill=str(decision.get("next_skill") or ""),
-                status=str(item.get("status") or result.get("status") or ""),
-                success=bool(result.get("success")),
+                status=record_status,
+                success=bool(result.get("success")) and record_status not in {
+                    "invalid_decision",
+                    "scheduler_failed",
+                    "skill_exception",
+                    "skill_failed",
+                },
                 errors=[str(error) for error in result.get("errors") or []],
                 output_keys=sorted(str(key) for key in (result.get("output") or {}).keys())
                 if isinstance(result.get("output"), dict)
@@ -333,11 +472,15 @@ RECOVERABLE_PREFLIGHT_ERRORS = {
 
 
 def _append_episode_terminal_reward(episode: EpisodeRecord, reward_path: Path, config: RLConfig) -> None:
-    invalid_decisions = sum(1 for skill in episode.skill_calls if skill.status == "invalid_decision")
-    recoverable_preflight_failures = sum(1 for skill in episode.skill_calls if _is_recoverable_preflight_failure(skill))
+    stalled_loop = episode.status == "stalled_loop"
+    budget_exhausted = episode.status in {"max_steps_reached", "max_steps_reached_with_failures"}
+    stalled_or_exhausted = stalled_loop or budget_exhausted
+    penalty_skill_calls = _skill_calls_excluding_stall_trigger(episode)
+    invalid_decisions = sum(1 for skill in penalty_skill_calls if skill.status == "invalid_decision")
+    recoverable_preflight_failures = sum(1 for skill in penalty_skill_calls if _is_recoverable_preflight_failure(skill))
     failed_skills = sum(
         1
-        for skill in episode.skill_calls
+        for skill in penalty_skill_calls
         if skill.status != "invalid_decision" and not skill.success and not _is_recoverable_preflight_failure(skill)
     )
     official_success, success_source = _episode_task_success(episode, config)
@@ -345,8 +488,13 @@ def _append_episode_terminal_reward(episode: EpisodeRecord, reward_path: Path, c
     incomplete = not official_success
     premature_finish = bool(loop_finished and not official_success)
     penalty = (
-        (float(config.reward.incomplete_episode_penalty) if incomplete else 0.0)
+        (float(config.reward.incomplete_episode_penalty) if incomplete and not stalled_or_exhausted else 0.0)
         + (float(config.reward.premature_finish_penalty) if premature_finish else 0.0)
+        + (
+            float(config.reward.stalled_loop_penalty)
+            if stalled_or_exhausted and not official_success
+            else 0.0
+        )
         + invalid_decisions * float(config.reward.invalid_decision_penalty)
         + failed_skills * float(config.reward.skill_failure_penalty)
         + recoverable_preflight_failures * float(config.reward.recoverable_preflight_penalty)
@@ -361,6 +509,8 @@ def _append_episode_terminal_reward(episode: EpisodeRecord, reward_path: Path, c
             episode.status,
             incomplete,
             premature_finish,
+            stalled_loop,
+            budget_exhausted,
             invalid_decisions,
             failed_skills,
             recoverable_preflight_failures,
@@ -371,6 +521,8 @@ def _append_episode_terminal_reward(episode: EpisodeRecord, reward_path: Path, c
             "official_task_success": official_success,
             "episode_incomplete": incomplete,
             "premature_finish": premature_finish,
+            "stalled_loop": stalled_loop,
+            "budget_exhausted": budget_exhausted,
             "invalid_decision_seen": invalid_decisions > 0,
             "skill_failure_seen": failed_skills > 0,
             "recoverable_preflight_failure_seen": recoverable_preflight_failures > 0,
@@ -380,10 +532,13 @@ def _append_episode_terminal_reward(episode: EpisodeRecord, reward_path: Path, c
             "loop_finished": 1.0 if loop_finished else 0.0,
             "official_task_success": 1.0 if official_success else 0.0,
             "premature_finish": 1.0 if premature_finish else 0.0,
+            "stalled_loop": 1.0 if stalled_loop else 0.0,
+            "budget_exhausted": 1.0 if budget_exhausted else 0.0,
             "invalid_decisions": float(invalid_decisions),
             "failed_skills": float(failed_skills),
             "recoverable_preflight_failures": float(recoverable_preflight_failures),
             "skill_calls": float(len(episode.skill_calls)),
+            "penalized_skill_calls": float(len(penalty_skill_calls)),
         },
         metadata={
             "episode_status": episode.status,
@@ -426,6 +581,8 @@ def _terminal_reward_reason(
     status: str,
     incomplete: bool,
     premature_finish: bool,
+    stalled_loop: bool,
+    budget_exhausted: bool,
     invalid_decisions: int,
     failed_skills: int,
     recoverable_preflight_failures: int = 0,
@@ -435,6 +592,10 @@ def _terminal_reward_reason(
         parts.append("incomplete_episode=1")
     if premature_finish:
         parts.append("premature_finish=1")
+    if stalled_loop:
+        parts.append("stalled_loop=1")
+    if budget_exhausted:
+        parts.append("budget_exhausted=1")
     if invalid_decisions:
         parts.append(f"invalid_decisions={invalid_decisions}")
     if failed_skills:
@@ -442,6 +603,18 @@ def _terminal_reward_reason(
     if recoverable_preflight_failures:
         parts.append(f"recoverable_preflight_failures={recoverable_preflight_failures}")
     return ";".join(parts)
+
+
+def _skill_calls_excluding_stall_trigger(episode: EpisodeRecord) -> list[SkillCallTrace]:
+    calls = list(episode.skill_calls)
+    reason = str(episode.metadata.get("loop_reason") or "")
+    if episode.status != "stalled_loop" or not reason.startswith("repeated_failed_skill:") or len(calls) < 5:
+        return calls
+    tail = calls[-5:]
+    signature = {(call.component, call.skill, call.status, call.success) for call in tail}
+    if len(signature) == 1 and (not tail[0].success or tail[0].status == "invalid_decision"):
+        return calls[:-5]
+    return calls
 
 
 def _episode_task_success(episode: EpisodeRecord, config: RLConfig) -> tuple[bool, str]:

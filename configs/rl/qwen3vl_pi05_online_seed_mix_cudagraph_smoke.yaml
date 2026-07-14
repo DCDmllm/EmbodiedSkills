@@ -1,0 +1,19 @@
+extends:
+  - qwen3vl_pi05_online_seed_mix_smoke.yaml
+
+name: qwen3vl_pi05_online_seed_mix_cudagraph_smoke
+
+rollout:
+  max_steps: 2
+  artifact_prefix: clawvla_rl_online_seed_mix_cudagraph_smoke
+  openpi_port_base: 9765
+
+openrlhf:
+  enforce_eager: false
+
+checkpoint:
+  save_freq: 9999
+  keep_last: 1
+
+metadata:
+  notes: Four TP=1 CUDA Graph rollout engines, two real agent steps, one optimizer update, and no ZeRO optimizer checkpoint.

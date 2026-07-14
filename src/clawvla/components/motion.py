@@ -14,6 +14,7 @@ from ..blackboard_utils import (
 from ..notices import emit_human_trace
 from ..schema import ActionChunk, MotionGoal, SkillRequest, SkillResult
 from ..skills.base import SkillContext, SkillRegistry
+from ..task_semantics import action_backend_requires_candidate_bindings
 from .skill_helpers import get_attr, ok, register_skill, to_dict, unavailable
 
 
@@ -28,6 +29,7 @@ def register_motion_skills(registry: SkillRegistry) -> None:
 def build_motion_goal(request: SkillRequest, context: SkillContext) -> SkillResult:
     blackboard = context.blackboard
     world_state = blackboard.read("world_state")
+    action_backend = blackboard.read("action_backend")
     payload = request.payload
     current_subgoal = blackboard.read("current_subgoal")
     source_candidate_id = (
@@ -43,6 +45,17 @@ def build_motion_goal(request: SkillRequest, context: SkillContext) -> SkillResu
     source = world_state.candidate_by_id(source_candidate_id) if world_state is not None else None
     target = world_state.candidate_by_id(target_candidate_id) if world_state is not None else None
     target_handle = _target_handle(source, target)
+    if (
+        target_handle.get("target_type") == "missing_visual_target"
+        and not action_backend_requires_candidate_bindings(action_backend)
+    ):
+        target_handle = {
+            "target_type": "image_grounded",
+            "grounding_mode": "subgoal_text_and_current_images",
+            "candidate_bindings_required": False,
+            "requires_controller": False,
+            "requires_visual_servo_or_vla": True,
+        }
     if target_handle.get("target_type") == "missing_visual_target":
         blackboard.write(
             "last_motion_error",

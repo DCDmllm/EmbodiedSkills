@@ -14,7 +14,7 @@ import pytest
 from clawvla.agent_loop import AgentLoop, AgentLoopConfig
 from clawvla.action_backends.pi05 import _resolve_prompt
 from clawvla.config import EnvironmentConfig, RobotwinConfig, load_config
-from clawvla.components.motion import _vla_prompt, execute_action
+from clawvla.components.motion import _vla_prompt, build_motion_goal, execute_action, plan_motion
 from clawvla.components.recovery import build_retry_request, decide_recovery
 from clawvla.components.safety import preflight_action
 from clawvla.components.scheduler import (
@@ -39,7 +39,7 @@ from clawvla.notices import _collect_markers
 from clawvla.blackboard import Blackboard
 from clawvla.components.state import update_world_state
 from clawvla.phase_policy import PhasePolicy
-from clawvla.rl.config import build_rollout_episode_specs, load_rl_config
+from clawvla.rl.config import PROJECT_ROOT, RolloutTaskConfig, build_rollout_episode_specs, load_rl_config
 from clawvla.rl.openrlhf_runner import (
     _openrlhf_env,
     _openrlhf_train_command,
@@ -47,19 +47,37 @@ from clawvla.rl.openrlhf_runner import (
     _write_prompt_dataset,
 )
 from clawvla.rl.openrlhf_runtime_patches import (
+    _align_batched_kwargs_by_modality,
     _align_experience_indices_by_modality,
+    _balanced_sample_assignments,
+    _compute_clawvla_rollout_metrics,
     _dispatch_forward_by_modality,
     _experience_modality,
+    _empty_cuda_cache_before_actor_step,
     _flatten_agent_outputs,
     _pad_indices_for_actor_group,
+    _masked_mean_with_empty_zero,
+    _valid_action_sample_count,
+    _patch_samples_generator_shard_group_rollouts,
     _patch_samples_generator_preserve_clawvla_rollout_batches,
     _replay_buffer_has_mixed_modalities,
     _split_indices_by_modality,
     _shape_episode_rewards,
+    _shape_planner_call_advantages,
 )
+from clawvla.rl.planner_similarity import (
+    PlannerReference,
+    load_planner_reference_index,
+    ordered_plan_similarity,
+    score_predicted_plan,
+)
+from clawvla.rl.persistent_services import rollout_service_specs
 from clawvla.rl.rollout_worker import (
     _append_episode_terminal_reward,
+    _gpu_for_rollout_lane,
+    _openpi_port_for_lane,
     _populate_episode_from_result,
+    _service_pool_ports,
     _should_run_environment,
     _write_agent_config,
 )
@@ -86,6 +104,7 @@ from clawvla.task_semantics import task_requires_target
 from clawvla.rl.trajectory import (
     EpisodeRecord,
     PolicyCallTrace,
+    RewardRecord,
     SkillCallTrace,
     TrajectoryWriter,
     build_policy_call_adapter,
@@ -130,6 +149,23 @@ def test_load_default_rl_config() -> None:
         "up_proj",
         "down_proj",
     ]
+    assert config.trainer.cwd == PROJECT_ROOT
+    assert config.trainer.python == f"{PROJECT_ROOT}/.venv-openrlhf-py310-cu128/bin/python"
+    assert "${PROJECT_ROOT}" not in config.planner_aux.dataset_root
+    assert config.rollout.base_config == f"{PROJECT_ROOT}/configs/robotwin_pi05_subtasks_25k.json"
+
+
+def test_planner_reference_loader_requires_split_manifest(tmp_path) -> None:
+    load_planner_reference_index.cache_clear()
+    with pytest.raises(FileNotFoundError, match="Planner split manifest is required"):
+        load_planner_reference_index(
+            str(tmp_path),
+            str(tmp_path / "repairs.jsonl"),
+            str(tmp_path / "missing_split.json"),
+            "train",
+            64,
+        )
+    load_planner_reference_index.cache_clear()
 
 
 def test_load_legacy_robotwin_config_sets_environment() -> None:
@@ -878,6 +914,18 @@ def test_openrlhf_outputs_use_one_training_item_per_policy_call(monkeypatch) -> 
         seed=123,
     )
     episode.status = "finished"
+    episode.metadata.update({"official_task_success": True, "task_status_available": True})
+    episode.rewards = [
+        RewardRecord(0, episode.task_name, 2.5, family="relative_place"),
+        RewardRecord(
+            None,
+            episode.task_name,
+            0.0,
+            family="episode_terminal",
+            events={"official_task_success": True, "episode_incomplete": False},
+            metrics={"skill_calls": 3.0},
+        ),
+    ]
 
     first = PolicyCallTrace.new(role="vision", model="m:vision", messages=[], image_refs=["first.png"])
     first.prompt_ids = [10, 11]
@@ -898,6 +946,8 @@ def test_openrlhf_outputs_use_one_training_item_per_policy_call(monkeypatch) -> 
         episode=episode,
         reward_score=1.25,
         group_uid=7,
+        task_index=4,
+        source="expert_subgoals",
     )
 
     assert len(samples) == 2
@@ -911,6 +961,10 @@ def test_openrlhf_outputs_use_one_training_item_per_policy_call(monkeypatch) -> 
     assert samples[0]["extra_logs"]["clawvla_policy_calls"] == 2
     assert samples[0]["extra_logs"]["clawvla_has_images"] == 1
     assert samples[0]["extra_logs"]["clawvla_image_count"] == 1
+    assert samples[0]["extra_logs"]["clawvla_task_index"] == 4
+    assert samples[0]["extra_logs"]["clawvla_official_task_success"] == 1
+    assert samples[0]["extra_logs"]["clawvla_source_expert_subgoals"] == 1
+    assert samples[0]["extra_logs"]["clawvla_reward_family__relative_place"] == 2.5
     assert samples[1]["observation_tokens"] == [20, 21, 22, 23, 24]
     assert samples[1]["action_ranges"] == [(3, 5)]
     assert samples[1]["rollout_log_probs"] is None
@@ -919,6 +973,57 @@ def test_openrlhf_outputs_use_one_training_item_per_policy_call(monkeypatch) -> 
     assert samples[1]["extra_logs"]["clawvla_image_count"] == 0
     assert samples[1]["reward"] == 1.25
     assert samples[1]["scores"] == 1.25
+
+
+def test_clawvla_rollout_metrics_deduplicate_policy_calls_by_episode() -> None:
+    torch = pytest.importorskip("torch")
+
+    def experience(uid, reward, success, *, plan=None, calls=1, family=0.0):
+        info = {
+            "clawvla_episode_uid": torch.tensor([uid]),
+            "clawvla_task_index": torch.tensor([0]),
+            "clawvla_official_task_success": torch.tensor([success]),
+            "clawvla_task_status_available": torch.tensor([1]),
+            "clawvla_episode_incomplete": torch.tensor([not success]),
+            "clawvla_premature_finish": torch.tensor([0]),
+            "clawvla_stalled_loop": torch.tensor([0]),
+            "clawvla_invalid_decisions": torch.tensor([0.0]),
+            "clawvla_failed_skills": torch.tensor([0.0]),
+            "clawvla_recoverable_preflight_failures": torch.tensor([0.0]),
+            "clawvla_skill_calls": torch.tensor([5.0]),
+            "clawvla_policy_calls": torch.tensor([calls]),
+            "clawvla_episode_reward": torch.tensor([reward]),
+            "clawvla_dense_reward": torch.tensor([reward + 1.0]),
+            "clawvla_terminal_reward": torch.tensor([-1.0]),
+            "clawvla_source_expert_subgoals": torch.tensor([plan is not None]),
+            "clawvla_source_official_valid_grounding": torch.tensor([plan is None]),
+            "clawvla_plan_score_available": torch.tensor([plan is not None]),
+            "clawvla_plan_score": torch.tensor([plan or 0.0]),
+            "clawvla_reward_family__relative_place": torch.tensor([family]),
+        }
+        return SimpleNamespace(info=info)
+
+    experiences = [
+        experience(10, 3.0, 1, plan=0.8, calls=2, family=4.0),
+        experience(10, 3.0, 1, plan=None, calls=2, family=4.0),
+        experience(20, -1.0, 0, plan=None, calls=1, family=0.0),
+    ]
+    running = {"episodes": 0, "successes": 0, "tasks": {}}
+
+    metrics = _compute_clawvla_rollout_metrics(
+        experiences,
+        task_names=("relative_place",),
+        running=running,
+    )
+
+    assert metrics["rollout/episodes"] == 2.0
+    assert metrics["rollout/episode_reward_mean"] == pytest.approx(1.0)
+    assert metrics["rollout/official_success_rate"] == pytest.approx(0.5)
+    assert metrics["rollout/planner_semantic_score_mean"] == pytest.approx(0.8)
+    assert metrics["rollout/planner_score_coverage"] == pytest.approx(0.5)
+    assert metrics["rollout/reward_family/relative_place_mean"] == pytest.approx(2.0)
+    assert metrics["rollout/task_success/relative_place"] == pytest.approx(0.5)
+    assert metrics["rollout/session_running_success_rate"] == pytest.approx(0.5)
 
 
 def test_openrlhf_sample_builder_fails_on_untrainable_policy_call(monkeypatch) -> None:
@@ -1018,6 +1123,53 @@ def test_openrlhf_episode_group_advantage_rejects_mismatched_call_rewards() -> N
         )
 
 
+def test_planner_similarity_uses_ordered_paraphrase_alignment() -> None:
+    reference = PlannerReference(
+        task_name="place_object_scale",
+        episode_index=0,
+        seed=200000,
+        task_instruction="Put the object on the scale.",
+        subgoals=(
+            ("Grasp the red object with the left arm.", "Use the left arm to grab the red object."),
+            ("Place the red object on the scale.", "Put the held red object onto the scale."),
+        ),
+        subgoal_types=("grasp", "place"),
+        completion_criteria=("The object is held.", "The object rests on the scale."),
+    )
+    correct = score_predicted_plan(
+        {
+            "subgoals": [
+                {"instruction": "Use the left arm to grab the red object."},
+                {"instruction": "Put the held red object onto the scale."},
+            ]
+        },
+        [reference],
+    )
+    reversed_score = ordered_plan_similarity(
+        ["Put the held red object onto the scale.", "Use the left arm to grab the red object."],
+        reference.subgoals,
+    )
+
+    assert correct == pytest.approx(1.0)
+    assert reversed_score < correct
+
+
+def test_planner_call_advantage_only_changes_plan_calls() -> None:
+    torch = pytest.importorskip("torch")
+    shaped = _shape_planner_call_advantages(
+        plan_scores=torch.tensor([0.2, 0.0, 0.8, 0.0]),
+        available=torch.tensor([1, 0, 1, 0]),
+        is_plan_call=torch.tensor([1, 0, 1, 0]),
+        group_uids=torch.tensor([7, 7, 7, 7]),
+        episode_uids=torch.tensor([10, 10, 20, 20]),
+    )
+
+    assert shaped[0].item() == pytest.approx(-0.70710677, rel=1e-5)
+    assert shaped[1].item() == 0.0
+    assert shaped[2].item() == pytest.approx(0.70710677, rel=1e-5)
+    assert shaped[3].item() == 0.0
+
+
 def test_openrlhf_runtime_patch_does_not_split_generated_call_batch(monkeypatch) -> None:
     samples_module = types.ModuleType("openrlhf.trainer.ppo_utils.samples_generator")
     sleep_calls = []
@@ -1060,6 +1212,72 @@ def test_openrlhf_runtime_patch_does_not_split_generated_call_batch(monkeypatch)
     assert exhausted is True
 
 
+def test_openrlhf_group_rollouts_balance_across_vllm_engines() -> None:
+    assert _balanced_sample_assignments([0, 0, 0, 0], 4) == [0, 1, 2, 3]
+    assert _balanced_sample_assignments([3, 0, 2, 0], 4) == [1, 3, 1, 3]
+    assert _balanced_sample_assignments([0, 0], 5) == [0, 1, 0, 1, 0]
+
+
+def test_openrlhf_group_rollouts_are_sharded_and_merged(monkeypatch) -> None:
+    samples_module = types.ModuleType("openrlhf.trainer.ppo_utils.samples_generator")
+
+    class RemoteMethod:
+        def __init__(self, function):
+            self.function = function
+
+        def remote(self, *args, **kwargs):
+            return self.function(*args, **kwargs)
+
+    class FakeRay:
+        @staticmethod
+        def get(value):
+            return value
+
+        @staticmethod
+        def remote(function):
+            return RemoteMethod(function)
+
+    class Engine:
+        def __init__(self, index):
+            self.index = index
+            self.calls = []
+            self.get_num_unfinished_requests = RemoteMethod(lambda: 0)
+            self.generate_responses = RemoteMethod(self._generate)
+
+        def _generate(self, **kwargs):
+            self.calls.append(kwargs)
+            return [{"engine": self.index, "sample": sample} for sample in range(kwargs["num_samples"])]
+
+    class SamplesGenerator:
+        def __init__(self):
+            self.vllm_engines = [Engine(index) for index in range(4)]
+            self.tokenizer = object()
+            self.args = SimpleNamespace(
+                rollout=SimpleNamespace(n_samples_per_prompt=4),
+                algo=SimpleNamespace(advantage=SimpleNamespace(is_correction_enable=False)),
+            )
+
+    samples_module.SamplesGenerator = SamplesGenerator
+    samples_module.SamplingParams = lambda **kwargs: SimpleNamespace(**kwargs)
+    samples_module.ray = FakeRay()
+    monkeypatch.setitem(sys.modules, "openrlhf.trainer.ppo_utils.samples_generator", samples_module)
+
+    _patch_samples_generator_shard_group_rollouts()
+    generator = SamplesGenerator()
+    grouped = generator._dispatch_prompts_to_vllm(
+        ["prompt"],
+        ["label"],
+        images=[["image.png"]],
+        n_samples_per_prompt=4,
+        max_len=1024,
+    )
+
+    assert [[item["engine"] for item in group] for group in grouped] == [[0, 1, 2, 3]]
+    assert [len(engine.calls) for engine in generator.vllm_engines] == [1, 1, 1, 1]
+    assert [engine.calls[0]["num_samples"] for engine in generator.vllm_engines] == [1, 1, 1, 1]
+    assert all(engine.calls[0]["images"] == ["image.png"] for engine in generator.vllm_engines)
+
+
 def test_openrlhf_modality_bucket_helpers_detect_and_pad() -> None:
     text = SimpleNamespace(images=[None], mm_train_inputs=[None], info={})
     image = SimpleNamespace(
@@ -1076,6 +1294,12 @@ def test_openrlhf_modality_bucket_helpers_detect_and_pad() -> None:
     group = SimpleNamespace(_actor_handlers=[object(), object(), object(), object()], duplicate_actors=2)
     assert _pad_indices_for_actor_group(group, [1]) == [1, 1]
     assert _pad_indices_for_actor_group(group, [1, 2]) == [1, 2]
+
+    four_rank_group = SimpleNamespace(_actor_handlers=[object()] * 4, duplicate_actors=1)
+    padded = _pad_indices_for_actor_group(four_rank_group, list(range(759)))
+    assert len(padded) == 760
+    assert padded[:759] == list(range(759))
+    assert padded[-1] == 758
 
 
 def test_openrlhf_training_modality_alignment_pairs_rank_steps() -> None:
@@ -1110,20 +1334,128 @@ def test_openrlhf_training_modality_alignment_pairs_rank_steps() -> None:
     ]
 
 
-def test_openrlhf_training_modality_alignment_rejects_uneven_buckets() -> None:
+def test_openrlhf_training_modality_alignment_neutrally_pads_uneven_buckets() -> None:
+    torch = pytest.importorskip("torch")
+
+    def sample(*, image: bool, value: float):
+        return SimpleNamespace(
+            images=[[f"m{value}.png"]] if image else [None],
+            mm_train_inputs=[{"pixel_values": [[value]]}] if image else [None],
+            action_mask=torch.ones(1, 2),
+            advantages=torch.full((1, 2), value),
+            returns=torch.full((1, 2), value),
+            rewards=torch.tensor([value]),
+            scores=torch.tensor([value]),
+            info={"reward": torch.tensor([value])},
+        )
+
     samples = [
-        SimpleNamespace(images=[None], mm_train_inputs=[None], info={}),
-        SimpleNamespace(images=[None], mm_train_inputs=[None], info={}),
-        SimpleNamespace(images=[["m0.png"]], mm_train_inputs=[{"pixel_values": [[0.0]]}], info={}),
-        SimpleNamespace(images=[["m1.png"]], mm_train_inputs=[{"pixel_values": [[1.0]]}], info={}),
-        SimpleNamespace(images=[["m2.png"]], mm_train_inputs=[{"pixel_values": [[2.0]]}], info={}),
-        SimpleNamespace(images=[["m3.png"]], mm_train_inputs=[{"pixel_values": [[3.0]]}], info={}),
-        SimpleNamespace(images=[["m4.png"]], mm_train_inputs=[{"pixel_values": [[4.0]]}], info={}),
-        SimpleNamespace(images=[["m5.png"]], mm_train_inputs=[{"pixel_values": [[5.0]]}], info={}),
+        sample(image=False, value=1.0),
+        sample(image=False, value=2.0),
+        *[sample(image=True, value=float(index + 3)) for index in range(6)],
     ]
 
-    with pytest.raises(RuntimeError, match="cannot align modalities"):
-        _align_experience_indices_by_modality(samples, effective_actors=4)
+    aligned_indices, stats = _align_experience_indices_by_modality(samples, effective_actors=4)
+    aligned, materialized_stats = _align_batched_kwargs_by_modality(
+        {"experience": samples}, effective_actors=4
+    )
+
+    assert stats == {
+        "dp": 4,
+        "text": 2,
+        "multimodal": 6,
+        "padding": 4,
+        "local_steps": 3,
+    }
+    assert materialized_stats == stats
+    assert len(aligned_indices) == len(aligned["experience"]) == 12
+    assert set(aligned_indices) == set(range(8))
+    padding = [
+        item
+        for item in aligned["experience"]
+        if getattr(item.info.get("clawvla_alignment_padding"), "item", lambda: 0)() == 1
+    ]
+    assert all("clawvla_alignment_padding" in item.info for item in aligned["experience"])
+    assert sum(
+        item.info["clawvla_alignment_padding"].item() == 0
+        for item in aligned["experience"]
+    ) == 8
+    assert len(padding) == 4
+    assert all(isinstance(item.info["clawvla_alignment_padding"], torch.Tensor) for item in padding)
+    assert all(tuple(item.info["clawvla_alignment_padding"].shape) == (1,) for item in padding)
+    assert all(item.action_mask.sum().item() == 0.0 for item in padding)
+    assert all(item.advantages.sum().item() == 0.0 for item in padding)
+    assert all(item.returns.sum().item() == 0.0 for item in padding)
+    assert all(item.info["reward"].sum().item() == 0.0 for item in padding)
+    assert all(item.action_mask.sum().item() == 2.0 for item in samples)
+
+
+def test_openrlhf_training_alignment_regression_four_text_759_images() -> None:
+    experiences = [
+        *[SimpleNamespace(images=[None], mm_train_inputs=[None], info={}) for _ in range(4)],
+        *[
+            SimpleNamespace(
+                images=[[f"frame_{index}.png"]],
+                mm_train_inputs=[{"pixel_values": [[float(index)]]}],
+                info={},
+            )
+            for index in range(759)
+        ],
+    ]
+
+    aligned, stats = _align_experience_indices_by_modality(experiences, effective_actors=4)
+    rank_chunks = [aligned[index * 191 : (index + 1) * 191] for index in range(4)]
+
+    assert stats == {"dp": 4, "text": 4, "multimodal": 759, "padding": 1, "local_steps": 191}
+    assert len(aligned) == 764
+    assert [len(chunk) for chunk in rank_chunks] == [191, 191, 191, 191]
+    assert all(_experience_modality(experiences[chunk[0]]) == "text" for chunk in rank_chunks)
+    assert all(
+        _experience_modality(experiences[chunk[local_step]]) == "multimodal"
+        for chunk in rank_chunks
+        for local_step in range(1, 191)
+    )
+
+
+def test_openrlhf_neutral_padding_has_finite_zero_diagnostics_and_no_sample_weight() -> None:
+    torch = pytest.importorskip("torch")
+    values = torch.tensor([[2.0, -3.0]])
+    empty = torch.zeros_like(values)
+    nonempty = torch.tensor([[1.0, 0.0]])
+
+    empty_mean = _masked_mean_with_empty_zero(values, empty)
+
+    assert torch.isfinite(empty_mean)
+    assert empty_mean.item() == 0.0
+    assert _masked_mean_with_empty_zero(values, nonempty).item() == 2.0
+    assert _valid_action_sample_count(empty) == 0
+    assert _valid_action_sample_count(nonempty) == 1
+
+
+def test_openrlhf_actor_step_flushes_cuda_cache_by_default(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    calls: list[str] = []
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_EMPTY_CACHE_EACH_TRAIN_STEP", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("synchronize"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+
+    _empty_cuda_cache_before_actor_step()
+
+    assert calls == ["synchronize", "empty_cache"]
+
+
+def test_openrlhf_actor_step_cache_flush_can_be_disabled(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    calls: list[str] = []
+    monkeypatch.setenv("CLAWVLA_OPENRLHF_EMPTY_CACHE_EACH_TRAIN_STEP", "0")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("synchronize"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+
+    _empty_cuda_cache_before_actor_step()
+
+    assert calls == []
 
 
 def test_openrlhf_replay_buffer_detects_mixed_modalities() -> None:
@@ -1214,6 +1546,53 @@ def test_rollout_episode_specs_expand_multitask_config() -> None:
     assert specs[-1].task_name == "put_object_cabinet"
 
 
+def test_rollout_seed_mix_combines_exact_expert_and_grounding_seeds(tmp_path, monkeypatch) -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_multitask_1update.yaml")
+    config.rollout.tasks = [
+        RolloutTaskConfig("task_a", "Do task A."),
+        RolloutTaskConfig("task_b", "Do task B."),
+    ]
+    config.planner_aux.enabled = True
+    config.rollout_seed_mix.enabled = True
+    config.rollout_seed_mix.valid_seed_cache_dir = str(tmp_path)
+    config.rollout_seed_mix.expert_plan_ratio = 0.6
+    config.rollout_seed_mix.shuffle_seed = 7
+    config.rollout_seed_mix.max_prompts = 4
+    references = {
+        "task_a": (
+            PlannerReference("task_a", 0, 200001, "Expert A1.", (("Act A1.",),), ("act",), ("done",)),
+            PlannerReference("task_a", 1, 200002, "Expert A2.", (("Act A2.",),), ("act",), ("done",)),
+        ),
+        "task_b": (
+            PlannerReference("task_b", 0, 200003, "Expert B1.", (("Act B1.",),), ("act",), ("done",)),
+        ),
+    }
+    monkeypatch.setattr(
+        "clawvla.rl.planner_similarity.load_planner_reference_index",
+        lambda *args, **kwargs: references,
+    )
+    for task_name in ("task_a", "task_b"):
+        (tmp_path / f"{task_name}.json").write_text(
+            json.dumps(
+                {
+                    "valid": [
+                        {"seed": 100001, "instruction": f"Ground {task_name} one."},
+                        {"seed": 100002, "instruction": f"Ground {task_name} two."},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    specs = build_rollout_episode_specs(config)
+
+    assert len(specs) == 4
+    assert sum(spec.source == "expert_subgoals" for spec in specs) == 2
+    assert sum(spec.source == "official_valid_grounding" for spec in specs) == 2
+    assert all(spec.planner_reference_available == (spec.source == "expert_subgoals") for spec in specs)
+    assert len({(spec.task_name, spec.seed) for spec in specs}) == 4
+
+
 def test_openrlhf_prompt_dataset_expands_multitask_tasks(tmp_path) -> None:
     config = load_rl_config("configs/rl/qwen3vl_pi05_multitask_1update.yaml")
 
@@ -1281,6 +1660,60 @@ def test_rl_write_agent_config_applies_libero_task_params(tmp_path) -> None:
     assert payload["environment"]["params"]["episode_index"] == 3
 
 
+def test_robotwin_rollout_lanes_rotate_openpi_and_environment_gpus(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CLAWVLA_OPENPI_POOL_PORTS", "9365,9366")
+    config = load_rl_config("configs/rl/qwen3vl_pi05_online_seed_mix_grpo.yaml")
+    episode = EpisodeRecord.new(task_name="click_bell", instruction="Click the bell.", seed=300000)
+
+    path = _write_agent_config(
+        config,
+        run_dir=tmp_path,
+        episode=episode,
+        episode_index=0,
+        seed=episode.seed,
+        policy_base_url="http://127.0.0.1:18080/v1",
+        openpi_port=9366,
+        rollout_lane=1,
+        task_name=episode.task_name,
+        instruction=episode.instruction,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    runtime = payload["metadata"]["action_backend"]["openpi_runtime"]
+
+    assert runtime["cuda_visible_devices"] == "5"
+    assert runtime["port"] == 9366
+    assert runtime["auto_start"] is False
+    assert _openpi_port_for_lane(config, 0) == 9365
+    assert _openpi_port_for_lane(config, 1) == 9366
+    assert _openpi_port_for_lane(config, 2) == 9365
+    assert _service_pool_ports("CLAWVLA_OPENPI_POOL_PORTS") == [9365, 9366]
+    assert _gpu_for_rollout_lane(config.cluster.robotwin_gpus, 0) == "6"
+    assert _gpu_for_rollout_lane(config.cluster.robotwin_gpus, 1) == "7"
+    assert _gpu_for_rollout_lane(config.cluster.robotwin_gpus, 2) == "6"
+
+
+def test_online_seed_mix_starts_persistent_openpi_and_robotwin_pools(tmp_path) -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_online_seed_mix_grpo.yaml")
+
+    specs = rollout_service_specs(config, tmp_path)
+    openpi = [spec for spec in specs if spec.kind == "openpi"]
+    robotwin = [spec for spec in specs if spec.kind == "robotwin"]
+
+    assert [(spec.index, spec.gpu, spec.port) for spec in openpi] == [
+        (0, 4, 9365),
+        (1, 5, 9366),
+    ]
+    assert [(spec.index, spec.gpu, spec.port) for spec in robotwin] == [
+        (0, 6, 19365),
+        (1, 7, 19366),
+        (2, 6, 19367),
+        (3, 7, 19368),
+    ]
+    assert all(any("pi05_worker" in item for item in spec.command) for spec in openpi)
+    assert all(any("robotwin_lane_worker" in item for item in spec.command) for spec in robotwin)
+    assert all(spec.env["CUDA_VISIBLE_DEVICES"] == str(spec.gpu) for spec in specs)
+
+
 def test_openrlhf_runner_resolves_preset_config() -> None:
     path = _resolve_config_path(None, "libero-multitask")
 
@@ -1323,6 +1756,11 @@ def test_openrlhf_train_command_uses_agent_entrypoint_and_full_zero3(tmp_path, m
     assert command[command.index("--ds.zero_stage") + 1] == "3"
     assert command[command.index("--ds.attn_implementation") + 1] == "flash_attention_2"
     assert command[command.index("--ds.tensor_parallel_size") + 1] == "1"
+    assert command[command.index("--algo.kl.init_coef") + 1] == "0.001"
+    assert command[command.index("--ckpt.max_num") + 1] == "1"
+    assert command[command.index("--ref.num_gpus_per_node") + 1] == command[
+        command.index("--actor.num_gpus_per_node") + 1
+    ]
     assert command[command.index("--train.max_tokens_per_gpu") + 1] == "12288"
     assert "--vllm.enable_sleep" in command
     assert "--ds.enable_sleep" in command
@@ -1359,6 +1797,61 @@ def test_openrlhf_train_command_allows_adam_offload_opt_out(tmp_path, monkeypatc
     )
 
     assert "--ds.adam_offload" not in command
+
+
+def test_openrlhf_train_command_allows_cuda_graph(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_VLLM_ENFORCE_EAGER", raising=False)
+    config = load_rl_config("configs/rl/qwen3vl_pi05_online_seed_mix_cudagraph_smoke.yaml")
+    command = _openrlhf_train_command(
+        config,
+        python=tmp_path / "python",
+        run_dir=tmp_path,
+        train_file=tmp_path / "train.jsonl",
+    )
+
+    assert config.openrlhf.enforce_eager is False
+    assert "--vllm.enforce_eager" not in command
+
+    monkeypatch.setenv("CLAWVLA_OPENRLHF_VLLM_ENFORCE_EAGER", "1")
+    overridden = _openrlhf_train_command(
+        config,
+        python=tmp_path / "python",
+        run_dir=tmp_path,
+        train_file=tmp_path / "train.jsonl",
+    )
+    assert "--vllm.enforce_eager" in overridden
+
+
+def test_online_seed_mix_keeps_all_periodic_checkpoints(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("CLAWVLA_OPENRLHF_VLLM_ENFORCE_EAGER", raising=False)
+    monkeypatch.setenv("WANDB_API_KEY", "secret-that-must-not-enter-command")
+    config = load_rl_config("configs/rl/qwen3vl_pi05_online_seed_mix_grpo.yaml")
+    command = _openrlhf_train_command(
+        config,
+        python=tmp_path / "python",
+        run_dir=tmp_path,
+        train_file=tmp_path / "train.jsonl",
+    )
+
+    assert command[command.index("--ckpt.save_steps") + 1] == "10"
+    assert command[command.index("--ckpt.max_num") + 1] == "2147483647"
+    assert command[command.index("--logger.wandb.key") + 1] == "clawvla-auth-is-preconfigured"
+    assert command[command.index("--logger.wandb.group") + 1] == "robotwin-online-seed-mix-grpo"
+    assert "secret-that-must-not-enter-command" not in command
+
+
+def test_online_wandb_requires_preconfigured_credentials(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setattr("clawvla.rl.openrlhf_runner._wandb_auth_available", lambda: False)
+    config = load_rl_config("configs/rl/qwen3vl_pi05_online_seed_mix_grpo.yaml")
+
+    with pytest.raises(RuntimeError, match="wandb login"):
+        _openrlhf_train_command(
+            config,
+            python=tmp_path / "python",
+            run_dir=tmp_path,
+            train_file=tmp_path / "train.jsonl",
+        )
 
 
 def test_openrlhf_train_command_allows_attention_override(tmp_path, monkeypatch) -> None:
@@ -1402,6 +1895,7 @@ def test_openrlhf_real_5step_uses_single_gpu_vllm_engines(tmp_path, monkeypatch)
 def test_openrlhf_env_removes_expandable_segments_when_vllm_sleep_is_enabled(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     monkeypatch.delenv("CLAWVLA_OPENRLHF_VLLM_ENABLE_SLEEP", raising=False)
+    monkeypatch.setenv("CLAWVLA_OPENRLHF_TMPDIR", str(tmp_path / "runtime_tmp"))
     config = load_rl_config("configs/rl/qwen3vl_pi05_train_smoke.yaml")
 
     env = _openrlhf_env(config, tmp_path, tmp_path / "resolved_config.yaml")
@@ -1411,6 +1905,8 @@ def test_openrlhf_env_removes_expandable_segments_when_vllm_sleep_is_enabled(tmp
     assert env["CLAWVLA_OPENRLHF_RL_CONFIG"] == str(tmp_path / "resolved_config.yaml")
     assert env["RAY_CGRAPH_submit_timeout"] == "300"
     assert env["RAY_CGRAPH_get_timeout"] == "300"
+    assert env["TMPDIR"] == str(tmp_path / "runtime_tmp")
+    assert env["RAY_TMPDIR"] == str(tmp_path / "runtime_tmp")
 
 
 def test_max_steps_result_keeps_failure_visible() -> None:
@@ -1462,10 +1958,11 @@ def test_terminal_reward_is_archived_for_failed_episode(tmp_path) -> None:
     assert len(lines) == 1
     payload = json.loads(lines[0])
     assert payload["event"] == "clawvla_rl_reward_record"
-    assert payload["reward"]["reward"] == -4.0
-    assert episode.reward_score == -4.0
+    assert payload["reward"]["reward"] == -11.0
+    assert episode.reward_score == -11.0
     assert episode.rewards[0].reason == (
-        "episode_status=max_steps_reached_with_failures;incomplete_episode=1;invalid_decisions=1;failed_skills=1"
+        "episode_status=max_steps_reached_with_failures;incomplete_episode=1;"
+        "budget_exhausted=1;invalid_decisions=1;failed_skills=1"
     )
 
 
@@ -1487,9 +1984,10 @@ def test_terminal_reward_penalizes_incomplete_episode_without_skill_failure(tmp_
 
     _append_episode_terminal_reward(episode, reward_path, config)
 
-    assert episode.reward_score == -1.0
+    assert episode.reward_score == -8.0
     payload = json.loads(reward_path.read_text(encoding="utf-8"))
     assert payload["reward"]["events"]["episode_incomplete"] is True
+    assert payload["reward"]["events"]["budget_exhausted"] is True
     assert payload["reward"]["metrics"]["incomplete_episode"] == 1.0
 
 
@@ -1539,7 +2037,7 @@ def test_terminal_reward_rejects_early_loop_finish_without_official_success(tmp_
     _append_episode_terminal_reward(episode, reward_path, config)
 
     payload = json.loads(reward_path.read_text(encoding="utf-8"))
-    assert episode.reward_score == -4.0
+    assert episode.reward_score == -5.0
     assert payload["reward"]["events"]["loop_finished"] is True
     assert payload["reward"]["events"]["official_task_success"] is False
     assert payload["reward"]["events"]["episode_incomplete"] is True
@@ -1547,6 +2045,32 @@ def test_terminal_reward_rejects_early_loop_finish_without_official_success(tmp_
     assert payload["reward"]["metrics"]["premature_finish"] == 1.0
     assert "premature_finish=1" in payload["reward"]["reason"]
     assert payload["reward"]["metadata"]["success_source"] == "environment_task_status"
+
+
+def test_terminal_reward_stall_preserves_progress_and_replaces_trigger_failures(tmp_path) -> None:
+    config = load_rl_config("configs/rl/qwen3vl_pi05_grpo.yaml")
+    episode = EpisodeRecord.new(task_name="click_bell", instruction="click the bell")
+    episode.status = "stalled_loop"
+    episode.metadata.update(
+        {
+            "task_status": {"available": True, "success": False},
+            "loop_reason": "repeated_failed_skill:vision.perceive_scene:count=5",
+        }
+    )
+    episode.rewards = [RewardRecord(step_index=0, task_name="click_bell", reward=2.0)]
+    episode.skill_calls = [
+        SkillCallTrace(0, "observe", "vision", "perceive_scene", "failed", False)
+        for _ in range(5)
+    ]
+    reward_path = tmp_path / "episode_reward.jsonl"
+
+    _append_episode_terminal_reward(episode, reward_path, config)
+
+    payload = json.loads(reward_path.read_text(encoding="utf-8"))
+    assert episode.reward_score == pytest.approx(-6.0)
+    assert payload["reward"]["reward"] == pytest.approx(-8.0)
+    assert payload["reward"]["events"]["stalled_loop"] is True
+    assert payload["reward"]["metrics"]["penalized_skill_calls"] == 0.0
 
 
 def test_terminal_reward_accepts_official_success_even_if_loop_hits_limit(tmp_path) -> None:
@@ -1579,6 +2103,26 @@ def test_rollout_result_archives_official_task_status() -> None:
     assert episode.status == "finished"
     assert episode.metadata["official_task_success"] is False
     assert episode.metadata["task_status"]["backend"] == "robotwin"
+
+
+def test_rollout_result_marks_task_status_exception_as_infrastructure_failure() -> None:
+    episode = EpisodeRecord.new(task_name="put_object_cabinet", instruction="put object in cabinet")
+
+    _populate_episode_from_result(
+        episode,
+        {
+            "loop": {"status": "stalled_loop", "steps": []},
+            "task_status": {
+                "available": False,
+                "success": False,
+                "reason": "task_status_failed:AttributeError:missing origin_z",
+            },
+        },
+    )
+
+    assert episode.status == "infra_failure"
+    assert episode.reward_score is None
+    assert episode.errors == ["task_status_failed:AttributeError:missing origin_z"]
 
 
 def test_run_loop_applies_runtime_environment(monkeypatch) -> None:
@@ -1736,6 +2280,33 @@ def test_task_plan_accepts_direct_contact_without_target_candidate() -> None:
     errors = _validate_task_plan_completeness(task_plan, "click the bell", "C1", "C2")
 
     assert "missing_target_candidate_in_subgoals" not in errors
+    assert errors == []
+
+
+def test_direct_vla_task_plan_accepts_no_candidate_bindings() -> None:
+    task_plan = TaskPlan(
+        task="place the container on the plate",
+        subgoals=[
+            Subgoal(
+                "S1",
+                "place",
+                instruction="Place the held container onto the round plate.",
+                source_candidate_id=None,
+                target_candidate_id=None,
+                completion_criteria={"natural_language": "the container is resting on the round plate"},
+            )
+        ],
+        current_subgoal_id="S1",
+    )
+
+    errors = _validate_task_plan_completeness(
+        task_plan,
+        "place the container on the plate",
+        None,
+        None,
+        candidate_bindings_required=False,
+    )
+
     assert errors == []
 
 
@@ -2150,6 +2721,65 @@ def test_preflight_action_blocks_place_without_target(tmp_path, monkeypatch) -> 
     assert result.success is False
     assert result.status == "preflight_failed"
     assert "missing_target_candidate_for_place" in result.errors
+
+
+def test_pi05_direct_vla_preflight_allows_missing_perception_world_state_and_bindings(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "clawvla.components.safety._openpi_worker_status",
+        lambda runtime_cfg: {"ok": True, "mode": "worker", "reason": "ok"},
+    )
+    blackboard = _preflight_blackboard(tmp_path, subgoal_type="place", include_target=False)
+    subgoal = Subgoal(
+        "S1",
+        "place",
+        instruction="Place the held container onto the round plate.",
+    )
+    blackboard.write("perception", None)
+    blackboard.write("world_state", None)
+    blackboard.write("task_plan", TaskPlan(subgoals=[subgoal], current_subgoal_id="S1"))
+    blackboard.write("current_subgoal", subgoal)
+    blackboard.read("action_backend").requires_candidate_bindings = False
+
+    result = preflight_action(
+        SkillRequest(component="safety", skill="preflight_action"),
+        SkillContext("safety", blackboard),
+    )
+
+    report = blackboard.read("preflight_report")
+    assert result.success is True
+    assert report.allowed is True
+    assert report.checks["object_binding"]["status"] == "advisory"
+    assert report.checks["object_binding"]["candidate_bindings_required"] is False
+
+
+def test_direct_vla_motion_plan_uses_subgoal_text_without_world_state() -> None:
+    blackboard = Blackboard(task_instruction="click the bell")
+    blackboard.write("observation", ObservationBundle(observation_id="obs_test"))
+    blackboard.write(
+        "current_subgoal",
+        Subgoal("S1", "press", instruction="Press the bell button with the right gripper."),
+    )
+    blackboard.write("action_backend", SimpleNamespace(requires_candidate_bindings=False, name="pi05"))
+
+    goal_result = build_motion_goal(
+        SkillRequest(component="motion", skill="build_motion_goal"),
+        SkillContext("motion", blackboard),
+    )
+    plan_result = plan_motion(
+        SkillRequest(component="motion", skill="plan_motion"),
+        SkillContext("motion", blackboard),
+    )
+
+    assert goal_result.success is True
+    assert blackboard.read("motion_goal").metadata["target_handle"]["grounding_mode"] == (
+        "subgoal_text_and_current_images"
+    )
+    assert plan_result.success is True
+    assert blackboard.read("motion_plan")["vla_prompt"] == (
+        "Press the bell button with the right gripper."
+    )
 
 
 def test_localize_task_objects_rejects_bad_source_target_contract() -> None:
@@ -2721,7 +3351,7 @@ def test_agent_loop_requires_explicit_emit_action_horizon() -> None:
         stage="execute",
         next_component="motion",
         next_skill="emit_action_chunk",
-        payload={"horizon": 9},
+        payload={"horizon": 14},
     )
     too_long = LoopDecision(
         control="run_skill",
@@ -2735,7 +3365,7 @@ def test_agent_loop_requires_explicit_emit_action_horizon() -> None:
         stage="execute",
         next_component="motion",
         next_skill="emit_action_chunk",
-        payload={"horizon": 10},
+        payload={"horizon": 15},
     )
     normal = LoopDecision(
         control="run_skill",
@@ -2745,16 +3375,18 @@ def test_agent_loop_requires_explicit_emit_action_horizon() -> None:
         payload={"horizon": 32},
     )
 
-    assert loop._validate_run_skill_decision(missing) == "missing_horizon_before_emit_action_chunk"
+    assert loop._validate_run_skill_decision(missing) is None
+    assert loop._prepare_payload(missing)["horizon"] == 32
     assert (
         loop._validate_run_skill_decision(too_short)
-        == "horizon_out_of_range_before_emit_action_chunk:9:expected_10_to_32"
+        == "horizon_out_of_range_before_emit_action_chunk:14:expected_15_to_32"
     )
-    assert loop._validate_run_skill_decision(too_long) == "horizon_out_of_range_before_emit_action_chunk:33:expected_10_to_32"
+    assert loop._validate_run_skill_decision(too_long) == "horizon_out_of_range_before_emit_action_chunk:33:expected_15_to_32"
     assert loop._validate_run_skill_decision(minimum) is None
     assert loop._validate_run_skill_decision(normal) is None
     scheduler_instruction = _scheduler_instruction(loop_mode=True)
-    assert "integer horizon from 10 to 32" in scheduler_instruction
+    assert "optional and defaults to 32" in scheduler_instruction
+    assert "integer from 15 to 32" in scheduler_instruction
     assert "Never request more than 32 actions" in scheduler_instruction
     assert "horizon=50" not in scheduler_instruction
 
@@ -2945,6 +3577,34 @@ def test_agent_loop_observe_complete_allows_missing_target_for_direct_contact_ta
     assert summary["world_state_ready_error"] is None
     assert summary["observe_complete"] is True
     assert required["control"] == "advance_stage"
+
+
+def test_agent_loop_direct_vla_observe_only_requires_current_images() -> None:
+    blackboard = Blackboard(task_instruction="place the container on the plate")
+    blackboard.write("observation", SimpleNamespace(observation_id="obs_new"))
+    blackboard.write(
+        "action_backend",
+        SimpleNamespace(name="pi05", requires_candidate_bindings=False),
+    )
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.runtime = SimpleNamespace(blackboard=blackboard)
+
+    summary = loop._runtime_state_summary()
+    required = loop._next_required_decision_summary("observe", None)
+
+    assert summary["candidate_bindings_required"] is False
+    assert summary["world_state_ready"] is True
+    assert summary["observe_complete"] is True
+    assert summary["perception_source_candidate_id"] is None
+    assert summary["world_state_source_candidate_id"] is None
+    assert required == {
+        "control": "advance_stage",
+        "stage": None,
+        "next_component": None,
+        "next_skill": None,
+        "payload": {},
+        "reason": "current_images_ready_for_direct_vla",
+    }
 
 
 def test_phase_policy_allows_preflight_observation_refresh_only_in_preflight() -> None:
@@ -3615,6 +4275,40 @@ def test_agent_loop_blocks_repeated_decision_after_limit() -> None:
     error = loop._check_repeat(decision, repeat_state)
 
     assert error == "repeated_decision_limit_exceeded:vision.perceive_scene:3>2"
+
+
+def test_agent_loop_stalls_after_five_identical_failures() -> None:
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.config = AgentLoopConfig(failed_skill_stall_limit=5)
+    loop.runtime = SimpleNamespace(blackboard=Blackboard(task_instruction="test"))
+    state = {"last_failed_key": None, "failed_count": 0, "no_progress_action_count": 0}
+    decision = LoopDecision(stage="observe", next_component="vision", next_skill="perceive_scene")
+    failed = SkillResult(success=False, status="perception_failed", errors=["bad_output"])
+
+    assert [loop._stall_reason(decision, failed, state) for _ in range(4)] == [None] * 4
+    assert loop._stall_reason(decision, failed, state) == "repeated_failed_skill:vision.perceive_scene:count=5"
+
+
+def test_agent_loop_stalls_after_six_successful_actions_without_progress() -> None:
+    blackboard = Blackboard(task_instruction="test")
+    blackboard.write("current_subgoal", Subgoal("S1", "move", instruction="Move the object."))
+    blackboard.write("rl_last_reward_progress", {"progress": False})
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.config = AgentLoopConfig(no_progress_action_stall_limit=6)
+    loop.runtime = SimpleNamespace(blackboard=blackboard)
+    state = {
+        "last_failed_key": None,
+        "failed_count": 0,
+        "no_progress_action_count": 0,
+        "last_action_subgoal": None,
+    }
+    decision = LoopDecision(stage="execute", next_component="motion", next_skill="execute_action")
+    executed = SkillResult(success=True, status="action_executed")
+
+    assert [loop._stall_reason(decision, executed, state) for _ in range(5)] == [None] * 5
+    assert loop._stall_reason(decision, executed, state) == (
+        "successful_actions_without_progress:subgoal=S1:count=6"
+    )
 
 
 def test_agent_loop_returns_skill_failure_to_scheduler_without_exiting() -> None:

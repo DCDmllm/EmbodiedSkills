@@ -34,7 +34,8 @@ Planner 生成的子任务自然语言原样进入 π0.5
 同 task + instruction + seed 的多条 rollout 做 GRPO 组内归一化
 ```
 
-奖励不是通过比较文字与参考答案获得的，也没有关键词打分。文字只有在促成正确的组件决策和真实物理状态变化时才得到正奖励。
+主奖励来自真实物理状态和官方成功，不使用关键词打分。唯一的文字辅助项是首次 `build_task_plan` 的
+组内 expert-plan 语义相似度；它只调整 Planner 调用自身，权重远低于物理成功。
 
 ## 2. “自然语言描述”如何获得奖励
 
@@ -57,7 +58,7 @@ Planner 生成的子任务自然语言原样进入 π0.5
 
 `action_ranges` 只覆盖模型生成的 response token。prompt、图片、工具结果、黑板状态不是被优化的输出 token。
 
-### 2.2 自然语言没有直接词面奖励
+### 2.2 自然语言没有关键词奖励
 
 例如模型输出：
 
@@ -65,7 +66,7 @@ Planner 生成的子任务自然语言原样进入 π0.5
 Use the left arm to grasp the brown bottle and the right arm to grasp the green bottle.
 ```
 
-不会因为包含 `left arm`、`grasp` 或颜色词自动加分。它的信用链路是：
+不会因为单独包含 `left arm`、`grasp` 或颜色词自动加分。主要信用链路是：
 
 1. 这句话进入 π0.5。
 2. π0.5 是否真的让正确夹爪接触并抓住两个瓶子。
@@ -73,11 +74,13 @@ Use the left arm to grasp the brown bottle and the right arm to grasp the green 
 4. RoboTwin 的 actor pose、真实 contact 和最终 `check_success()` 是否改善。
 5. 上述物理变化产生 dense reward 和 success bonus。
 
-相反，一句语言流畅但对象、左右臂或目标位置错误的指令，不会得到“语言质量分”；它会因为物理状态无进展而低分。
+相反，一句语言流畅但对象、左右臂或目标位置错误的指令，会因为物理状态无进展而低分；其完整 plan
+通常也会在顺序感知的 expert-plan 语义对齐中低于正确 rollout。
 
 ### 2.3 整局信用如何分配给多次文字输出
 
-设一局包含 12 次 VLM 调用，总奖励为 `R_episode`。当前 episode-level GRPO 会给12次调用都写入相同的 `R_episode`，但每次只训练自己的 response token：
+设一局包含 12 次 VLM 调用，总环境奖励为 `R_episode`。episode-level GRPO 会给12次调用写入相同的
+环境 advantage，但每次只训练自己的 response token：
 
 ```text
 call_0 response tokens ← R_episode
@@ -94,7 +97,8 @@ call_11 response tokens ← R_episode
 
 GRPO 对这4个 episode 做组内标准化。高于组均值的轨迹获得正 advantage，低于组均值的轨迹获得负 advantage；同一 episode 的所有 policy call 共享该 episode advantage。
 
-这属于粗粒度 credit assignment：能学习“哪整套视觉、规划、验证和恢复输出更好”，但暂时不能精确判断一局中哪一句文字贡献最大。
+这部分仍属于粗粒度 credit assignment。首次 `build_task_plan` 另有局部 `0.2 * A_plan`，因此 Planner
+输出可以在同组 rollout 间获得更细的相对信号；其余调用仍只共享环境 advantage。
 
 ### 2.4 典型结果
 
@@ -110,13 +114,41 @@ GRPO 对这4个 episode 做组内标准化。高于组均值的轨迹获得正 a
 ### 2.5 已采集子任务文本怎么利用
 
 已有数据位于 `runs/data/robotwin_expert_subtasks_train_50x50_merged`，可按 episode 顺序把 canonical
-segment instruction 重建成完整 plan。推荐先把它用于 Planner SFT/behavior cloning，或在 RL 期间混入
-10%–20% 的 Planner SFT replay，以保持对象映射、左右臂和双臂同步拆分风格。
+segment instruction 重建成完整 plan。主训练不要求预先制作 grounding JSON：这批 expert episode 的 seed
+直接作为普通在线 RL prompt，所有 VLM 调用照常接收真实环境奖励，只有首次 Planner 调用再获得 plan 辅助分。
 
-不建议把“与某一句参考文本的字符串相似度”直接作为主奖励：同一物理子任务有多种正确表达，模型也可能
-通过复读模板刷分。如果后续需要文本先验，应只在首次 `build_task_plan` 时发一次、总额限制在 `0~0.5`，
-并比较任务条件下的结构与语义特征（JSON合法性、subgoal数量、动作动词序列、对象/左右臂映射、双臂同步性、
-sentence embedding），其权重必须显著低于官方成功 `+20`。当前实现尚未启用任何文本相似度奖励。
+当前已启用首次 `build_task_plan` 的顺序感知语义辅助分。它把预测 subgoals 与同任务 expert episode 的
+canonical/paraphrase 序列做单调对齐，未匹配步骤自然降分。分数只在相同 task/instruction/seed 的 GRPO
+组内标准化，并以 `0.2` 权重加到 Planner 调用自身；vision/verifier/recovery 调用不接收这项 advantage。
+参考计划按 task + seed 精确匹配。没有参考计划的官方有效 seed 直接 mask，不按零分处理；它们仍通过在线
+图片、环境动作和物理 reward 训练 grounding/verification/recovery。官方成功 `+20` 仍是主信号。
+
+官方有效 seed 由 `clawvla.scripts.robotwin_precompute_valid_seeds` 通过 expert `plan_success + check_success()`
+筛出。`100000+` 的 50 × 100 缓存保留给 official eval；训练另采 `300000+` 的独立缓存，避免 seed
+泄漏。当前缓存为 49 类 × 30 加 `put_object_cabinet` 21 条，共 1491 条且覆盖全部 50 类。
+`qwen3vl_pi05_online_seed_mix_grpo.yaml` 将 2236 个 train-split expert-plan seed 与
+1491 个 grounding-only seed 按约 60:40 混合，得到 3727 个 prompt；`rollout_n=4` 时一轮对应 14908 条 rollout。
+
+```bash
+cd /path/to/clawvla
+./scripts/run_clawvla_rl.sh \
+  --config configs/rl/qwen3vl_pi05_online_seed_mix_grpo.yaml \
+  --mode dry-run \
+  --run-id robotwin_online_seed_mix_check
+```
+
+`build_robotwin_planner_sft` 和对应 SFT 配置仍保留为可选的 Planner warm-start，但不再是在线 GRPO 的前置条件。
+
+当前 8 卡在线配置按 policy/OpenPI/RoboTwin = 4/2/2 分配，环境 lane 会在两张后端卡间轮转。GRPO
+使用 group size 4、temperature 1.0、全参学习率 1e-6、KL 0.001；vLLM utilization 0.7，tool loop
+最多 150 次，另有 5 次重复失败与 6 次无进展动作的提前 stall 保护。
+PI0.5 action horizon 默认 32；Planner 可省略该字段，若显式指定则范围为 15–32，短 horizon 仅用于纠错。
+周期 checkpoint 每 10 个外层 GRPO 更新保存一次，并保留全部历史 checkpoint。
+
+正式在线配置会在训练启动时常驻 2 个 OpenPI worker（GPU4/5）和 4 个 RoboTwin lane worker
+（GPU6/7 轮转）。OpenPI 的冻结 π0.5 权重只加载一次；RoboTwin Python/SAPIEN lane 进程不重启，
+但每条轨迹仍会关闭旧 task env 并按新的 task/seed 创建干净场景。环境 `task_status` 自身抛异常时，
+episode 会被标成 `infra_failure` 并禁止进入 GRPO，而不是错误地当作策略失败扣分。
 
 ## 3. 奖励在什么时刻计算
 
@@ -161,7 +193,8 @@ after motion.execute_action
 | --- | ---: | --- |
 | `step_cost` | `-0.05` | 每次成功进入某个物理 reward family 的 `execute_action` 计算。 |
 | `incomplete_episode_penalty` | `-1.0` | RoboTwin 官方 `task_status.success=False`。Agent loop 的 `finished` 不能取消它。 |
-| `premature_finish_penalty` | `-3.0` | Agent 主动 `finished`，但 RoboTwin 官方 `task_status.success=False`；与 incomplete 叠加后共 `-4.0`。 |
+| `premature_finish_penalty` | `-4.0` | Agent 主动 `finished` 且官方失败；与 incomplete `-1` 叠加后共 `-5.0`。 |
+| `stalled_loop_penalty` | `-8.0` | 5次相同失败或6次成功动作无进展；替代 incomplete，叠加在此前 dense reward 上。 |
 | `invalid_decision_penalty` | `-2.0` | 非法组件、技能、stage 或控制决策。 |
 | `skill_failure_penalty` | `-1.0` | 非 invalid、非可恢复 preflight 的失败技能。 |
 | `recoverable_preflight_penalty` | `-0.1` | stale perception/world state 等可恢复刷新。 |
@@ -453,11 +486,14 @@ TCP 到指定 contact point 的距离势能差  distance_before-distance_after
 | 靠近—远离或打开—关闭往返刷分 | 距离、姿态、关节、计数和高度 shaping 使用未逐步裁剪的正负对称势能差；完整循环严格相消。 |
 | 抓住抬高、松手降低后重新抓取 | 首次抓取后继续计算高度势能，松手下降也会等额扣回；适用于 spatial、axis_lift 和 dump。 |
 | 失败时持续摇瓶刷动作分 | shake增量整局最多发3次，之后继续摇动只产生step cost。 |
+| 相同失败skill持续重试 | 完全相同失败累计5次后以`stalled_loop`结束，触发序列不再逐次重复扣skill failure。 |
+| action执行成功但无物理进展 | 同一subgoal连续6个action chunk没有新milestone或正向物理reward后结束。 |
+| stall后保留已完成进展 | 不覆盖整局分数；在此前dense reward上追加`-8`，保持GRPO组内排序。 |
 | 通过无效动作拖延 | 每个action chunk有`-0.05` step cost。 |
-| 官方失败时提前finish省步骤 | incomplete `-1` 再叠加 premature finish `-3`。 |
+| 官方失败时提前finish省步骤 | incomplete `-1` 再叠加 premature finish `-4`，合计 `-5`。 |
 | 反复输出非法JSON或非法技能 | invalid decision和skill failure按episode累计惩罚。 |
 | 服务崩溃被当成坏策略 | infra failure从训练样本中剔除。 |
-| 只优化文字格式、不完成物理任务 | 没有独立的语言匹配正奖励；最终必须造成仿真进展。 |
+| 只优化文字格式、不完成物理任务 | Planner语义项只有`0.2`组内权重；官方成功`+20`和物理进展仍主导。 |
 
 旧的 `pick_place/stack/articulation/handover/contact_press/dual_lift/ordering` family 也已统一改成首次触发制。
 

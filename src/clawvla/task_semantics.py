@@ -59,6 +59,17 @@ def task_plan_requires_target(task_instruction: object | None, subgoals: Iterabl
     )
 
 
+def action_backend_requires_candidate_bindings(action_backend: object | None) -> bool:
+    """Whether grounding ids are a hard execution contract for this backend.
+
+    Classical geometric controllers may need candidate ids and poses.  A
+    language-conditioned VLA such as PI0.5 consumes the current images, robot
+    state, and subgoal text directly, so candidate bindings are optional hints.
+    Unknown backends keep the conservative historical behavior.
+    """
+    return bool(getattr(action_backend, "requires_candidate_bindings", True))
+
+
 def _normalize_identifier(value: object | None) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
 

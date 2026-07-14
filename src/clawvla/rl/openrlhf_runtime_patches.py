@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
 import functools
 import logging
+import os
+import re
 import sys
 from typing import Any
 
@@ -12,11 +15,16 @@ def apply_openrlhf_runtime_patches() -> None:
     """Patch OpenRLHF so one environment episode may emit many call-level samples."""
     _patch_rollout_actor_flatten_agent_outputs()
     _patch_samples_generator_flatten_agent_outputs()
+    _patch_samples_generator_shard_group_rollouts()
     _patch_samples_generator_preserve_clawvla_rollout_batches()
     _patch_clawvla_modality_bucketed_experience_forward()
     _patch_clawvla_training_modality_alignment()
+    _patch_clawvla_empty_masked_means()
+    _patch_clawvla_actor_valid_sample_count()
     _patch_clawvla_actor_training_shuffle()
     _patch_clawvla_group_advantages()
+    _patch_clawvla_rollout_stats()
+    _patch_wandb_sample_frequency()
 
 
 def _patch_logger() -> Any:
@@ -33,6 +41,211 @@ def _patch_logger() -> Any:
     return _PATCH_LOGGER
 
 
+def _patch_clawvla_rollout_stats() -> None:
+    """Add episode-deduplicated RoboTwin metrics to OpenRLHF/WandB logs."""
+    module = sys.modules.get("openrlhf.trainer.ppo_trainer")
+    if module is None:
+        return
+    cls = getattr(module, "PPOTrainer", None)
+    if cls is None or getattr(cls, "_clawvla_rollout_stats_patch", False):
+        return
+
+    original_compute = cls._compute_rollout_stats
+
+    @functools.wraps(original_compute)
+    def compute_rollout_stats(self, experiences):
+        stats = original_compute(self, experiences)
+        task_names = getattr(self, "_clawvla_metric_task_names", None)
+        if task_names is None:
+            task_names = _configured_task_names()
+            self._clawvla_metric_task_names = task_names
+        running = getattr(self, "_clawvla_metric_running", None)
+        if running is None:
+            running = {"episodes": 0, "successes": 0, "tasks": {}}
+            self._clawvla_metric_running = running
+        stats.update(_compute_clawvla_rollout_metrics(experiences, task_names=task_names, running=running))
+        return stats
+
+    cls._compute_rollout_stats = compute_rollout_stats
+    cls._clawvla_rollout_stats_patch = True
+
+
+def _patch_wandb_sample_frequency() -> None:
+    """Avoid uploading an ever-growing decoded-sample table every RL step."""
+    module = sys.modules.get("openrlhf.utils.logging_utils")
+    if module is None:
+        return
+    cls = getattr(module, "WandbLogger", None)
+    if cls is None or getattr(cls, "_clawvla_sample_frequency_patch", False):
+        return
+
+    original_log_train = cls.log_train
+
+    @functools.wraps(original_log_train)
+    def log_train(self, global_step, logs_dict):
+        frequency = max(0, int(os.environ.get("CLAWVLA_WANDB_SAMPLE_LOG_FREQ", "20")))
+        if frequency == 0 or int(global_step) % frequency != 0:
+            logs_dict = dict(logs_dict)
+            logs_dict.pop("generated_samples", None)
+        return original_log_train(self, global_step, logs_dict)
+
+    cls.log_train = log_train
+    cls._clawvla_sample_frequency_patch = True
+
+
+def _compute_clawvla_rollout_metrics(
+    experiences: list[Any],
+    *,
+    task_names: tuple[str, ...] = (),
+    running: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    """Aggregate per-call Experience objects into true per-episode metrics."""
+    episodes: dict[int, dict[str, Any]] = {}
+    family_prefix = "clawvla_reward_family__"
+    scalar_fields = (
+        "clawvla_task_index",
+        "clawvla_official_task_success",
+        "clawvla_task_status_available",
+        "clawvla_episode_incomplete",
+        "clawvla_premature_finish",
+        "clawvla_stalled_loop",
+        "clawvla_budget_exhausted",
+        "clawvla_invalid_decisions",
+        "clawvla_failed_skills",
+        "clawvla_recoverable_preflight_failures",
+        "clawvla_skill_calls",
+        "clawvla_policy_calls",
+        "clawvla_episode_reward",
+        "clawvla_dense_reward",
+        "clawvla_terminal_reward",
+        "clawvla_source_expert_subgoals",
+        "clawvla_source_official_valid_grounding",
+    )
+    for experience in experiences:
+        info = getattr(experience, "info", None)
+        if not isinstance(info, dict) or "clawvla_episode_uid" not in info:
+            continue
+        episode_uid = int(_info_scalar_value(info, "clawvla_episode_uid"))
+        episode = episodes.setdefault(episode_uid, {"families": {}})
+        for key in scalar_fields:
+            if key in info and key not in episode:
+                episode[key] = _info_scalar_value(info, key)
+        if bool(_info_scalar_value(info, "clawvla_plan_score_available", 0.0)):
+            episode["clawvla_plan_score"] = _info_scalar_value(info, "clawvla_plan_score")
+        for key in info:
+            if key.startswith(family_prefix) and key not in episode["families"]:
+                episode["families"][key] = _info_scalar_value(info, key)
+
+    rows = list(episodes.values())
+    if not rows:
+        return {}
+
+    def mean(key: str) -> float:
+        return sum(float(row.get(key, 0.0)) for row in rows) / len(rows)
+
+    rewards = [float(row.get("clawvla_episode_reward", 0.0)) for row in rows]
+    success_count = sum(int(bool(row.get("clawvla_official_task_success", 0.0))) for row in rows)
+    stats = {
+        "rollout/episodes": float(len(rows)),
+        "rollout/episode_reward_mean": sum(rewards) / len(rewards),
+        "rollout/episode_reward_min": min(rewards),
+        "rollout/episode_reward_max": max(rewards),
+        "rollout/episode_reward_std": _population_std(rewards),
+        "rollout/official_success_count": float(success_count),
+        "rollout/official_success_rate": success_count / len(rows),
+        "rollout/task_status_coverage": mean("clawvla_task_status_available"),
+        "rollout/incomplete_rate": mean("clawvla_episode_incomplete"),
+        "rollout/premature_finish_rate": mean("clawvla_premature_finish"),
+        "rollout/stalled_loop_rate": mean("clawvla_stalled_loop"),
+        "rollout/budget_exhausted_rate": mean("clawvla_budget_exhausted"),
+        "rollout/invalid_decisions_mean": mean("clawvla_invalid_decisions"),
+        "rollout/failed_skills_mean": mean("clawvla_failed_skills"),
+        "rollout/recoverable_preflight_failures_mean": mean("clawvla_recoverable_preflight_failures"),
+        "rollout/skill_calls_mean": mean("clawvla_skill_calls"),
+        "rollout/policy_calls_mean": mean("clawvla_policy_calls"),
+        "rollout/dense_reward_mean": mean("clawvla_dense_reward"),
+        "rollout/terminal_reward_mean": mean("clawvla_terminal_reward"),
+        "rollout/expert_subgoals_rate": mean("clawvla_source_expert_subgoals"),
+        "rollout/grounding_rate": mean("clawvla_source_official_valid_grounding"),
+    }
+    plan_scores = [float(row["clawvla_plan_score"]) for row in rows if "clawvla_plan_score" in row]
+    stats["rollout/planner_score_coverage"] = len(plan_scores) / len(rows)
+    if plan_scores:
+        stats["rollout/planner_semantic_score_mean"] = sum(plan_scores) / len(plan_scores)
+        stats["rollout/planner_semantic_score_std"] = _population_std(plan_scores)
+
+    family_keys = sorted({key for row in rows for key in row["families"]})
+    for key in family_keys:
+        name = key[len(family_prefix) :]
+        stats[f"rollout/reward_family/{name}_mean"] = (
+            sum(float(row["families"].get(key, 0.0)) for row in rows) / len(rows)
+        )
+
+    task_rows: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        task_rows.setdefault(int(row.get("clawvla_task_index", -1)), []).append(row)
+    for task_index, selected in task_rows.items():
+        task_name = task_names[task_index] if 0 <= task_index < len(task_names) else f"task_{task_index}"
+        task_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", task_name)
+        task_successes = sum(int(bool(row.get("clawvla_official_task_success", 0.0))) for row in selected)
+        stats[f"rollout/task_success/{task_name}"] = task_successes / len(selected)
+
+    if running is not None:
+        running["episodes"] = int(running.get("episodes", 0)) + len(rows)
+        running["successes"] = int(running.get("successes", 0)) + success_count
+        running_tasks = running.setdefault("tasks", {})
+        for task_index, selected in task_rows.items():
+            task_state = running_tasks.setdefault(task_index, {"episodes": 0, "successes": 0})
+            task_state["episodes"] += len(selected)
+            task_state["successes"] += sum(
+                int(bool(row.get("clawvla_official_task_success", 0.0))) for row in selected
+            )
+            task_name = task_names[task_index] if 0 <= task_index < len(task_names) else f"task_{task_index}"
+            task_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", task_name)
+            stats[f"rollout/task_running_success/{task_name}"] = (
+                task_state["successes"] / task_state["episodes"]
+            )
+        stats["rollout/session_running_success_rate"] = running["successes"] / running["episodes"]
+    return stats
+
+
+def _info_scalar_value(info: dict[str, Any], key: str, default: float | None = None) -> float:
+    if key not in info:
+        if default is None:
+            raise KeyError(key)
+        return float(default)
+    value = info[key]
+    if hasattr(value, "detach"):
+        flattened = value.detach().reshape(-1).cpu()
+        if flattened.numel() != 1:
+            raise ValueError(f"OpenRLHF ClawVLA metric must be scalar: {key} shape={tuple(flattened.shape)}")
+        return float(flattened.item())
+    if isinstance(value, (int, float, bool)):
+        return float(value)
+    raise TypeError(f"OpenRLHF ClawVLA metric must be numeric: {key}={type(value).__name__}")
+
+
+def _population_std(values: list[float]) -> float:
+    if len(values) <= 1:
+        return 0.0
+    mean = sum(values) / len(values)
+    return (sum((value - mean) ** 2 for value in values) / len(values)) ** 0.5
+
+
+def _configured_task_names() -> tuple[str, ...]:
+    config_path = os.environ.get("CLAWVLA_OPENRLHF_RL_CONFIG")
+    if not config_path:
+        return ()
+    try:
+        from .config import load_rl_config, rollout_tasks
+
+        config = load_rl_config(config_path)
+        return tuple(task.task_name for task in rollout_tasks(config))
+    except Exception as exc:
+        _patch_logger().warning("Could not load ClawVLA task names for metrics: %s", exc)
+        return ()
+
+
 def _flatten_agent_outputs(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, dict):
         return [value]
@@ -42,6 +255,23 @@ def _flatten_agent_outputs(value: Any) -> list[dict[str, Any]]:
             flattened.extend(_flatten_agent_outputs(item))
         return flattened
     raise TypeError(f"OpenRLHF ClawVLA agent output must be dict or nested list[dict], got {type(value).__name__}")
+
+
+def _merge_response_groups(*groups: Any) -> list[dict[str, Any]]:
+    return _flatten_agent_outputs(groups)
+
+
+def _balanced_sample_assignments(pending_counts: list[int], n_samples: int) -> list[int]:
+    """Assign samples to the currently least-loaded rollout engines."""
+    if not pending_counts:
+        raise ValueError("At least one vLLM engine is required")
+    loads = [max(0, int(value)) for value in pending_counts]
+    assignments: list[int] = []
+    for _ in range(max(1, int(n_samples))):
+        engine_index = min(range(len(loads)), key=lambda index: (loads[index], index))
+        assignments.append(engine_index)
+        loads[engine_index] += 1
+    return assignments
 
 
 def _patch_rollout_actor_flatten_agent_outputs() -> None:
@@ -131,6 +361,78 @@ def _patch_samples_generator_flatten_agent_outputs() -> None:
     cls._clawvla_flatten_agent_outputs = True
 
 
+def _patch_samples_generator_shard_group_rollouts() -> None:
+    """Run one prompt's GRPO samples on separate vLLM replicas.
+
+    Upstream OpenRLHF assigns a prompt as one unit, so all ``n_samples`` agent
+    episodes execute inside a single rollout engine.  ClawVLA uses one prompt
+    per batch because every sample owns a real simulator.  Sharding the samples
+    here lets the four long-running agent episodes use four TP=1 replicas while
+    the merged result remains one GRPO group.
+    """
+    module = sys.modules.get("openrlhf.trainer.ppo_utils.samples_generator")
+    if module is None:
+        return
+
+    cls = getattr(module, "SamplesGenerator", None)
+    if cls is None or getattr(cls, "_clawvla_shard_group_rollouts", False):
+        return
+
+    def _dispatch_prompts_to_vllm(self, prompts, labels, *, images=None, **generate_kwargs):
+        sampling_params = module.SamplingParams(
+            temperature=generate_kwargs.get("temperature", 1.0),
+            top_p=generate_kwargs.get("top_p", 1.0),
+            top_k=generate_kwargs.get("top_k", -1),
+            max_tokens=generate_kwargs.get("max_new_tokens"),
+            min_tokens=generate_kwargs.get("min_new_tokens", 1),
+            skip_special_tokens=generate_kwargs.get("skip_special_tokens", False),
+            logprobs=1 if self.args.algo.advantage.is_correction_enable else None,
+        )
+        truncate_length = generate_kwargs.get("max_len", 2048)
+        n_samples = max(
+            1,
+            int(generate_kwargs.get("n_samples_per_prompt", self.args.rollout.n_samples_per_prompt)),
+        )
+        pending_counts = module.ray.get(
+            [engine.get_num_unfinished_requests.remote() for engine in self.vllm_engines]
+        )
+        loads = [max(0, int(value)) for value in pending_counts]
+        if images is None:
+            images = [None] * len(prompts)
+
+        merge_remote = getattr(module, "_clawvla_merge_response_groups_remote", None)
+        if merge_remote is None:
+            merge_remote = module.ray.remote(_merge_response_groups)
+            module._clawvla_merge_response_groups_remote = merge_remote
+
+        grouped_refs = []
+        for prompt, label, image in zip(prompts, labels, images, strict=True):
+            assignments = _balanced_sample_assignments(loads, n_samples)
+            per_engine_counts: dict[int, int] = {}
+            for engine_index in assignments:
+                per_engine_counts[engine_index] = per_engine_counts.get(engine_index, 0) + 1
+                loads[engine_index] += 1
+
+            sample_refs = []
+            for engine_index, sample_count in per_engine_counts.items():
+                sample_refs.append(
+                    self.vllm_engines[engine_index].generate_responses.remote(
+                        prompt=prompt,
+                        label=label,
+                        sampling_params=sampling_params,
+                        max_length=truncate_length,
+                        hf_tokenizer=self.tokenizer,
+                        num_samples=sample_count,
+                        images=image,
+                    )
+                )
+            grouped_refs.append(merge_remote.remote(*sample_refs))
+        return grouped_refs
+
+    cls._dispatch_prompts_to_vllm = _dispatch_prompts_to_vllm
+    cls._clawvla_shard_group_rollouts = True
+
+
 def _patch_samples_generator_preserve_clawvla_rollout_batches() -> None:
     module = sys.modules.get("openrlhf.trainer.ppo_utils.samples_generator")
     if module is None:
@@ -209,8 +511,7 @@ def _patch_clawvla_modality_bucketed_experience_forward() -> None:
     @functools.wraps(original_make_experience)
     def make_experience(self, samples_list):
         buckets = _split_indices_by_modality(samples_list)
-        non_empty_buckets = [indices for indices in buckets.values() if indices]
-        if len(non_empty_buckets) <= 1:
+        if not any(buckets.values()):
             return original_make_experience(self, samples_list)
         return _make_experience_with_modality_buckets(self, samples_list, buckets, module)
 
@@ -397,12 +698,11 @@ def _scatter_by_indices(results: list[Any], indices: list[int], values: list[Any
 
 
 def _pad_indices_for_actor_group(group: Any, indices: list[int]) -> list[int]:
-    min_size = _minimum_batch_size_for_actor_group(group)
-    if len(indices) >= min_size:
-        return list(indices)
+    actor_count = _minimum_batch_size_for_actor_group(group)
     if not indices:
         raise ValueError("OpenRLHF ClawVLA cannot pad an empty modality bucket.")
-    return list(indices) + [indices[-1]] * (min_size - len(indices))
+    padding = (-len(indices)) % actor_count
+    return list(indices) + [indices[-1]] * padding
 
 
 def _minimum_batch_size_for_actor_group(group: Any) -> int:
@@ -499,7 +799,7 @@ def _patch_clawvla_training_modality_alignment() -> None:
                 _patch_logger().info(
                     "ClawVLA training modality alignment: "
                     f"dp={stats['dp']} text={stats['text']} multimodal={stats['multimodal']} "
-                    f"local_steps={stats['local_steps']}"
+                    f"padding={stats.get('padding', 0)} local_steps={stats['local_steps']}"
                 )
                 kwargs = aligned_kwargs
         return original_async_run_method_batch(self, method_name, **kwargs)
@@ -543,6 +843,87 @@ def _patch_clawvla_actor_training_shuffle() -> None:
     cls._clawvla_disable_mixed_modality_shuffle_patch = True
 
 
+def _patch_clawvla_empty_masked_means() -> None:
+    """Make logging reductions well-defined for loss-neutral DP padding.
+
+    A rank may receive a single alignment sample whose action mask is entirely
+    zero.  OpenRLHF's globally normalized losses already handle that sample,
+    but its local PPO diagnostics use ``0 / 0`` masked means.  Returning zero
+    for an empty mask keeps those diagnostics finite without changing any
+    non-empty reduction.
+    """
+    for module_name in ("openrlhf.models.loss", "openrlhf.trainer.ray.ppo_actor"):
+        module = sys.modules.get(module_name)
+        if module is not None:
+            module.masked_mean = _masked_mean_with_empty_zero
+
+
+def _masked_mean_with_empty_zero(tensor: Any, mask: Any, dim: int | None = None) -> Any:
+    if mask is None:
+        return tensor.mean(dim=dim)
+    numerator = (tensor * mask).sum(dim=dim)
+    denominator = mask.sum(dim=dim)
+    return numerator / denominator.clamp(min=1)
+
+
+def _patch_clawvla_actor_valid_sample_count() -> None:
+    """Stabilize actor steps and exclude neutral padding from PPO metrics.
+
+    Long multimodal rollouts can produce hundreds of differently shaped PPO
+    micro-batches.  With ZeRO-3 that leaves a large amount of cached, fragmented
+    CUDA memory, and a later parameter all-gather may fail even though the cache
+    is mostly unused.  Flush every actor rank at the same point before each
+    training step, as recommended by DeepSpeed's stage-3 memory-pressure
+    warning.  This changes allocator state only; it does not change model or
+    optimizer values.
+    """
+    module = sys.modules.get("openrlhf.trainer.ray.ppo_actor")
+    if module is None:
+        return
+    cls = getattr(module, "ActorPPOTrainer", None)
+    if cls is None or getattr(cls, "_clawvla_valid_sample_count_patch", False):
+        return
+
+    original_training_step = cls.training_step
+
+    @functools.wraps(original_training_step)
+    def training_step(self, experience, *args, **kwargs):
+        _empty_cuda_cache_before_actor_step()
+        status = original_training_step(self, experience, *args, **kwargs)
+        status["num_samples"] = float(_valid_action_sample_count(experience.action_mask))
+        return status
+
+    cls.training_step = training_step
+    cls._clawvla_valid_sample_count_patch = True
+
+
+def _empty_cuda_cache_before_actor_step() -> None:
+    if os.environ.get("CLAWVLA_OPENRLHF_EMPTY_CACHE_EACH_TRAIN_STEP", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+        "",
+    }:
+        return
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    except Exception as exc:
+        # Allocator maintenance must never turn a recoverable runtime into a
+        # failed training step (for example on CPU-only test runners).
+        _patch_logger().warning("ClawVLA CUDA cache flush skipped: %s", exc)
+
+
+def _valid_action_sample_count(action_mask: Any) -> int:
+    flattened = action_mask.reshape(action_mask.shape[0], -1)
+    return int((flattened.sum(dim=-1) > 0).sum().item())
+
+
 def _align_batched_kwargs_by_modality(
     kwargs: dict[str, Any], effective_actors: int
 ) -> tuple[dict[str, Any], dict[str, int] | None]:
@@ -557,7 +938,10 @@ def _align_batched_kwargs_by_modality(
     aligned_kwargs: dict[str, Any] = {}
     for key, value in kwargs.items():
         if isinstance(value, list) and len(value) == len(experiences):
-            aligned_kwargs[key] = [value[index] for index in aligned_indices]
+            if key == "experience":
+                aligned_kwargs[key] = _materialize_aligned_experiences(value, aligned_indices)
+            else:
+                aligned_kwargs[key] = [value[index] for index in aligned_indices]
         elif isinstance(value, tuple) and len(value) == len(experiences):
             aligned_kwargs[key] = tuple(value[index] for index in aligned_indices)
         else:
@@ -572,38 +956,24 @@ def _align_experience_indices_by_modality(
         return list(range(len(experiences))), None
 
     buckets = _split_indices_by_modality(experiences)
-    if not buckets["text"] or not buckets["multimodal"]:
-        return list(range(len(experiences))), None
-
-    total = len(experiences)
-    if total % effective_actors != 0:
-        raise RuntimeError(
-            "OpenRLHF ClawVLA mixed-modality training batch cannot be evenly split across actor ranks: "
-            f"total={total} effective_actors={effective_actors}. "
-            "Increase rollout samples or change task mix so every actor rank receives the same number of samples."
-        )
-
-    uneven = {
-        name: len(indices)
+    padded_buckets = {
+        name: _pad_indices_to_multiple(indices, effective_actors) if indices else []
         for name, indices in buckets.items()
-        if indices and len(indices) % effective_actors != 0
     }
-    if uneven:
-        raise RuntimeError(
-            "OpenRLHF ClawVLA mixed-modality training batch cannot align modalities across actor ranks: "
-            f"effective_actors={effective_actors} counts={uneven}. "
-            "Each non-empty modality bucket must be divisible by the actor data-parallel size."
-        )
+    padding = sum(len(padded_buckets[name]) - len(buckets[name]) for name in buckets)
+    if padding == 0 and (not buckets["text"] or not buckets["multimodal"]):
+        return list(range(len(experiences))), None
 
     rank_indices: list[list[int]] = [[] for _ in range(effective_actors)]
     for bucket_name in ("text", "multimodal"):
-        indices = buckets[bucket_name]
+        indices = padded_buckets[bucket_name]
         for start in range(0, len(indices), effective_actors):
             column = indices[start : start + effective_actors]
             for rank, index in enumerate(column):
                 rank_indices[rank].append(index)
 
-    local_steps = total // effective_actors
+    padded_total = sum(len(indices) for indices in padded_buckets.values())
+    local_steps = padded_total // effective_actors
     if any(len(chunk) != local_steps for chunk in rank_indices):
         raise RuntimeError(
             "OpenRLHF ClawVLA modality alignment produced uneven actor chunks: "
@@ -621,8 +991,8 @@ def _align_experience_indices_by_modality(
             )
 
     aligned_indices = [index for chunk in rank_indices for index in chunk]
-    if sorted(aligned_indices) != list(range(total)):
-        raise RuntimeError("OpenRLHF ClawVLA modality alignment lost or duplicated training samples.")
+    if set(aligned_indices) != set(range(len(experiences))) or len(aligned_indices) != padded_total:
+        raise RuntimeError("OpenRLHF ClawVLA modality alignment lost original training samples.")
 
     stats = {
         "dp": effective_actors,
@@ -630,7 +1000,70 @@ def _align_experience_indices_by_modality(
         "multimodal": len(buckets["multimodal"]),
         "local_steps": local_steps,
     }
+    if padding:
+        stats["padding"] = padding
     return aligned_indices, stats
+
+
+def _pad_indices_to_multiple(indices: list[int], divisor: int) -> list[int]:
+    if not indices:
+        return []
+    padding = (-len(indices)) % max(1, int(divisor))
+    return list(indices) + [indices[-1]] * padding
+
+
+def _materialize_aligned_experiences(experiences: list[Any], indices: list[int]) -> list[Any]:
+    """Make repeated alignment entries loss-neutral while preserving modality."""
+    seen: set[int] = set()
+    aligned: list[Any] = []
+    for index in indices:
+        experience = experiences[index]
+        if index in seen:
+            experience = _neutral_training_padding(experience)
+        else:
+            seen.add(index)
+            experience = _mark_training_alignment_sample(experience, is_padding=False)
+        aligned.append(experience)
+    return aligned
+
+
+def _neutral_training_padding(experience: Any) -> Any:
+    padded = copy.copy(experience)
+    for name in ("action_mask", "advantages", "returns", "rewards", "scores"):
+        value = getattr(padded, name, None)
+        if hasattr(value, "detach") and hasattr(value, "new_zeros"):
+            setattr(padded, name, value.new_zeros(value.shape))
+    info = dict(getattr(padded, "info", {}) or {})
+    for key, value in list(info.items()):
+        if hasattr(value, "detach") and hasattr(value, "new_zeros"):
+            info[key] = value.new_zeros(value.shape)
+    padded.info = info
+    return _mark_training_alignment_sample(padded, is_padding=True)
+
+
+def _mark_training_alignment_sample(experience: Any, *, is_padding: bool) -> Any:
+    """Give every aligned DP sample the same batch-aligned metric schema.
+
+    OpenRLHF reduces every ``Experience.info`` key independently.  If only
+    padding ranks carry the marker, those ranks enqueue one extra NCCL
+    all-reduce on the final uneven column and the process group deadlocks.
+    Therefore real and padding samples both carry this key, with values 0 and
+    1 respectively.
+    """
+    marked = copy.copy(experience)
+    info = dict(getattr(marked, "info", {}) or {})
+    action_mask = getattr(marked, "action_mask", None)
+    marker = 1 if is_padding else 0
+    if hasattr(action_mask, "new_full") and hasattr(action_mask, "shape"):
+        # Experience.info is batch-aligned. split_experience_batch requires
+        # the leading length to equal the Experience batch size.
+        info["clawvla_alignment_padding"] = action_mask.new_full(
+            (int(action_mask.shape[0]),), marker
+        )
+    else:
+        info["clawvla_alignment_padding"] = [marker]
+    marked.info = info
+    return marked
 
 
 def _effective_actor_count(group: Any) -> int:
@@ -702,6 +1135,24 @@ def _compute_clawvla_group_advantages(self: Any, experiences: list[Any], module:
         episode_uids=episode_uids,
         estimator=args.algo.advantage.estimator,
     ).to(raw_rewards.device)
+    if all("clawvla_plan_score" in experience.info for experience in experiences):
+        plan_scores = torch.cat([_info_float_vector(experience, "clawvla_plan_score") for experience in experiences])
+        plan_available = torch.cat(
+            [_info_vector(experience, "clawvla_plan_score_available") for experience in experiences]
+        )
+        plan_calls = torch.cat(
+            [_info_vector(experience, "clawvla_is_build_task_plan") for experience in experiences]
+        )
+        plan_weights = torch.cat(
+            [_info_float_vector(experience, "clawvla_plan_advantage_weight") for experience in experiences]
+        )
+        shaped_rewards = shaped_rewards + _shape_planner_call_advantages(
+            plan_scores=plan_scores,
+            available=plan_available,
+            is_plan_call=plan_calls,
+            group_uids=group_uids,
+            episode_uids=episode_uids,
+        ).to(raw_rewards.device) * plan_weights.to(raw_rewards.device)
     reward_chunks = shaped_rewards.split(exp_len)
 
     for experience, reward in zip(experiences, reward_chunks, strict=True):
@@ -759,6 +1210,43 @@ def _info_vector(experience: Any, key: str):
     if hasattr(value, "detach"):
         return value.detach().reshape(-1).cpu().long()
     raise TypeError(f"OpenRLHF ClawVLA info field must be tensor-like: {key}={type(value).__name__}")
+
+
+def _info_float_vector(experience: Any, key: str):
+    value = experience.info[key]
+    if hasattr(value, "detach"):
+        return value.detach().reshape(-1).cpu().float()
+    raise TypeError(f"OpenRLHF ClawVLA info field must be tensor-like: {key}={type(value).__name__}")
+
+
+def _shape_planner_call_advantages(*, plan_scores, available, is_plan_call, group_uids, episode_uids):
+    """Group-normalize plan scores and emit a bonus only on planner-call samples."""
+    import torch
+
+    shaped = torch.zeros_like(plan_scores, dtype=torch.float32)
+    groups: dict[int, list[tuple[int, int, float]]] = {}
+    for index, (score, mask, plan_call, group_uid, episode_uid) in enumerate(
+        zip(plan_scores, available, is_plan_call, group_uids, episode_uids, strict=True)
+    ):
+        if not bool(mask.item()) or not bool(plan_call.item()):
+            continue
+        groups.setdefault(int(group_uid.item()), []).append(
+            (index, int(episode_uid.item()), float(score.item()))
+        )
+
+    for entries in groups.values():
+        by_episode: dict[int, tuple[int, float]] = {}
+        for index, episode_uid, score in entries:
+            by_episode.setdefault(episode_uid, (index, score))
+        values = torch.tensor([value[1] for value in by_episode.values()], dtype=torch.float32)
+        if values.numel() <= 1:
+            normalized = torch.zeros_like(values)
+        else:
+            std = values.std(unbiased=True)
+            normalized = (values - values.mean()) / (std + 1e-9)
+        for (index, _), value in zip(by_episode.values(), normalized, strict=True):
+            shaped[index] = value
+    return shaped
 
 
 def _shape_episode_rewards(*, raw_rewards, group_uids, episode_uids, estimator: str):
