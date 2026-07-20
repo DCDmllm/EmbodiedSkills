@@ -48,6 +48,7 @@ slurm-*.out
 .local_archive/
 .venv-openrlhf-py310/
 .venv-openrlhf-py310-cu128/
+/source/
 
 # Editor/system files
 .DS_Store

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 try:
     from enum import StrEnum
@@ -13,6 +14,21 @@ from pathlib import Path
 from typing import Any
 
 from .schema import StageDefinition
+
+
+_PROJECT_ROOT_PATH = Path(
+    os.environ.get(
+        "CLAWVLA_PROJECT_ROOT",
+        Path(__file__).resolve().parents[2],
+    )
+).expanduser().resolve()
+_DEFAULT_WORKSPACE_ROOT = _PROJECT_ROOT_PATH.parent
+PROJECT_ROOT = str(_PROJECT_ROOT_PATH)
+WORKSPACE_ROOT = str(
+    Path(os.environ.get("CLAWVLA_WORKSPACE_ROOT", _DEFAULT_WORKSPACE_ROOT))
+    .expanduser()
+    .resolve()
+)
 
 
 class ModelBackend(StrEnum):
@@ -69,7 +85,7 @@ class RobotwinConfig:
     camera_profile: str | None = None
     planner_image_mode: str = "current_rgb_4"
     static_camera_preset: str = "selected_global_4"
-    artifact_dir: str = "/mnt/wangwai/vla/clawvla/tmp_artifacts"
+    artifact_dir: str = f"{PROJECT_ROOT}/tmp_artifacts"
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -127,7 +143,7 @@ def _stage_definition(payload: dict[str, Any]) -> StageDefinition:
 
 
 def load_config(path: str | Path) -> AgentConfig:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    payload = _expand_config_value(json.loads(Path(path).read_text(encoding="utf-8")))
     robotwin = RobotwinConfig(**payload.get("robotwin", {}))
     environment = _environment_config(payload.get("environment"), robotwin)
     return AgentConfig(
@@ -141,6 +157,22 @@ def load_config(path: str | Path) -> AgentConfig:
         runtime_environment=RuntimeEnvironment(**payload.get("runtime_environment", {})),
         metadata=dict(payload.get("metadata", {})),
     )
+
+
+def _expand_config_value(value: Any) -> Any:
+    """Resolve portable repository tokens and ordinary environment variables."""
+    if isinstance(value, dict):
+        return {key: _expand_config_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_config_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_expand_config_value(item) for item in value)
+    if not isinstance(value, str):
+        return value
+    expanded = value.replace("${PROJECT_ROOT}", PROJECT_ROOT).replace(
+        "${WORKSPACE_ROOT}", WORKSPACE_ROOT
+    )
+    return os.path.expandvars(expanded)
 
 
 def _environment_config(payload: Any, robotwin: RobotwinConfig) -> EnvironmentConfig:

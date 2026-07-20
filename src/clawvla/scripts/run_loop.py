@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--artifact-prefix", default="agent_loop")
     parser.add_argument("--initial-stage", default="observe")
     parser.add_argument("--max-steps", type=int, default=12)
+    parser.add_argument("--seed", type=int, default=None, help="Override environment.seed for a reproducible episode.")
     parser.add_argument("--run", action="store_true", help="Instantiate the configured environment and capture a real initial observation.")
     parser.add_argument("--initial-observe", action="store_true", help="Run the fixed bootstrap observation before scheduler loop.")
     parser.add_argument("--no-initial-observe", action="store_true", help="Deprecated compatibility flag; bootstrap is off by default.")
@@ -42,6 +43,7 @@ def main() -> None:
         artifact_prefix=args.artifact_prefix,
         initial_stage=args.initial_stage,
         max_steps=args.max_steps,
+        seed=args.seed,
         result_output=args.result_output,
         run_environment=bool(args.run),
         initial_observe=bool(args.initial_observe and not args.no_initial_observe),
@@ -55,12 +57,15 @@ def run_agent_loop(
     artifact_prefix: str,
     initial_stage: str,
     max_steps: int,
+    seed: int | None = None,
     result_output: str | Path | None,
     run_environment: bool,
     initial_observe: bool = False,
 ) -> Path:
     """Run one complete agent episode, safely releasing its environment scene."""
     config = load_config(config_path)
+    if seed is not None:
+        config.environment.seed = int(seed)
     _apply_runtime_environment(config)
     output_path = (
         Path(result_output)
@@ -423,6 +428,15 @@ def _bootstrap_observe(runtime: AgentRuntime, instruction: str, artifact_prefix:
         payload["setup"] = True
     capture = runtime.run_skill("vision", "capture_views", payload, stage="observe")
     if not capture.success:
+        return capture
+    from clawvla.task_semantics import action_backend_requires_candidate_bindings
+
+    if not action_backend_requires_candidate_bindings(runtime.blackboard.read("action_backend")):
+        runtime.blackboard.write(
+            "bootstrap_observe_mode",
+            "direct_vla_images_only",
+            event_type="bootstrap.direct_vla_images_ready",
+        )
         return capture
     observation = runtime.blackboard.read("observation")
     image_paths = [view.rgb_path for view in getattr(observation, "camera_views", {}).values() if view.rgb_path]

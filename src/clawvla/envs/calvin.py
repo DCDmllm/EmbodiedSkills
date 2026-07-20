@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from ..artifacts import ArtifactStore
-from ..config import EnvironmentConfig
+from ..config import EnvironmentConfig, PROJECT_ROOT
 from ..notices import emit_status_notice
 from ..schema import ActionChunk, CameraView, ObservationBundle, RobotArmState
 from .base import RobotEnvAdapter
@@ -22,6 +22,7 @@ CALVIN_CAMERA_MAP = {
 }
 
 CALVIN_ACTION_TYPES = {"calvin_ee_pose_10d", "calvin_ee_delta"}
+CALVIN_OFFICIAL_SEQUENCE_POOL_SIZE = 1000
 
 
 class CalvinAdapter(RobotEnvAdapter):
@@ -33,13 +34,16 @@ class CalvinAdapter(RobotEnvAdapter):
         self.validation_dir = Path(str(params.get("validation_dir") or self.dataset_path / "validation"))
         self.camera_names = _string_list(params.get("camera_names") or ["rgb_static", "rgb_gripper"])
         self.sequence_index = int(params.get("sequence_index", 0))
+        self.sequence_pool_size = int(
+            params.get("sequence_pool_size", CALVIN_OFFICIAL_SEQUENCE_POOL_SIZE)
+        )
         self.subtask_index = int(params.get("subtask_index", 0))
         self.max_episode_steps = int(params.get("max_episode_steps", 720))
         self.show_gui = _truthy(params.get("show_gui", False))
         self.use_egl = _truthy(params.get("use_egl", True))
         self.scene = str(params["scene"]) if params.get("scene") else None
         self.gripper_close_threshold = float(params.get("gripper_close_threshold", 0.8))
-        self.artifacts = ArtifactStore(config.artifact_dir or "/mnt/wangwai/vla/clawvla/tmp_artifacts/calvin")
+        self.artifacts = ArtifactStore(config.artifact_dir or Path(PROJECT_ROOT) / "tmp_artifacts" / "calvin")
 
         self.env: Any | None = None
         self.task_oracle: Any | None = None
@@ -87,12 +91,17 @@ class CalvinAdapter(RobotEnvAdapter):
         self._ensure_repo_pythonpath()
         self._check_validation_dir()
         self._load_task_context()
-        if self.env is None:
-            self.env = self._make_env()
-        if self.initial_state is None:
-            raise RuntimeError("calvin_initial_state_unavailable")
-        robot_obs, scene_obs = _calvin_env_state_for_initial_condition(self.initial_state)
-        raw_observation = self.env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
+        seed = int(self.config.seed or 0)
+        with _temp_numpy_seed(seed):
+            if self.env is None:
+                self.env = self._make_env()
+            if self.initial_state is None:
+                raise RuntimeError("calvin_initial_state_unavailable")
+            seed_fn = getattr(self.env, "seed", None)
+            if callable(seed_fn):
+                seed_fn(seed)
+            robot_obs, scene_obs = _calvin_env_state_for_initial_condition(self.initial_state)
+            raw_observation = self.env.reset(robot_obs=robot_obs, scene_obs=scene_obs)
         self.start_info = dict(self.env.get_info()) if hasattr(self.env, "get_info") else None
         self.last_info = dict(self.start_info or {})
         self.last_done = False
@@ -165,6 +174,7 @@ class CalvinAdapter(RobotEnvAdapter):
             "task_language": self.task_language(),
             "subtask": self.current_subtask,
             "sequence_index": self.sequence_index,
+            "sequence_pool_size": self.sequence_pool_size,
             "subtask_index": self.subtask_index,
             "dataset_path": str(self.dataset_path),
             "validation_dir": str(self.validation_dir),
@@ -182,6 +192,9 @@ class CalvinAdapter(RobotEnvAdapter):
             "task_name": self.config.task_name or "calvin",
             "task_language": self.task_language(),
             "subtask": self.current_subtask,
+            "sequence_index": self.sequence_index,
+            "sequence_pool_size": self.sequence_pool_size,
+            "subtask_index": self.subtask_index,
             "step_count": self.step_count,
         }
 
@@ -204,9 +217,10 @@ class CalvinAdapter(RobotEnvAdapter):
             "task_language": self.task_language(),
             "subtask": self.current_subtask,
             "sequence_index": self.sequence_index,
+            "sequence_pool_size": self.sequence_pool_size,
             "subtask_index": self.subtask_index,
             "success": success,
-            "done": bool(self.last_done) if self.last_done is not None else success,
+            "done": bool(self.last_done) or bool(success),
             "step_count": self.step_count,
             "reward": self.last_reward,
             "info": dict(self.last_info),
@@ -222,10 +236,64 @@ class CalvinAdapter(RobotEnvAdapter):
                 return str(annotation).split("\n", 1)[0].replace("\u2019", "'").strip()
         return None
 
+    def advance_sequence_subtask(self, *, require_success: bool = True) -> dict[str, Any]:
+        """Advance the task oracle within one persistent CALVIN scene.
+
+        Official CALVIN sequence evaluation must not reset the environment
+        between subtasks.  The current environment info becomes the next
+        subtask's oracle baseline while the physical scene stays untouched.
+        """
+        if self.eval_sequence is None or not self.eval_sequence:
+            raise RuntimeError("calvin_eval_sequence_unavailable")
+        current_status = self.task_status()
+        if require_success and current_status.get("success") is not True:
+            raise RuntimeError(
+                f"calvin_sequence_advance_requires_success:{self.current_subtask}"
+            )
+        next_index = int(self.subtask_index) + 1
+        if next_index >= len(self.eval_sequence):
+            return {
+                "status": "calvin_sequence_complete",
+                "sequence_complete": True,
+                "sequence_index": self.sequence_index,
+                "completed_subtask_index": self.subtask_index,
+                "completed_subtask": self.current_subtask,
+                "sequence_length": len(self.eval_sequence),
+            }
+        next_subtask = str(self.eval_sequence[next_index])
+        if self.val_annotations is not None and next_subtask not in self.val_annotations:
+            raise KeyError(f"calvin_subtask_annotation_missing:{next_subtask}")
+        self.subtask_index = next_index
+        self.current_subtask = next_subtask
+        self.start_info = dict(self.last_info)
+        self.last_done = False
+        self.last_reward = 0.0
+        return {
+            "status": "calvin_sequence_subtask_advanced",
+            "sequence_complete": False,
+            "sequence_index": self.sequence_index,
+            "subtask_index": self.subtask_index,
+            "subtask": self.current_subtask,
+            "task_language": self.task_language(),
+            "sequence_length": len(self.eval_sequence),
+        }
+
     def close(self) -> None:
         if self.env is not None and hasattr(self.env, "close"):
             self.env.close()
+            # CALVIN's legacy PlayTableSimEnv.__del__ calls close() again but
+            # its close method does not mark the Bullet client as released.
+            # Prevent a second disconnect attempt during interpreter teardown.
+            if hasattr(self.env, "ownsPhysicsClient"):
+                self.env.ownsPhysicsClient = False
         self.env = None
+        self.start_info = None
+        self.last_raw_observation = None
+        self.last_observation = None
+        self.last_reward = None
+        self.last_done = None
+        self.last_info = {}
+        self.step_count = 0
 
     def _ensure_repo_pythonpath(self) -> None:
         for path in (self.repo_root / "calvin_env", self.repo_root / "calvin_models"):
@@ -245,13 +313,24 @@ class CalvinAdapter(RobotEnvAdapter):
     def _load_task_context(self) -> None:
         if self.initial_state is not None and self.eval_sequence is not None and self.task_oracle is not None:
             return
-        from omegaconf import OmegaConf
-        import hydra
-
+        if self.sequence_index < 0:
+            raise ValueError(f"calvin_sequence_index_out_of_range:{self.sequence_index}:available=unknown")
+        if self.sequence_pool_size <= 0:
+            raise ValueError(
+                f"calvin_sequence_pool_size_must_be_positive:{self.sequence_pool_size}"
+            )
+        if self.sequence_index >= self.sequence_pool_size:
+            raise ValueError(
+                f"calvin_sequence_index_out_of_range:{self.sequence_index}:"
+                f"available={self.sequence_pool_size}"
+            )
         if self.initial_state is None or self.eval_sequence is None:
             from calvin_agent.evaluation.multistep_sequences import get_sequences
 
-            sequences = list(get_sequences(max(self.sequence_index + 1, 1), num_workers=1))
+            # Match CALVIN's official evaluator: sequence content is frozen by
+            # its internal seed, while the default worker pool avoids a long
+            # single-core startup for the 1000-sequence benchmark pool.
+            sequences = list(get_sequences(self.sequence_pool_size))
             if self.sequence_index < 0 or self.sequence_index >= len(sequences):
                 raise ValueError(f"calvin_sequence_index_out_of_range:{self.sequence_index}:available={len(sequences)}")
             initial_state, sequence = sequences[self.sequence_index]
@@ -263,6 +342,9 @@ class CalvinAdapter(RobotEnvAdapter):
                     f"calvin_subtask_index_out_of_range:{self.subtask_index}:sequence_len={len(self.eval_sequence)}"
                 )
             self.current_subtask = self.eval_sequence[self.subtask_index]
+        from omegaconf import OmegaConf
+        import hydra
+
         conf_dir = self.repo_root / "calvin_models" / "conf"
         task_cfg = OmegaConf.load(conf_dir / "callbacks" / "rollout" / "tasks" / "new_playtable_tasks.yaml")
         self.task_oracle = hydra.utils.instantiate(task_cfg)
@@ -297,6 +379,7 @@ class CalvinAdapter(RobotEnvAdapter):
             "task_language": self.task_language(),
             "subtask": self.current_subtask,
             "sequence_index": self.sequence_index,
+            "sequence_pool_size": self.sequence_pool_size,
             "subtask_index": self.subtask_index,
             "seed": self.config.seed,
             "camera_names": list(self.camera_names),

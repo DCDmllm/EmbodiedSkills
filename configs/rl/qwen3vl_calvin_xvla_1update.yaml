@@ -10,18 +10,18 @@ planner_aux:
 
 environment:
   python: /mnt/wangwai/miniconda3/envs/calvin-py38/bin/python
-  cwd: /mnt/wangwai/vla/clawvla
+  cwd: ${PROJECT_ROOT}
   unset_env:
     - PYTHONPATH
   env:
-    PYTHONPATH: /mnt/wangwai/vla/clawvla/src:/mnt/wangwai/vla/CALVIN/calvin_env:/mnt/wangwai/vla/CALVIN/calvin_models
+    PYTHONPATH: ${PROJECT_ROOT}/src:/mnt/wangwai/vla/CALVIN/calvin_env:/mnt/wangwai/vla/CALVIN/calvin_models
+    NO_PROXY: 127.0.0.1,localhost
+    no_proxy: 127.0.0.1,localhost
     PYOPENGL_PLATFORM: egl
     __EGL_VENDOR_LIBRARY_DIRS: /usr/share/glvnd/egl_vendor.d
-    http_proxy: http://10.20.5.5:20171
-    https_proxy: http://10.20.5.5:20171
 
 rollout:
-  base_config: /mnt/wangwai/vla/clawvla/configs/calvin_xvla_enabled_probe.json
+  base_config: ${PROJECT_ROOT}/configs/calvin_xvla_enabled_probe.json
   max_steps: 8
   run_environment: true
   run_robotwin: true

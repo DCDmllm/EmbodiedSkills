@@ -1,7 +1,7 @@
 {
   "name": "clawvla_calvin_xvla_enabled_probe",
   "task": {
-    "instruction": "move the slider left",
+    "instruction": "push the sliding door to the left side",
     "default_stage": "observe"
   },
   "models": {
@@ -168,7 +168,7 @@
   ],
   "environment": {
     "type": "calvin",
-    "artifact_dir": "/mnt/wangwai/vla/clawvla/tmp_artifacts/calvin",
+    "artifact_dir": "${PROJECT_ROOT}/tmp_artifacts/calvin",
     "task_name": "calvin_move_slider_left",
     "seed": 0,
     "params": {
@@ -197,22 +197,22 @@
     }
   },
   "robotwin": {
-    "artifact_dir": "/mnt/wangwai/vla/clawvla/tmp_artifacts"
+    "artifact_dir": "${PROJECT_ROOT}/tmp_artifacts"
   },
   "runtime_environment": {
     "conda_env": "calvin-py38",
     "conda_bin": "/mnt/wangwai/miniconda3/bin/conda",
     "pythonpath_prefix": [
-      "/mnt/wangwai/vla/clawvla/src",
+      "${PROJECT_ROOT}/src",
       "/mnt/wangwai/vla/CALVIN/calvin_env",
       "/mnt/wangwai/vla/CALVIN/calvin_models"
     ],
     "env": {
-      "PYTHONPATH": "/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/vla/CALVIN/calvin_env:/mnt/wangwai/vla/CALVIN/calvin_models",
+      "PYTHONPATH": "${PROJECT_ROOT}/src:/mnt/wangwai/vla/CALVIN/calvin_env:/mnt/wangwai/vla/CALVIN/calvin_models",
       "PYOPENGL_PLATFORM": "egl",
       "__EGL_VENDOR_LIBRARY_DIRS": "/usr/share/glvnd/egl_vendor.d",
-      "http_proxy": "http://10.20.5.5:20171",
-      "https_proxy": "http://10.20.5.5:20171"
+      "NO_PROXY": "127.0.0.1,localhost",
+      "no_proxy": "127.0.0.1,localhost"
     }
   },
   "metadata": {
@@ -222,7 +222,10 @@
       "url": "http://127.0.0.1:8000/act",
       "timeout": 30.0,
       "domain_id": 2,
-      "horizon": 10,
+      "horizon": 20,
+      "inference_steps": 10,
+      "checkpoint_id": "2toINF/X-VLA-Calvin-ABC_D",
+      "checkpoint_sha256": "98813bb2063fa62f8ffb21696546005b61defca6c0724adeab524c8f82f84bd4",
       "serialization": "json_numpy",
       "action_type": "calvin_ee_pose_10d",
       "image_mapping": {

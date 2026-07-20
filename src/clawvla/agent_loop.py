@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 import json
 from typing import Any
 
-from .blackboard_utils import current_observation_id, metadata_value
+from .blackboard_utils import current_observation_id, mark_motion_artifacts_stale, metadata_value
 from .loop_types import (
     ADVANCE_STAGE,
     FINISH_RUN,
@@ -18,8 +18,12 @@ from .loop_types import (
 from .notices import emit_human_trace, emit_runtime_event, emit_status_notice
 from .phase_policy import PhasePolicy
 from .runtime import AgentRuntime
-from .schema import SkillResult
-from .task_semantics import action_backend_requires_candidate_bindings, task_requires_target
+from .schema import SkillResult, Subgoal, TaskPlan
+from .task_semantics import (
+    action_backend_requires_candidate_bindings,
+    action_backend_task_plan_contract,
+    task_requires_target,
+)
 
 
 REPAIR_TARGET_STAGES = {"observe", "plan", "preflight", "recover"}
@@ -87,6 +91,7 @@ class AgentLoop:
                     return LoopRunResult("scheduler_failed", stage, records, reason=decision_result.status)
                 continue
             decision = self._decision_from_result(decision_result)
+            decision = self._enforce_completion_authority(stage, decision)
             if decision.control == RUN_SKILL:
                 decision.stage = self.policy.normalize_stage(decision.stage or stage)
             elif decision.stage is not None:
@@ -117,6 +122,36 @@ class AgentLoop:
             self.runtime.blackboard.write("last_loop_decision", decision, event_type="loop.decision")
 
             if decision.control == FINISH_RUN:
+                if self._environment_oracle_blocks_completion():
+                    self._restore_oracle_owned_subgoal()
+                    self._clear_verify_observation("finish_blocked_by_environment_oracle")
+                    self.runtime.blackboard.write(
+                        "last_verification_report",
+                        None,
+                        event_type="loop.environment_oracle_rejected_finish",
+                    )
+                    mark_motion_artifacts_stale(
+                        self.runtime.blackboard,
+                        "environment_oracle_rejected_finish",
+                        include_goal=True,
+                    )
+                    stage = "preflight"
+                    self.runtime.blackboard.write(
+                        "stage",
+                        stage,
+                        event_type="loop.environment_oracle_rejected_finish",
+                    )
+                    records.append(
+                        LoopStepRecord(
+                            step_index,
+                            stage_before,
+                            decision,
+                            "finish_blocked_by_environment_oracle",
+                            decision_result.to_dict(),
+                        )
+                    )
+                    self._write_loop_history(records)
+                    continue
                 if stage == "verify":
                     self._clear_verify_observation("finish_run")
                 records.append(LoopStepRecord(step_index, stage_before, decision, "finished", decision_result.to_dict()))
@@ -182,6 +217,25 @@ class AgentLoop:
             record = LoopStepRecord(step_index, stage_before, decision, result.status, result.to_dict())
             records.append(record)
             self._write_loop_history(records)
+            if self._environment_oracle_succeeded(decision, result):
+                self._mark_environment_task_succeeded()
+                emit_status_notice(
+                    "environment_task_succeeded",
+                    success=True,
+                    source="agent_loop",
+                    reason="environment_oracle_success",
+                    always=True,
+                )
+                emit_runtime_event(
+                    "clawvla_environment_task_succeeded",
+                    {
+                        "step_index": step_index,
+                        "stage": stage,
+                        "component": decision.next_component,
+                        "skill": decision.next_skill,
+                    },
+                )
+                return LoopRunResult("finished", stage, records, reason="environment_oracle_success")
             stall_reason = self._stall_reason(decision, result, stall_state)
             if stall_reason:
                 return LoopRunResult("stalled_loop", stage, records, reason=stall_reason)
@@ -205,6 +259,35 @@ class AgentLoop:
             stage = self.policy.normalize_stage(self.runtime.blackboard.read("stage") or decision.stage or stage)
 
         return self._max_steps_result(stage, records)
+
+    def _environment_oracle_succeeded(self, decision: LoopDecision, result: SkillResult) -> bool:
+        if not result.success:
+            return False
+        if decision.next_component != "motion" or decision.next_skill != "execute_action":
+            return False
+        report = self.runtime.blackboard.read("execution_report")
+        if isinstance(report, dict) and report.get("status") == "action_executed" and report.get("success") is True:
+            return True
+        env = self.runtime.blackboard.read("env_adapter")
+        task_status = env.task_status() if env is not None and hasattr(env, "task_status") else None
+        return isinstance(task_status, dict) and task_status.get("success") is True
+
+    def _mark_environment_task_succeeded(self) -> None:
+        task_plan = self.runtime.blackboard.read("task_plan")
+        if isinstance(task_plan, TaskPlan):
+            task_plan.status = "succeeded"
+            for subgoal in task_plan.subgoals:
+                if subgoal.status in {"pending", "running"}:
+                    subgoal.status = "succeeded"
+            self.runtime.blackboard.write("task_plan", task_plan, event_type="loop.environment_oracle_task_succeeded")
+        current_subgoal = self.runtime.blackboard.read("current_subgoal")
+        if isinstance(current_subgoal, Subgoal) and current_subgoal.status in {"pending", "running"}:
+            current_subgoal.status = "succeeded"
+            self.runtime.blackboard.write(
+                "current_subgoal",
+                current_subgoal,
+                event_type="loop.environment_oracle_subgoal_succeeded",
+            )
 
     def _stall_reason(
         self,
@@ -846,6 +929,19 @@ class AgentLoop:
 
         if current_stage == "verify":
             if self._task_plan_complete():
+                if self._environment_oracle_blocks_completion():
+                    self._restore_oracle_owned_subgoal()
+                    return _required_decision(
+                        "run_skill",
+                        current_stage,
+                        "scheduler",
+                        "repair_stage_transition",
+                        payload={
+                            "target_stage": "preflight",
+                            "reason": "environment_oracle_not_successful",
+                        },
+                        reason="environment_oracle_not_successful",
+                    )
                 return _required_decision("finish_run", None, reason="task_plan_complete")
             verification = blackboard.read("last_verification_report")
             if verification is None:
@@ -859,6 +955,18 @@ class AgentLoop:
                     )
                 return _required_decision("run_skill", current_stage, "verifier", "verify_progress", reason="missing_verification_report")
             next_action = self._verification_next_action(verification)
+            if next_action in {"advance_subgoal", "finish"} and self._environment_oracle_blocks_completion():
+                return _required_decision(
+                    "run_skill",
+                    current_stage,
+                    "scheduler",
+                    "repair_stage_transition",
+                    payload={
+                        "target_stage": "preflight",
+                        "reason": "environment_oracle_not_successful",
+                    },
+                    reason="environment_oracle_not_successful",
+                )
             if next_action == "advance_subgoal":
                 return _required_decision("run_skill", current_stage, "scheduler", "advance_subgoal", reason="verification_advance_subgoal")
             if next_action in {"continue_execute", "reobserve", "replan", "recover"}:
@@ -883,6 +991,74 @@ class AgentLoop:
     def _task_plan_complete(self) -> bool:
         task_plan = self.runtime.blackboard.read("task_plan")
         return getattr(task_plan, "status", None) == "succeeded" and self.runtime.blackboard.read("current_subgoal") is None
+
+    def _environment_oracle_blocks_completion(self) -> bool:
+        blackboard = self.runtime.blackboard
+        contract = action_backend_task_plan_contract(
+            blackboard.read("action_backend"),
+            blackboard.task_instruction,
+        )
+        if contract.get("completion_authority") != "environment_oracle":
+            return False
+        env = blackboard.read("env_adapter")
+        if env is None or not hasattr(env, "task_status"):
+            return False
+        status = env.task_status()
+        return isinstance(status, dict) and status.get("success") is False
+
+    def _enforce_completion_authority(self, stage: str, decision: LoopDecision) -> LoopDecision:
+        if stage != "verify" or not self._environment_oracle_blocks_completion():
+            return decision
+        attempts_completion = decision.control == FINISH_RUN or (
+            decision.control == RUN_SKILL
+            and decision.next_component == "scheduler"
+            and decision.next_skill == "advance_subgoal"
+        )
+        if not attempts_completion:
+            return decision
+        return LoopDecision(
+            control=RUN_SKILL,
+            stage="verify",
+            next_component="scheduler",
+            next_skill="repair_stage_transition",
+            payload={
+                "target_stage": "preflight",
+                "reason": "environment_oracle_not_successful",
+            },
+            reason="environment_oracle_not_successful",
+            narration="CALVIN oracle has not confirmed success; continue the current atomic task.",
+            state_summary=decision.state_summary,
+            expected_result="Return to preflight and continue bounded execution until the environment oracle succeeds.",
+            metadata={
+                **dict(decision.metadata),
+                "completion_decision_overridden": True,
+                "original_control": decision.control,
+                "original_next_component": decision.next_component,
+                "original_next_skill": decision.next_skill,
+            },
+        )
+
+    def _restore_oracle_owned_subgoal(self) -> None:
+        blackboard = self.runtime.blackboard
+        task_plan = blackboard.read("task_plan")
+        if not isinstance(task_plan, TaskPlan) or not task_plan.subgoals:
+            return
+        current = blackboard.read("current_subgoal")
+        if not isinstance(current, Subgoal):
+            current = task_plan.subgoals[-1]
+        current.status = "running"
+        task_plan.status = "running"
+        task_plan.current_subgoal_id = current.subgoal_id
+        blackboard.write(
+            "task_plan",
+            task_plan,
+            event_type="loop.environment_oracle_restored_task_plan",
+        )
+        blackboard.write(
+            "current_subgoal",
+            current,
+            event_type="loop.environment_oracle_restored_subgoal",
+        )
 
     def _preflight_ready_error(self) -> str | None:
         report = self.runtime.blackboard.read("preflight_report")
@@ -992,6 +1168,9 @@ class AgentLoop:
                 targets.add("plan")
             elif next_action == "recover":
                 targets.add("recover")
+        if verification is not None and self._environment_oracle_blocks_completion():
+            if next_action in {"advance_subgoal", "finish"}:
+                targets.add("preflight")
 
         retry_request = blackboard.read("last_retry_request")
         if isinstance(retry_request, dict):
@@ -1036,6 +1215,13 @@ class AgentLoop:
         if verification is None:
             return None
         next_action = self._verification_next_action(verification)
+        if (
+            next_action in {"advance_subgoal", "finish"}
+            and self._environment_oracle_blocks_completion()
+            and component == "scheduler"
+            and skill == "repair_stage_transition"
+        ):
+            return None
         if next_action == "advance_subgoal" and component == "scheduler" and skill == "advance_subgoal":
             return None
         if next_action in {"continue_execute", "reobserve", "replan", "recover"} and component == "scheduler" and skill == "repair_stage_transition":

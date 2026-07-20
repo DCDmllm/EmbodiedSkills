@@ -12,9 +12,21 @@ from .base import ActionBackendResult
 
 class CalvinHttpActionBackend:
     name = "calvin_http"
+    # X-VLA consumes current images, proprioception, and natural language
+    # directly. Object candidate ids are optional diagnostics, not inputs.
+    requires_candidate_bindings = False
 
     def __init__(self, config: dict[str, Any] | None = None):
         self.config = dict(config or {})
+
+    def task_plan_contract(self, task_instruction: str) -> dict[str, Any]:
+        return {
+            "mode": "atomic_instruction_passthrough",
+            "instruction": str(task_instruction).strip(),
+            "max_subgoals": 1,
+            "candidate_bindings_required": False,
+            "completion_authority": "environment_oracle",
+        }
 
     def build_action_chunk(
         self,
@@ -32,7 +44,18 @@ class CalvinHttpActionBackend:
         try:
             payload, payload_metadata = self._request_payload(observation, request)
             response_payload = self._post(url, payload)
-            commands = _commands_from_response(response_payload, horizon=int(payload["steps"]))
+            response_actions = response_payload.get(
+                "action", response_payload.get("actions")
+            )
+            payload_metadata["response_action_shape"] = (
+                list(np.asarray(response_actions).shape)
+                if response_actions is not None
+                else None
+            )
+            commands = _commands_from_response(
+                response_payload,
+                horizon=int(payload_metadata["execution_horizon"]),
+            )
         except Exception as exc:
             return self._unavailable("calvin_http_inference_failed", request, {"exception": f"{type(exc).__name__}: {exc}"})
         action_type = str(self.config.get("action_type") or "calvin_ee_pose_10d")
@@ -63,6 +86,12 @@ class CalvinHttpActionBackend:
             "backend": self.name,
             "types": {str(self.config.get("action_type") or "calvin_ee_pose_10d"): 10},
             "horizon": int(self.config.get("horizon") or self.config.get("steps") or 10),
+            "inference_steps": int(
+                self.config.get("inference_steps")
+                or self.config.get("diffusion_steps")
+                or self.config.get("steps")
+                or 10
+            ),
             "serialization": str(self.config.get("serialization") or "json_numpy"),
         }
 
@@ -72,7 +101,14 @@ class CalvinHttpActionBackend:
         url = str(self.config.get("url") or self.config.get("endpoint") or "").strip()
         if not url:
             return {"ok": False, "backend": self.name, "reason": "action_backend_url_missing"}
-        return {"ok": True, "backend": self.name, "reason": "configured", "url": _public_url(url)}
+        return {
+            "ok": True,
+            "backend": self.name,
+            "reason": "configured",
+            "url": _public_url(url),
+            "checkpoint_id": self.config.get("checkpoint_id"),
+            "checkpoint_sha256": self.config.get("checkpoint_sha256"),
+        }
 
     def public_config(self) -> dict[str, Any]:
         return {
@@ -81,10 +117,17 @@ class CalvinHttpActionBackend:
             "url": _public_url(str(self.config.get("url") or self.config.get("endpoint") or "")),
             "action_type": self.config.get("action_type", "calvin_ee_pose_10d"),
             "horizon": self.config.get("horizon") or self.config.get("steps"),
+            "inference_steps": (
+                self.config.get("inference_steps")
+                or self.config.get("diffusion_steps")
+                or self.config.get("steps")
+            ),
             "serialization": self.config.get("serialization", "json_numpy"),
             "image_mapping": dict(self.config.get("image_mapping", {}))
             if isinstance(self.config.get("image_mapping"), dict)
             else {},
+            "checkpoint_id": self.config.get("checkpoint_id"),
+            "checkpoint_sha256": self.config.get("checkpoint_sha256"),
         }
 
     def _request_payload(self, observation: ObservationBundle | None, request: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -93,15 +136,30 @@ class CalvinHttpActionBackend:
         prompt = _resolve_prompt(request, observation)
         proprio = _calvin_proprio_from_observation(observation)
         image_payload, image_metadata = _image_payloads(observation, self.config)
-        horizon = int(request.get("horizon") or self.config.get("horizon") or self.config.get("steps") or 10)
-        if horizon <= 0:
-            raise ValueError(f"calvin_http_invalid_horizon:{horizon}")
+        configured_horizon = int(self.config.get("horizon") or self.config.get("steps") or 10)
+        requested_horizon = int(request.get("horizon") or configured_horizon)
+        if configured_horizon <= 0:
+            raise ValueError(f"calvin_http_invalid_configured_horizon:{configured_horizon}")
+        if requested_horizon <= 0:
+            raise ValueError(f"calvin_http_invalid_horizon:{requested_horizon}")
+        execution_horizon = min(requested_horizon, configured_horizon)
+        inference_steps = int(
+            request.get("inference_steps")
+            or self.config.get("inference_steps")
+            or self.config.get("diffusion_steps")
+            or self.config.get("steps")
+            or 10
+        )
+        if inference_steps <= 0:
+            raise ValueError(f"calvin_http_invalid_inference_steps:{inference_steps}")
         serialization = str(self.config.get("serialization") or "json_numpy")
         payload = {
             "language_instruction": prompt,
             "proprio": _serialize_payload(proprio, serialization),
             "domain_id": int(self.config.get("domain_id", 2)),
-            "steps": horizon,
+            # X-VLA interprets `steps` as the flow-matching sampling count. The
+            # number of returned actions is fixed by checkpoint `num_actions`.
+            "steps": inference_steps,
             **image_payload,
         }
         return payload, {
@@ -110,6 +168,10 @@ class CalvinHttpActionBackend:
             "image_sources": image_metadata,
             "domain_id": payload["domain_id"],
             "serialization": serialization,
+            "requested_horizon": requested_horizon,
+            "configured_horizon": configured_horizon,
+            "execution_horizon": execution_horizon,
+            "inference_steps": inference_steps,
         }
 
     def _post(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -210,16 +272,16 @@ def _commands_from_response(response: dict[str, Any], horizon: int) -> list[list
     if actions is None:
         raise KeyError("calvin_http_response_missing_action")
     array = np.asarray(actions, dtype=np.float32)
+    if array.size == 0:
+        raise ValueError("calvin_http_empty_action_response")
     if array.ndim == 1:
         array = array.reshape(1, -1)
     if array.ndim != 2 or array.shape[1] < 10:
         raise ValueError(f"calvin_http_action_shape_invalid:{list(array.shape)}:expected=[N,>=10]")
-    # X-VLA's official CALVIN client executes action_predict[:10] from the
-    # released ee6d checkpoints, whose server returns 20 columns.
-    array = array[:, :10]
-    array = array[:horizon]
-    if array.shape[0] == 0:
-        raise ValueError("calvin_http_empty_action_response")
+    # The released CALVIN checkpoint has num_actions=30 and real_action_dim=20.
+    # The official client consumes a bounded prefix of rows and executes the
+    # first 10 columns of each ee6d action. `steps` does not control row count.
+    array = array[:horizon, :10]
     if not np.isfinite(array).all():
         raise ValueError("calvin_http_action_contains_nonfinite")
     return [[float(item) for item in row.tolist()] for row in array]

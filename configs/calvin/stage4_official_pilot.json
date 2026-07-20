@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "name": "calvin_stage4_official_sequence_pilot_0_9",
+  "source": "calvin_agent.evaluation.multistep_sequences.get_sequences",
+  "official_sequence_pool_size": 1000,
+  "purpose": "Development pilot only; not a formal benchmark result.",
+  "default_seeds": [0],
+  "sequences": [
+    {
+      "sequence_id": "official_000",
+      "official_sequence_index": 0,
+      "expected_initial_state": {"led": 1, "lightbulb": 1, "slider": "left", "drawer": "open", "red_block": "slider_left", "blue_block": "table", "pink_block": "slider_right", "grasped": 0},
+      "expected_subtasks": ["rotate_blue_block_right", "move_slider_right", "lift_red_block_slider", "place_in_slider", "turn_off_lightbulb"]
+    },
+    {
+      "sequence_id": "official_001",
+      "official_sequence_index": 1,
+      "expected_initial_state": {"led": 1, "lightbulb": 1, "slider": "right", "drawer": "open", "red_block": "slider_right", "blue_block": "table", "pink_block": "slider_left", "grasped": 0},
+      "expected_subtasks": ["turn_off_led", "push_into_drawer", "lift_blue_block_drawer", "place_in_slider", "close_drawer"]
+    },
+    {
+      "sequence_id": "official_002",
+      "official_sequence_index": 2,
+      "expected_initial_state": {"led": 0, "lightbulb": 1, "slider": "right", "drawer": "closed", "red_block": "table", "blue_block": "slider_right", "pink_block": "slider_left", "grasped": 0},
+      "expected_subtasks": ["lift_pink_block_slider", "place_in_slider", "open_drawer", "rotate_red_block_right", "lift_red_block_table"]
+    },
+    {
+      "sequence_id": "official_003",
+      "official_sequence_index": 3,
+      "expected_initial_state": {"led": 1, "lightbulb": 0, "slider": "right", "drawer": "closed", "red_block": "slider_right", "blue_block": "table", "pink_block": "table", "grasped": 0},
+      "expected_subtasks": ["rotate_blue_block_right", "lift_pink_block_table", "place_in_slider", "move_slider_left", "open_drawer"]
+    },
+    {
+      "sequence_id": "official_004",
+      "official_sequence_index": 4,
+      "expected_initial_state": {"led": 1, "lightbulb": 0, "slider": "left", "drawer": "closed", "red_block": "slider_right", "blue_block": "table", "pink_block": "table", "grasped": 0},
+      "expected_subtasks": ["open_drawer", "lift_pink_block_table", "place_in_slider", "turn_on_lightbulb", "rotate_blue_block_left"]
+    },
+    {
+      "sequence_id": "official_005",
+      "official_sequence_index": 5,
+      "expected_initial_state": {"led": 1, "lightbulb": 1, "slider": "left", "drawer": "open", "red_block": "slider_right", "blue_block": "table", "pink_block": "table", "grasped": 0},
+      "expected_subtasks": ["push_blue_block_left", "close_drawer", "lift_red_block_slider", "place_in_slider", "turn_off_lightbulb"]
+    },
+    {
+      "sequence_id": "official_006",
+      "official_sequence_index": 6,
+      "expected_initial_state": {"led": 0, "lightbulb": 0, "slider": "right", "drawer": "closed", "red_block": "table", "blue_block": "slider_left", "pink_block": "table", "grasped": 0},
+      "expected_subtasks": ["open_drawer", "rotate_red_block_right", "turn_on_led", "lift_pink_block_table", "stack_block"]
+    },
+    {
+      "sequence_id": "official_007",
+      "official_sequence_index": 7,
+      "expected_initial_state": {"led": 0, "lightbulb": 0, "slider": "left", "drawer": "open", "red_block": "table", "blue_block": "slider_right", "pink_block": "table", "grasped": 0},
+      "expected_subtasks": ["push_pink_block_right", "lift_pink_block_table", "place_in_slider", "push_into_drawer", "close_drawer"]
+    },
+    {
+      "sequence_id": "official_008",
+      "official_sequence_index": 8,
+      "expected_initial_state": {"led": 0, "lightbulb": 1, "slider": "right", "drawer": "closed", "red_block": "table", "blue_block": "slider_left", "pink_block": "slider_right", "grasped": 0},
+      "expected_subtasks": ["open_drawer", "push_red_block_right", "move_slider_left", "lift_pink_block_slider", "place_in_slider"]
+    },
+    {
+      "sequence_id": "official_009",
+      "official_sequence_index": 9,
+      "expected_initial_state": {"led": 1, "lightbulb": 0, "slider": "left", "drawer": "open", "red_block": "table", "blue_block": "table", "pink_block": "slider_left", "grasped": 0},
+      "expected_subtasks": ["push_red_block_left", "lift_blue_block_table", "place_in_slider", "turn_on_lightbulb", "move_slider_right"]
+    }
+  ]
+}

@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 from ..artifacts import ArtifactStore
-from ..config import EnvironmentConfig
+from ..config import EnvironmentConfig, PROJECT_ROOT
 from ..notices import emit_status_notice
 from ..schema import ActionChunk, CameraView, ObservationBundle, RobotArmState
 from .base import RobotEnvAdapter
@@ -61,7 +61,7 @@ class RoboCasaAdapter(RobotEnvAdapter):
                 config.metadata.get("debug_expose_environment_semantics"),
             )
         )
-        self.artifacts = ArtifactStore(config.artifact_dir or "/mnt/wangwai/vla/clawvla/tmp_artifacts/robocasa")
+        self.artifacts = ArtifactStore(config.artifact_dir or Path(PROJECT_ROOT) / "tmp_artifacts" / "robocasa")
         self.env: Any | None = None
         self.last_raw_observation: dict[str, Any] | None = None
         self.last_observation: ObservationBundle | None = None

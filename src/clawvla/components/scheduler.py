@@ -8,7 +8,11 @@ from ..loop_types import MAX_ACTION_HORIZON, MIN_ACTION_HORIZON, LoopDecision
 from ..model_calls import call_component_json
 from ..schema import SchedulerDecision, SkillRequest, SkillResult, Subgoal, TaskPlan
 from ..skills.base import SkillContext, SkillRegistry
-from ..task_semantics import action_backend_requires_candidate_bindings, task_plan_requires_target
+from ..task_semantics import (
+    action_backend_requires_candidate_bindings,
+    action_backend_task_plan_contract,
+    task_plan_requires_target,
+)
 from .skill_helpers import ok, register_skill, to_dict, unavailable
 
 
@@ -154,7 +158,9 @@ def choose_next_skill(request: SkillRequest, context: SkillContext) -> SkillResu
 def build_task_plan(request: SkillRequest, context: SkillContext) -> SkillResult:
     blackboard = context.blackboard
     world_state = blackboard.read("world_state")
-    require_candidate_bindings = action_backend_requires_candidate_bindings(blackboard.read("action_backend"))
+    action_backend = blackboard.read("action_backend")
+    require_candidate_bindings = action_backend_requires_candidate_bindings(action_backend)
+    backend_contract = action_backend_task_plan_contract(action_backend, blackboard.task_instruction)
     if world_state is None and require_candidate_bindings:
         return unavailable("task_plan_unavailable", "missing_world_state", {})
     source_id = getattr(world_state, "source_candidate_id", None)
@@ -163,25 +169,43 @@ def build_task_plan(request: SkillRequest, context: SkillContext) -> SkillResult
         return unavailable("task_plan_unavailable", "missing_source_candidate", {"world_state": to_dict(world_state)})
 
     if context.has_model and request.payload.get("use_model", True):
-        raw = call_component_json(
-            context,
-            instruction=_task_plan_instruction(),
-            payload={
-                "original_task_instruction": blackboard.task_instruction,
-                "world_state": to_dict(world_state),
-                "required_schema": _task_plan_schema(
-                    source_id,
-                    target_id,
-                    candidate_bindings_required=require_candidate_bindings,
-                ),
-                "hard_planning_constraints": _task_plan_hard_constraints(),
-                "instruction_style_examples": _task_plan_style_examples(),
-                "full_plan_few_shots": _task_plan_full_few_shots(),
-            },
-            image_paths=request.payload.get("image_paths"),
-            render_format=request.payload.get("render_format", "json"),
-        )
-        plan = TaskPlan.from_payload(raw)
+        try:
+            raw = call_component_json(
+                context,
+                instruction=_task_plan_instruction(),
+                payload={
+                    "original_task_instruction": blackboard.task_instruction,
+                    "world_state": to_dict(world_state),
+                    "required_schema": _task_plan_schema(
+                        source_id,
+                        target_id,
+                        candidate_bindings_required=require_candidate_bindings,
+                    ),
+                    "hard_planning_constraints": _task_plan_hard_constraints(),
+                    "action_backend_task_plan_contract": backend_contract,
+                    "instruction_style_examples": _task_plan_style_examples(),
+                    "full_plan_few_shots": _task_plan_full_few_shots(),
+                },
+                image_paths=request.payload.get("image_paths"),
+                render_format=request.payload.get("render_format", "json"),
+            )
+            proposed_plan = TaskPlan.from_payload(raw)
+        except Exception as exc:
+            if backend_contract.get("mode") != "atomic_instruction_passthrough":
+                raise
+            raw = {}
+            proposed_plan = None
+            plan = _atomic_passthrough_task_plan(
+                blackboard.task_instruction,
+                backend_contract,
+                model_proposal_error=f"{type(exc).__name__}: {exc}",
+            )
+        else:
+            plan = _apply_backend_task_plan_contract(
+                proposed_plan,
+                blackboard.task_instruction,
+                backend_contract,
+            )
         validation_errors = _validate_task_plan_completeness(
             plan,
             blackboard.task_instruction,
@@ -190,7 +214,7 @@ def build_task_plan(request: SkillRequest, context: SkillContext) -> SkillResult
             candidate_bindings_required=require_candidate_bindings,
         )
         if not validation_errors:
-            plan.metadata["source"] = "scheduler_model"
+            plan.metadata.setdefault("source", "scheduler_model")
         else:
             return unavailable(
                 "task_plan_invalid_model_output",
@@ -225,6 +249,76 @@ def build_task_plan(request: SkillRequest, context: SkillContext) -> SkillResult
     blackboard.write("current_subgoal", None, event_type="scheduler.build_task_plan_reset_current_subgoal")
     mark_motion_artifacts_stale(blackboard, "task_plan_rebuilt", include_goal=True)
     return ok("task_plan_built", {"task_plan": plan.to_dict()})
+
+
+def _apply_backend_task_plan_contract(
+    proposed_plan: TaskPlan,
+    task_instruction: str | None,
+    contract: dict[str, Any],
+) -> TaskPlan:
+    """Adapt a model proposal to an action backend's executable contract."""
+    if contract.get("mode") != "atomic_instruction_passthrough":
+        return proposed_plan
+
+    return _atomic_passthrough_task_plan(
+        task_instruction,
+        contract,
+        proposed_plan=proposed_plan,
+    )
+
+
+def _atomic_passthrough_task_plan(
+    task_instruction: str | None,
+    contract: dict[str, Any],
+    *,
+    proposed_plan: TaskPlan | None = None,
+    model_proposal_error: str | None = None,
+) -> TaskPlan:
+    instruction = str(contract.get("instruction") or task_instruction or "").strip()
+    action_type = _atomic_action_type(instruction)
+    proposed_payload = proposed_plan.to_dict() if proposed_plan is not None else None
+    metadata: dict[str, Any] = {
+        **dict(proposed_plan.metadata if proposed_plan is not None else {}),
+        "backend_contract": dict(contract),
+        "model_proposed_subgoal_count": len(proposed_plan.subgoals) if proposed_plan is not None else None,
+        "model_proposed_task_plan": proposed_payload,
+    }
+    if model_proposal_error is not None:
+        metadata.update(
+            {
+                "source": "scheduler_model_fallback_to_backend_contract",
+                "model_proposal_error": model_proposal_error,
+            }
+        )
+    return TaskPlan(
+        task=instruction,
+        subgoals=[
+            Subgoal(
+                subgoal_id="S1",
+                type=action_type,
+                instruction=instruction,
+                source_candidate_id=None,
+                target_candidate_id=None,
+                status="pending",
+                completion_criteria={
+                    "natural_language": "The environment oracle reports the complete task as successful."
+                },
+                metadata={
+                    "instruction_passthrough": True,
+                    "completion_authority": contract.get("completion_authority", "environment_oracle"),
+                },
+            )
+        ],
+        current_subgoal_id="S1",
+        status="pending",
+        metadata=metadata,
+    )
+
+
+def _atomic_action_type(instruction: str) -> str:
+    first_word = str(instruction).strip().lower().split(maxsplit=1)[0] if str(instruction).strip() else "act"
+    normalized = "".join(character for character in first_word if character.isalnum() or character == "_")
+    return (normalized or "act")[:32]
 
 
 def select_current_subgoal(request: SkillRequest, context: SkillContext) -> SkillResult:

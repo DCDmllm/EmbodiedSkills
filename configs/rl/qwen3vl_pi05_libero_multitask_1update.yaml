@@ -10,18 +10,18 @@ planner_aux:
 
 environment:
   python: /mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python
-  cwd: /mnt/wangwai/vla/clawvla
+  cwd: ${PROJECT_ROOT}
   unset_env:
     - PYTHONPATH
   env:
-    PYTHONPATH: /mnt/wangwai/vla/clawvla/src:/mnt/wangwai/lerobot/src
+    PYTHONPATH: ${PROJECT_ROOT}/src:/mnt/wangwai/lerobot/src
     MUJOCO_GL: egl
     PYOPENGL_PLATFORM: egl
     __EGL_VENDOR_LIBRARY_DIRS: /usr/share/glvnd/egl_vendor.d
     VK_ICD_FILENAMES: /etc/vulkan/icd.d/nvidia_icd.json
 
 rollout:
-  base_config: /mnt/wangwai/vla/clawvla/configs/libero_pi05_enabled_probe.json
+  base_config: ${PROJECT_ROOT}/configs/libero_pi05_enabled_probe.json
   max_steps: 4
   run_environment: true
   run_robotwin: true

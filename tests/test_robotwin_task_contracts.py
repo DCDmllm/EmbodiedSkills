@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -35,6 +36,8 @@ def _self_method_calls(node: ast.AST) -> set[str]:
 
 
 def test_robotwin_success_state_does_not_depend_on_expert_play_once() -> None:
+    if not ROBOTWIN_ENVS.is_dir():
+        pytest.skip(f"RoboTwin source checkout is required for source-contract audit: {ROBOTWIN_ENVS}")
     payload = yaml.safe_load(TASK_CONFIG.read_text(encoding="utf-8"))
     task_names = [row["task_name"] for row in payload["rollout"]["tasks"]]
     assert len(task_names) == 50

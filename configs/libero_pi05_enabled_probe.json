@@ -175,7 +175,7 @@
   ],
   "environment": {
     "type": "libero",
-    "artifact_dir": "/mnt/wangwai/vla/clawvla/tmp_artifacts/libero",
+    "artifact_dir": "${PROJECT_ROOT}/tmp_artifacts/libero",
     "task_name": "libero_object",
     "seed": 0,
     "params": {
@@ -199,17 +199,17 @@
     "task_name": "place_container_plate",
     "task_config": "demo_clean",
     "seed": 0,
-    "artifact_dir": "/mnt/wangwai/vla/clawvla/tmp_artifacts"
+    "artifact_dir": "${PROJECT_ROOT}/tmp_artifacts"
   },
   "runtime_environment": {
     "conda_env": "robotwin-py312",
     "conda_bin": "/mnt/wangwai/miniconda3/bin/conda",
     "pythonpath_prefix": [
-      "/mnt/wangwai/vla/clawvla/src",
+      "${PROJECT_ROOT}/src",
       "/mnt/wangwai/lerobot/src"
     ],
     "env": {
-      "PYTHONPATH": "/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/lerobot/src",
+      "PYTHONPATH": "${PROJECT_ROOT}/src:/mnt/wangwai/lerobot/src",
       "MUJOCO_GL": "egl",
       "PYOPENGL_PLATFORM": "egl",
       "__EGL_VENDOR_LIBRARY_DIRS": "/usr/share/glvnd/egl_vendor.d",

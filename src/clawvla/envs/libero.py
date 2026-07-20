@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 
 from ..artifacts import ArtifactStore
-from ..config import EnvironmentConfig
+from ..config import EnvironmentConfig, PROJECT_ROOT
 from ..notices import emit_status_notice
 from ..schema import ActionChunk, CameraView, ObservationBundle, RobotArmState
 from .base import RobotEnvAdapter
@@ -33,7 +33,7 @@ class LiberoAdapter(RobotEnvAdapter):
         self.init_states = bool(params.get("init_states", True))
         self.num_steps_wait = int(params.get("num_steps_wait", 10))
         self.render_gpu_device_id = int(params.get("render_gpu_device_id", -1))
-        self.artifacts = ArtifactStore(config.artifact_dir or "/mnt/wangwai/vla/clawvla/tmp_artifacts/libero")
+        self.artifacts = ArtifactStore(config.artifact_dir or Path(PROJECT_ROOT) / "tmp_artifacts" / "libero")
         self.env: Any | None = None
         self.suite: Any | None = None
         self.task: Any | None = None

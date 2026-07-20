@@ -32,7 +32,7 @@ from clawvla.components.scheduler import (
 )
 from clawvla.components.verifier import _subgoal_verification_contract, _verifier_blackboard_context, verify_progress
 from clawvla.envs import build_env_adapter, normalize_calvin_observation, normalize_libero_observation
-from clawvla.envs.robotwin_session import prepare_task_args
+from clawvla.envs.robotwin_session import apply_camera_profile, prepare_task_args
 from clawvla.components.vision import localize_task_objects
 from clawvla.loop_types import LoopDecision, LoopStepRecord
 from clawvla.notices import _collect_markers
@@ -365,18 +365,38 @@ def test_calvin_http_backend_builds_chunk_from_real_response(monkeypatch, tmp_pa
     assert result.action_chunk.action_type == "calvin_ee_pose_10d"
     assert result.action_chunk.commands == [[float(i) for i in range(10)], [float(i + 20) for i in range(10)]]
     assert calls[0]["json"]["language_instruction"] == "move the slider left."
-    assert calls[0]["json"]["steps"] == 2
+    assert calls[0]["json"]["steps"] == 10
+    assert result.action_chunk.control_horizon == 2
+    assert result.metadata["response_action_shape"] == [2, 20]
     assert len(calls[0]["json"]["proprio"]) == 20
 
 
-def test_pi05_libero_checkpoint_diagnosis() -> None:
+def test_pi05_libero_checkpoint_diagnosis(tmp_path) -> None:
     from clawvla.action_backends.pi05 import Pi05ActionBackend
 
+    checkpoint = tmp_path / "pi05_libero"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps(
+            {
+                "type": "pi05",
+                "input_features": {
+                    "observation.state": {"type": "state", "shape": [8]},
+                },
+                "output_features": {
+                    "action": {"type": "action", "shape": [7]},
+                },
+                "chunk_size": 10,
+                "n_action_steps": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
     backend = Pi05ActionBackend(
         {
             "type": "pi05",
             "enabled": True,
-            "pretrained_path": "/mnt/wangwai/weights/lerobot/pi05_libero_finetuned_v044",
+            "pretrained_path": str(checkpoint),
             "environment_adapter": {"type": "libero"},
             "lerobot_env": {"task": "libero_object"},
         }
@@ -1801,6 +1821,7 @@ def test_openrlhf_train_command_allows_adam_offload_opt_out(tmp_path, monkeypatc
 
 def test_openrlhf_train_command_allows_cuda_graph(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CLAWVLA_OPENRLHF_VLLM_ENFORCE_EAGER", raising=False)
+    monkeypatch.setattr("clawvla.rl.openrlhf_runner.build_rollout_episode_specs", lambda _config: [object()])
     config = load_rl_config("configs/rl/qwen3vl_pi05_online_seed_mix_cudagraph_smoke.yaml")
     command = _openrlhf_train_command(
         config,
@@ -1825,6 +1846,7 @@ def test_openrlhf_train_command_allows_cuda_graph(tmp_path, monkeypatch) -> None
 def test_online_seed_mix_keeps_all_periodic_checkpoints(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CLAWVLA_OPENRLHF_VLLM_ENFORCE_EAGER", raising=False)
     monkeypatch.setenv("WANDB_API_KEY", "secret-that-must-not-enter-command")
+    monkeypatch.setattr("clawvla.rl.openrlhf_runner.build_rollout_episode_specs", lambda _config: [object()])
     config = load_rl_config("configs/rl/qwen3vl_pi05_online_seed_mix_grpo.yaml")
     command = _openrlhf_train_command(
         config,
@@ -1843,6 +1865,7 @@ def test_online_seed_mix_keeps_all_periodic_checkpoints(tmp_path, monkeypatch) -
 def test_online_wandb_requires_preconfigured_credentials(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("WANDB_API_KEY", raising=False)
     monkeypatch.setattr("clawvla.rl.openrlhf_runner._wandb_auth_available", lambda: False)
+    monkeypatch.setattr("clawvla.rl.openrlhf_runner.build_rollout_episode_specs", lambda _config: [object()])
     config = load_rl_config("configs/rl/qwen3vl_pi05_online_seed_mix_grpo.yaml")
 
     with pytest.raises(RuntimeError, match="wandb login"):
@@ -2137,9 +2160,22 @@ def test_run_loop_applies_runtime_environment(monkeypatch) -> None:
 
 
 def test_robotwin_camera_profile_applies_to_all_observation_cameras() -> None:
-    config = RobotwinConfig(camera_profile="Large_D435_Wide")
+    args = {
+        "camera": {
+            "head_camera_type": "D435",
+            "wrist_camera_type": "D435",
+        },
+        "left_embodiment_config": {
+            "static_camera_list": [
+                {"name": "head_camera", "type": "D435"},
+                {"name": "front_camera", "type": "D435"},
+            ]
+        },
+        "right_embodiment_config": {"static_camera_list": []},
+    }
+    camera_map = {"Large_D435_Wide": {"h": 540, "w": 960}}
 
-    args = prepare_task_args(config)
+    apply_camera_profile(args, camera_map, "Large_D435_Wide")
 
     assert args["camera"]["head_camera_type"] == "Large_D435_Wide"
     assert args["camera"]["wrist_camera_type"] == "Large_D435_Wide"
@@ -2152,8 +2188,6 @@ def test_robotwin_camera_profile_applies_to_all_observation_cameras() -> None:
         "head_camera": "Large_D435_Wide",
         "front_camera": "Large_D435_Wide",
     }
-    assert args["head_camera_h"] == 540
-    assert args["head_camera_w"] == 960
 
 
 def test_vla_prompt_uses_subgoal_instruction_without_agent_schema() -> None:
@@ -2308,6 +2342,148 @@ def test_direct_vla_task_plan_accepts_no_candidate_bindings() -> None:
     )
 
     assert errors == []
+
+
+def test_calvin_task_plan_collapses_model_decomposition_to_exact_official_instruction(monkeypatch) -> None:
+    from clawvla.action_backends.calvin import CalvinHttpActionBackend
+
+    official = "push the sliding door to the left side"
+
+    def fake_call_component_json(context, *, instruction, payload, image_paths, render_format):
+        assert payload["action_backend_task_plan_contract"]["mode"] == "atomic_instruction_passthrough"
+        return {
+            "task": official,
+            "subgoals": [
+                {
+                    "subgoal_id": "S1",
+                    "type": "grasp",
+                    "instruction": "Grasp the sliding-door handle.",
+                    "completion_criteria": {"natural_language": "The handle is held."},
+                },
+                {
+                    "subgoal_id": "S2",
+                    "type": "move",
+                    "instruction": "Move the handle left.",
+                    "completion_criteria": {"natural_language": "The door moved left."},
+                },
+                {
+                    "subgoal_id": "S3",
+                    "type": "release",
+                    "instruction": "Release the handle.",
+                    "completion_criteria": {"natural_language": "The handle is released."},
+                },
+            ],
+            "current_subgoal_id": "S1",
+        }
+
+    monkeypatch.setattr("clawvla.components.scheduler.call_component_json", fake_call_component_json)
+    blackboard = Blackboard(task_instruction=official)
+    blackboard.write("action_backend", CalvinHttpActionBackend({"enabled": True}))
+
+    result = build_task_plan(
+        SkillRequest(component="scheduler", skill="build_task_plan", payload={"use_model": True}, stage="plan"),
+        SkillContext("scheduler", blackboard, SimpleNamespace(enabled=True)),
+    )
+
+    plan = blackboard.read("task_plan")
+    assert result.success is True
+    assert len(plan.subgoals) == 1
+    assert plan.task == official
+    assert plan.subgoals[0].instruction == official
+    assert plan.subgoals[0].type == "push"
+    assert plan.subgoals[0].source_candidate_id is None
+    assert plan.subgoals[0].target_candidate_id is None
+    assert plan.metadata["model_proposed_subgoal_count"] == 3
+    assert plan.metadata["backend_contract"]["completion_authority"] == "environment_oracle"
+
+
+def test_calvin_task_plan_uses_atomic_contract_when_model_json_is_truncated(monkeypatch) -> None:
+    from clawvla.action_backends.calvin import CalvinHttpActionBackend
+
+    official = "grasp and lift the pink block"
+
+    def fail_call_component_json(*args, **kwargs):
+        raise ValueError("scheduler model output did not contain a JSON object: truncated")
+
+    monkeypatch.setattr("clawvla.components.scheduler.call_component_json", fail_call_component_json)
+    blackboard = Blackboard(task_instruction=official)
+    blackboard.write("action_backend", CalvinHttpActionBackend({"enabled": True}))
+
+    result = build_task_plan(
+        SkillRequest(component="scheduler", skill="build_task_plan", payload={"use_model": True}, stage="plan"),
+        SkillContext("scheduler", blackboard, SimpleNamespace(enabled=True)),
+    )
+
+    plan = blackboard.read("task_plan")
+    assert result.success is True
+    assert len(plan.subgoals) == 1
+    assert plan.subgoals[0].instruction == official
+    assert plan.metadata["source"] == "scheduler_model_fallback_to_backend_contract"
+    assert "truncated" in plan.metadata["model_proposal_error"]
+
+
+def test_direct_vla_bootstrap_stops_after_current_images() -> None:
+    from clawvla.scripts.run_loop import _bootstrap_observe
+
+    class RuntimeStub:
+        def __init__(self) -> None:
+            self.blackboard = Blackboard(task_instruction="push the sliding door to the left side")
+            self.blackboard.write("action_backend", SimpleNamespace(requires_candidate_bindings=False))
+            self.calls = []
+
+        def run_skill(self, component, skill, payload=None, **kwargs):
+            self.calls.append((component, skill))
+            return SkillResult(success=True, status="observation_captured")
+
+    runtime = RuntimeStub()
+
+    result = _bootstrap_observe(runtime, runtime.blackboard.task_instruction, "test", True)
+
+    assert result.success is True
+    assert runtime.calls == [("vision", "capture_views")]
+    assert runtime.blackboard.read("bootstrap_observe_mode") == "direct_vla_images_only"
+
+
+def test_run_loop_seed_override_is_applied_before_environment_build(monkeypatch, tmp_path) -> None:
+    from clawvla.config import AgentConfig
+    from clawvla.scripts import run_loop
+
+    config = AgentConfig(name="seed-test")
+    config.environment.seed = 99
+    captured = {}
+
+    class RuntimeStub:
+        def __init__(self, loaded_config):
+            captured["runtime_seed"] = loaded_config.environment.seed
+            self.blackboard = Blackboard(task_instruction="test")
+
+        def run_loop(self, **kwargs):
+            return SimpleNamespace(to_dict=lambda: {"status": "finished", "final_stage": "observe", "steps": []})
+
+    class AdapterStub:
+        def close(self):
+            pass
+
+        def task_status(self):
+            return {"success": False}
+
+    monkeypatch.setattr(run_loop, "load_config", lambda path: config)
+    monkeypatch.setattr(run_loop, "AgentRuntime", RuntimeStub)
+    monkeypatch.setattr(run_loop, "build_env_adapter", lambda loaded_config: AdapterStub())
+    monkeypatch.setattr(run_loop, "_print_result", lambda runtime, result, output_path: None)
+
+    run_loop.run_agent_loop(
+        config_path="unused.json",
+        instruction="test",
+        artifact_prefix="seed_test",
+        initial_stage="observe",
+        max_steps=1,
+        seed=7,
+        result_output=tmp_path / "result.json",
+        run_environment=False,
+    )
+
+    assert captured["runtime_seed"] == 7
 
 
 def test_task_plan_instruction_prefers_atomic_multi_step_subgoals() -> None:
@@ -4356,6 +4532,132 @@ def test_agent_loop_returns_skill_failure_to_scheduler_without_exiting() -> None
     assert runtime.scheduler_calls == 2
     assert result.steps[0].status == "observation_unavailable"
     assert result.steps[0].result["errors"] == ["rendering_device_missing"]
+
+
+def test_agent_loop_finishes_immediately_when_environment_oracle_succeeds() -> None:
+    class ComponentsStub:
+        def names(self):
+            return ["scheduler", "motion"]
+
+    class RuntimeStub:
+        def __init__(self) -> None:
+            self.blackboard = Blackboard(task_instruction="push the sliding door to the left side")
+            self.blackboard.write("stage", "execute")
+            subgoal = Subgoal(
+                "S1",
+                "push",
+                instruction=self.blackboard.task_instruction,
+                status="running",
+                completion_criteria={"natural_language": "The door is open to the left."},
+            )
+            self.blackboard.write(
+                "task_plan",
+                TaskPlan(
+                    task=self.blackboard.task_instruction,
+                    subgoals=[subgoal],
+                    current_subgoal_id="S1",
+                    status="running",
+                ),
+            )
+            self.blackboard.write("current_subgoal", subgoal)
+            self.components = ComponentsStub()
+
+        def run_skill(self, component, skill, payload=None, **kwargs):
+            if (component, skill) == ("scheduler", "choose_next_skill"):
+                return SkillResult(
+                    success=True,
+                    status="next_skill_chosen_by_model",
+                    output={
+                        "loop_decision": {
+                            "control": "run_skill",
+                            "stage": "execute",
+                            "next_component": "motion",
+                            "next_skill": "execute_action",
+                        }
+                    },
+                )
+            if (component, skill) == ("motion", "execute_action"):
+                self.blackboard.write(
+                    "execution_report",
+                    {"status": "action_executed", "success": True, "done": True},
+                )
+                return SkillResult(success=True, status="action_executed")
+            raise AssertionError(f"unexpected skill {component}.{skill}")
+
+    runtime = RuntimeStub()
+    loop = AgentLoop(runtime, config=AgentLoopConfig(max_steps=3))
+    loop._validate_run_skill_decision = lambda decision: None
+
+    result = loop.run()
+
+    assert result.status == "finished"
+    assert result.reason == "environment_oracle_success"
+    assert len(result.steps) == 1
+    assert runtime.blackboard.read("task_plan").status == "succeeded"
+    assert runtime.blackboard.read("current_subgoal").status == "succeeded"
+    assert runtime.blackboard.read("stage") == "execute"
+
+
+def test_agent_loop_rejects_visual_completion_when_environment_oracle_is_false() -> None:
+    from clawvla.action_backends.calvin import CalvinHttpActionBackend
+
+    class EnvStub:
+        def task_status(self):
+            return {"backend": "calvin", "success": False}
+
+    subgoal = Subgoal(
+        "S1",
+        "lift",
+        instruction="grasp and lift the pink block",
+        status="running",
+        completion_criteria={"natural_language": "The oracle reports success."},
+    )
+    blackboard = Blackboard(task_instruction=subgoal.instruction)
+    blackboard.write("stage", "verify")
+    blackboard.write("action_backend", CalvinHttpActionBackend({"enabled": True}))
+    blackboard.write("env_adapter", EnvStub())
+    blackboard.write(
+        "task_plan",
+        TaskPlan(
+            task=subgoal.instruction,
+            subgoals=[subgoal],
+            current_subgoal_id="S1",
+            status="running",
+        ),
+    )
+    blackboard.write("current_subgoal", subgoal)
+    blackboard.write(
+        "last_verification_report",
+        VerificationReport(
+            success=True,
+            metadata={"next_action": "advance_subgoal", "current_subgoal_id": "S1"},
+        ),
+    )
+    loop = AgentLoop(SimpleNamespace(blackboard=blackboard))
+    loop.runtime.components = SimpleNamespace(names=lambda: ["scheduler"])
+
+    required = loop._next_required_decision_summary("verify", None)
+    corrected = loop._enforce_completion_authority(
+        "verify",
+        LoopDecision(
+            control="run_skill",
+            stage="verify",
+            next_component="scheduler",
+            next_skill="advance_subgoal",
+        ),
+    )
+
+    assert required["control"] == "run_skill"
+    assert required["next_component"] == "scheduler"
+    assert required["next_skill"] == "repair_stage_transition"
+    assert required["payload"] == {
+        "target_stage": "preflight",
+        "reason": "environment_oracle_not_successful",
+    }
+    assert "preflight" in loop._repair_allowed_target_stages()
+    assert corrected.next_skill == "repair_stage_transition"
+    assert corrected.metadata["completion_decision_overridden"] is True
+    assert loop._validate_run_skill_decision(corrected) is None
 
 
 def test_execute_action_blocks_stale_action_chunk(tmp_path) -> None:

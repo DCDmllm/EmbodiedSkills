@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 
 _TARGET_REQUIRED_SUBGOAL_TYPES = {
@@ -68,6 +68,23 @@ def action_backend_requires_candidate_bindings(action_backend: object | None) ->
     Unknown backends keep the conservative historical behavior.
     """
     return bool(getattr(action_backend, "requires_candidate_bindings", True))
+
+
+def action_backend_task_plan_contract(
+    action_backend: object | None,
+    task_instruction: object | None,
+) -> dict[str, Any]:
+    """Return an optional backend-owned planning contract.
+
+    Backends may constrain how a high-level task is presented to an action
+    model.  Keeping that policy on the backend avoids scattering environment
+    names through the generic scheduler.
+    """
+    contract_factory = getattr(action_backend, "task_plan_contract", None)
+    if not callable(contract_factory):
+        return {}
+    contract = contract_factory(str(task_instruction or ""))
+    return dict(contract) if isinstance(contract, dict) else {}
 
 
 def _normalize_identifier(value: object | None) -> str:
