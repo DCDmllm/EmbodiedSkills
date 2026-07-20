@@ -1,7 +1,8 @@
 # 铭健阶段 3 CALVIN 工程报告：绿旗一举，Agent 立即收车
 
-日期：2026-07-17  
-工作分支：`mingjian/calvin-stage3-integration`  
+日期：2026-07-17
+
+工作分支：`mingjian/calvin-stage3-integration`
 基线分支：`mingjian/calvin-stage1`
 
 任务流程图见：[阶段 3 CALVIN 任务流程可视化](stage3_task_flow_visualization.md)。

@@ -1,6 +1,6 @@
 # 阶段 3：Planner、Verifier 与 CALVIN oracle 接口契约（待核心负责人确认）
 
-日期：2026-07-17  
+日期：2026-07-17
 实现分支：`mingjian/calvin-stage3-integration`
 
 ## 1. 权威顺序
