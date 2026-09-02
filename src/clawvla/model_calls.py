@@ -7,20 +7,18 @@ from .rendering import render_payload
 from .skills import SkillContext
 
 
-def call_component_json(
-    context: SkillContext,
+def build_component_prompt(
     instruction: str,
     payload: dict[str, Any],
-    image_paths: list[str] | None = None,
+    *,
     render_format: str = "json",
-    max_new_tokens: int | None = None,
-    temperature: float | None = None,
-) -> dict[str, Any]:
-    if context.model_runtime is None or not context.model_runtime.enabled:
-        raise RuntimeError(f"Component {context.component_name} has no enabled model runtime.")
-
+    schema_guidance: bool = True,
+) -> str:
+    """Render the exact text sent by a production component model call."""
     context_text = render_payload(payload, fmt=render_format, root_tag="clawvla_context")
-    prompt = (
+    if not schema_guidance:
+        return f"{instruction.strip()}\n\n{context_text}"
+    return (
         f"{instruction.strip()}\n\n"
         "Return exactly one JSON object. Do not include markdown fences or extra text. "
         "If the context contains required_schema, it is the exact output contract: return an object with "
@@ -29,14 +27,41 @@ def call_component_json(
         "keys are explicitly present in required_schema.\n\n"
         f"{context_text}"
     )
+
+
+def call_component_json(
+    context: SkillContext,
+    instruction: str,
+    payload: dict[str, Any],
+    image_paths: list[str] | None = None,
+    render_format: str = "json",
+    max_new_tokens: int | None = None,
+    temperature: float | None = None,
+    schema_guidance: bool = True,
+) -> dict[str, Any]:
+    if context.model_runtime is None or not context.model_runtime.enabled:
+        raise RuntimeError(f"Component {context.component_name} has no enabled model runtime.")
+
+    prompt = build_component_prompt(
+        instruction,
+        payload,
+        render_format=render_format,
+        schema_guidance=schema_guidance,
+    )
     content: list[dict[str, str]] = []
     for image_path in image_paths or []:
         content.append({"type": "image", "image": image_path})
     content.append({"type": "text", "text": prompt})
+    runtime_config = getattr(context.model_runtime, "config", None)
+    routed_model = getattr(runtime_config, "model", None) or getattr(
+        context.model_runtime, "name", None
+    )
     context.blackboard.append_event(
         "model.call",
         {
             "component": context.component_name,
+            "model_route": context.model_route,
+            "model": routed_model,
             "image_count": len(image_paths or []),
             "render_format": render_format,
         },
@@ -51,6 +76,8 @@ def call_component_json(
         "model.output",
         {
             "component": context.component_name,
+            "model_route": context.model_route,
+            "model": routed_model,
             "raw_text_preview": raw_text[:4000],
             "raw_text_length": len(raw_text),
             "truncated": len(raw_text) > 4000,

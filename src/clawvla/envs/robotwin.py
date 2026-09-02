@@ -105,7 +105,15 @@ class RoboTwinAdapter(RobotEnvAdapter):
                 task_env.take_action(command_payload, action_type=action_chunk.action_type)
                 executed.append(command_payload)
             raw_observation = task_env.get_obs()
-            success = task_env.check_success() if hasattr(task_env, "check_success") else None
+            skip_success_check = bool(
+                isinstance(action_chunk.metadata, dict)
+                and action_chunk.metadata.get("skip_success_check")
+            )
+            success = (
+                None
+                if skip_success_check
+                else task_env.check_success() if hasattr(task_env, "check_success") else None
+            )
         artifact_prefix = str(action_chunk.metadata.get("artifact_prefix", "execute")) if isinstance(action_chunk.metadata, dict) else "execute"
         if isinstance(raw_observation, dict):
             self.last_observation = normalize_robotwin_observation(

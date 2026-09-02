@@ -163,25 +163,40 @@ def build_task_plan(request: SkillRequest, context: SkillContext) -> SkillResult
         return unavailable("task_plan_unavailable", "missing_source_candidate", {"world_state": to_dict(world_state)})
 
     if context.has_model and request.payload.get("use_model", True):
+        instruction, planner_payload = build_task_planner_model_request(
+            task_instruction=blackboard.task_instruction,
+            world_state=world_state,
+            image_roles=_task_plan_image_roles(
+                blackboard,
+                list(request.payload.get("image_paths") or []),
+            ),
+        )
         raw = call_component_json(
             context,
-            instruction=_task_plan_instruction(),
-            payload={
-                "original_task_instruction": blackboard.task_instruction,
-                "world_state": to_dict(world_state),
-                "required_schema": _task_plan_schema(
-                    source_id,
-                    target_id,
-                    candidate_bindings_required=require_candidate_bindings,
-                ),
-                "hard_planning_constraints": _task_plan_hard_constraints(),
-                "instruction_style_examples": _task_plan_style_examples(),
-                "full_plan_few_shots": _task_plan_full_few_shots(),
-            },
+            instruction=instruction,
+            payload=planner_payload,
             image_paths=request.payload.get("image_paths"),
             render_format=request.payload.get("render_format", "json"),
+            schema_guidance=False,
         )
-        plan = TaskPlan.from_payload(raw)
+        try:
+            plan = task_plan_from_planner_tool_output(
+                raw,
+                task_instruction=blackboard.task_instruction,
+                source_candidate_id=source_id,
+                target_candidate_id=target_id,
+            )
+        except ValueError as exc:
+            return unavailable(
+                "task_plan_invalid_model_output",
+                str(exc),
+                {
+                    "raw_keys": sorted(str(key) for key in raw.keys()),
+                    "raw_task_plan": raw,
+                    "source_candidate_id": source_id,
+                    "target_candidate_id": target_id,
+                },
+            )
         validation_errors = _validate_task_plan_completeness(
             plan,
             blackboard.task_instruction,
@@ -225,6 +240,137 @@ def build_task_plan(request: SkillRequest, context: SkillContext) -> SkillResult
     blackboard.write("current_subgoal", None, event_type="scheduler.build_task_plan_reset_current_subgoal")
     mark_motion_artifacts_stale(blackboard, "task_plan_rebuilt", include_goal=True)
     return ok("task_plan_built", {"task_plan": plan.to_dict()})
+
+
+def build_task_planner_model_request(
+    *,
+    task_instruction: str | None,
+    world_state: object | None,
+    image_roles: list[str] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Build the planner-tool request shared by Runtime and planner SFT.
+
+    The planner is a tool called *inside* ``scheduler.build_task_plan``.  Its
+    request therefore contains task/scene evidence and a TaskPlan output
+    contract, never the outer AgentLoop skill-selection envelope.
+    """
+
+    task = str(task_instruction or "").strip()
+    payload: dict[str, Any] = {
+        "task": task,
+        "image_roles": list(image_roles or []),
+    }
+    grounding = _compact_task_plan_grounding(world_state)
+    if grounding is not None:
+        payload["grounding"] = grounding
+    return _task_planner_tool_instruction(), payload
+
+
+def _task_planner_tool_instruction() -> str:
+    return (
+        "From the current images and complete task, generate the full ordered subtask sequence. "
+        "Each instruction will be sent directly to the short-horizon VLA, so keep the exact object, destination, "
+        "and relation. Do not assign a left or right arm; the VLA chooses the arm from the current images. "
+        "Use concise physical stages and do not add non-physical checking steps. Each "
+        "success_condition must be one visible condition for that subtask. Return exactly "
+        "{\"subtasks\":[{\"instruction\":\"...\",\"success_condition\":\"...\"}]} with no other fields."
+    )
+
+
+def task_plan_from_planner_tool_output(
+    raw: dict[str, Any],
+    *,
+    task_instruction: str | None,
+    source_candidate_id: str | None = None,
+    target_candidate_id: str | None = None,
+) -> TaskPlan:
+    if set(raw) != {"subtasks"}:
+        raise ValueError(
+            "planner_tool_output_top_level_keys_must_be_exactly_subtasks:"
+            f"got={sorted(str(key) for key in raw)}"
+        )
+    items = raw.get("subtasks")
+    if not isinstance(items, list) or not items:
+        raise ValueError("planner_tool_output_requires_nonempty_subtasks")
+    subgoals: list[Subgoal] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict) or set(item) != {"instruction", "success_condition"}:
+            keys = sorted(str(key) for key in item) if isinstance(item, dict) else []
+            raise ValueError(
+                f"planner_tool_subtask_{index + 1}_keys_must_be_instruction_and_success_condition:got={keys}"
+            )
+        instruction = str(item.get("instruction") or "").strip()
+        success_condition = str(item.get("success_condition") or "").strip()
+        if not instruction:
+            raise ValueError(f"planner_tool_subtask_{index + 1}_missing_instruction")
+        if not success_condition:
+            raise ValueError(f"planner_tool_subtask_{index + 1}_missing_success_condition")
+        subgoals.append(
+            Subgoal(
+                subgoal_id=f"S{index + 1}",
+                # Legacy Runtime storage only. The planner tool neither sees nor emits this field.
+                type="act",
+                instruction=instruction,
+                source_candidate_id=source_candidate_id,
+                target_candidate_id=target_candidate_id,
+                status="pending",
+                completion_criteria={"natural_language": success_condition},
+                metadata={},
+            )
+        )
+    return TaskPlan(
+        task=str(task_instruction or "").strip(),
+        subgoals=subgoals,
+        current_subgoal_id="S1",
+        status="pending",
+        metadata={"source": "planner_tool"},
+    )
+
+
+def _compact_task_plan_grounding(world_state: object | None) -> dict[str, Any] | None:
+    if world_state is None:
+        return None
+    candidates = []
+    for candidate in _value(world_state, "candidates", []) or []:
+        candidates.append(
+            {
+                "candidate_id": _value(candidate, "candidate_id"),
+                "label": _value(candidate, "label"),
+                "role_hypotheses": dict(_value(candidate, "role_hypotheses", {}) or {}),
+                "bbox_by_view": dict(_value(candidate, "bbox_by_view", {}) or {}),
+                "visibility": _value(candidate, "visibility"),
+                "confidence": _value(candidate, "confidence"),
+                "status": _value(candidate, "status"),
+            }
+        )
+    return {
+        "available": True,
+        "source_candidate_id": _value(world_state, "source_candidate_id"),
+        "target_candidate_id": _value(world_state, "target_candidate_id"),
+        "candidates": candidates,
+    }
+
+
+def _task_plan_image_roles(blackboard: Blackboard, image_paths: list[str]) -> list[str]:
+    path_roles: dict[str, str] = {}
+    observation = blackboard.read("observation")
+    for role, view in (_value(observation, "camera_views", {}) or {}).items():
+        path = _value(view, "rgb_path")
+        if path:
+            path_roles[str(path)] = str(role)
+    overlay = blackboard.read("grounding_overlay")
+    for role, path in (_value(overlay, "image_paths", {}) or {}).items():
+        if path:
+            path_roles[str(path)] = str(role)
+    return [path_roles.get(str(path), f"image_{index + 1}") for index, path in enumerate(image_paths)]
+
+
+def _value(value: object | None, key: str, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
 
 
 def select_current_subgoal(request: SkillRequest, context: SkillContext) -> SkillResult:

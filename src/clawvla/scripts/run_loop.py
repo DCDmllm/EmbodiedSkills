@@ -21,8 +21,8 @@ from clawvla.runtime import AgentRuntime
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the model-driven ClawVLA agent loop.")
-    parser.add_argument("--config", default="configs/robotwin_default.json")
+    parser = argparse.ArgumentParser(description="Run the EmbodiedSkills closed-loop agent.")
+    parser.add_argument("--config", default="configs/runtime/robotwin.json")
     parser.add_argument("--instruction", required=True)
     parser.add_argument("--artifact-prefix", default="agent_loop")
     parser.add_argument("--initial-stage", default="observe")
@@ -76,8 +76,6 @@ def run_agent_loop(
             runtime.blackboard.write("run_robotwin", bool(run_environment))
             runtime.blackboard.write("artifact_prefix", artifact_prefix)
             runtime.blackboard.task_instruction = instruction
-            _install_rl_reward_tracker(runtime, config)
-
             if initial_observe:
                 bootstrap = _bootstrap_observe(runtime, instruction, artifact_prefix, run_environment)
                 if not bootstrap.success:
@@ -100,12 +98,6 @@ def run_agent_loop(
 
 @contextmanager
 def _action_worker_lifecycle(config: AgentConfig, config_path: str, artifact_prefix: str) -> Iterator[None]:
-    backend_cfg = config.metadata.get("action_backend", {})
-    backend_type = str(backend_cfg.get("type", "pi05")).lower() if isinstance(backend_cfg, dict) else "pi05"
-    if backend_type in {"groot", "gr00t", "gr00t_n1_5", "gr00t-n1.5"}:
-        with _groot_worker_lifecycle(config, config_path, artifact_prefix):
-            yield
-        return
     with _openpi_worker_lifecycle(config, config_path, artifact_prefix):
         yield
 
@@ -150,49 +142,6 @@ def _openpi_runtime_cfg(config: AgentConfig) -> dict[str, object]:
     if not isinstance(backend_cfg, dict):
         return {}
     runtime_cfg = backend_cfg.get("openpi_runtime", {})
-    return dict(runtime_cfg) if isinstance(runtime_cfg, dict) else {}
-
-
-@contextmanager
-def _groot_worker_lifecycle(config: AgentConfig, config_path: str, artifact_prefix: str) -> Iterator[None]:
-    runtime_cfg = _groot_runtime_cfg(config)
-    if runtime_cfg.get("mode") != "worker" or not runtime_cfg.get("auto_start", True):
-        yield
-        return
-
-    process, log_path = _start_groot_worker(config_path, artifact_prefix, runtime_cfg, config)
-    previous_handlers: dict[int, signal.Handlers] = {}
-
-    def stop_worker() -> None:
-        _stop_process_group(process)
-
-    def handle_signal(signum: int, frame: object) -> None:
-        stop_worker()
-        previous = previous_handlers.get(signum)
-        if callable(previous):
-            previous(signum, frame)
-            return
-        raise SystemExit(128 + signum)
-
-    atexit.register(stop_worker)
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        previous_handlers[signum] = signal.getsignal(signum)
-        signal.signal(signum, handle_signal)
-    try:
-        yield
-    finally:
-        for signum, previous in previous_handlers.items():
-            signal.signal(signum, previous)
-        atexit.unregister(stop_worker)
-        stop_worker()
-        print(json.dumps({"status": "groot_worker_stopped", "log": str(log_path)}, ensure_ascii=True), file=sys.stderr, flush=True)
-
-
-def _groot_runtime_cfg(config: AgentConfig) -> dict[str, object]:
-    backend_cfg = config.metadata.get("action_backend", {})
-    if not isinstance(backend_cfg, dict):
-        return {}
-    runtime_cfg = backend_cfg.get("runtime", {})
     return dict(runtime_cfg) if isinstance(runtime_cfg, dict) else {}
 
 
@@ -242,9 +191,10 @@ def _start_openpi_worker(
     ]
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
-    env["PYTHONPATH"] = str(
-        runtime_cfg.get("pythonpath") or "/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/RoboTwin/policy/pi05/src"
-    )
+    pythonpath = runtime_cfg.get("pythonpath") or os.environ.get("OPENPI_PYTHONPATH")
+    if not pythonpath:
+        raise ValueError("openpi worker requires openpi_runtime.pythonpath or OPENPI_PYTHONPATH")
+    env["PYTHONPATH"] = str(pythonpath)
     env["CLAWVLA_PI05_DIRECT"] = "1"
     if runtime_cfg.get("cuda_visible_devices"):
         env["CUDA_VISIBLE_DEVICES"] = str(runtime_cfg["cuda_visible_devices"])
@@ -256,48 +206,6 @@ def _start_openpi_worker(
         _stop_process_group(process)
         raise
     print(json.dumps({"status": "pi05_worker_started", "log": str(log_path)}, ensure_ascii=True), file=sys.stderr, flush=True)
-    return process, log_path
-
-
-def _start_groot_worker(
-    config_path: str,
-    artifact_prefix: str,
-    runtime_cfg: dict[str, object],
-    config: AgentConfig,
-) -> tuple[subprocess.Popen[bytes], Path]:
-    log_path = _default_run_path(config, artifact_prefix, "groot_worker.log")
-    log_file = log_path.open("w", encoding="utf-8")
-    command = [
-        *_python_command_prefix(
-            runtime_cfg.get("conda_bin"),
-            runtime_cfg.get("conda_env") or "groot-py312",
-            source="run_loop.groot_worker",
-        ),
-        "-m",
-        "clawvla.scripts.groot_worker",
-        "--config",
-        str(config_path),
-        "--host",
-        str(runtime_cfg.get("host") or "127.0.0.1"),
-        "--port",
-        str(runtime_cfg.get("port") or 8766),
-    ]
-    if runtime_cfg.get("load_policy", True):
-        command.append("--load-policy")
-    env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
-    env["PYTHONPATH"] = str(runtime_cfg.get("pythonpath") or "/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/lerobot/src")
-    env["CLAWVLA_GROOT_DIRECT"] = "1"
-    if runtime_cfg.get("cuda_visible_devices"):
-        env["CUDA_VISIBLE_DEVICES"] = str(runtime_cfg["cuda_visible_devices"])
-    process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, env=env, preexec_fn=_parent_death_preexec)
-    log_file.close()
-    try:
-        _wait_for_groot_worker_ready(process, log_path, float(runtime_cfg.get("startup_timeout", 1200.0)))
-    except BaseException:
-        _stop_process_group(process)
-        raise
-    print(json.dumps({"status": "groot_worker_started", "log": str(log_path)}, ensure_ascii=True), file=sys.stderr, flush=True)
     return process, log_path
 
 
@@ -314,19 +222,6 @@ def _wait_for_openpi_worker_ready(process: subprocess.Popen[bytes], log_path: Pa
     raise TimeoutError(f"pi05 worker did not become ready within {timeout:.1f}s. log={log_path}")
 
 
-def _wait_for_groot_worker_ready(process: subprocess.Popen[bytes], log_path: Path, timeout: float) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if log_path.exists():
-            text = log_path.read_text(encoding="utf-8", errors="replace")
-            if "groot_worker_ready" in text:
-                return
-        if process.poll() is not None:
-            raise RuntimeError(f"GR00T worker exited before ready. log={log_path}")
-        time.sleep(1.0)
-    raise TimeoutError(f"GR00T worker did not become ready within {timeout:.1f}s. log={log_path}")
-
-
 def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
@@ -339,7 +234,7 @@ def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def _python_command_prefix(conda_bin: object | None, conda_env: object | None, *, source: str) -> list[str]:
-    conda_path = Path(str(conda_bin or "/mnt/wangwai/miniconda3/bin/conda"))
+    conda_path = Path(str(conda_bin or "conda"))
     env_name = str(conda_env or "")
     python_path = conda_path.parent.parent / "envs" / env_name / "bin" / "python"
     if python_path.exists():
@@ -453,59 +348,6 @@ def _model_call_summary(runtime: AgentRuntime) -> list[dict[str, object]]:
         if event.event_type in {"model.call", "model.output"}:
             calls.append({"event_index": event_index, "event_type": event.event_type, **event.payload})
     return calls[-32:]
-
-
-def _install_rl_reward_tracker(runtime: AgentRuntime, config: AgentConfig) -> None:
-    output_path = os.environ.get("CLAWVLA_RL_REWARD_JSONL")
-    if not output_path:
-        return
-    from clawvla.rl.reward_tracker import RuntimeRewardTracker
-
-    task_name = os.environ.get("CLAWVLA_RL_TASK_NAME") or config.environment.task_name or config.robotwin.task_name
-    step_cost = float(os.environ.get("CLAWVLA_RL_STEP_COST") or 0.05)
-    registry_imports, task_map = _reward_registry_from_env() or _reward_registry_defaults(config, task_name)
-    tracker = RuntimeRewardTracker(
-        task_name=task_name,
-        output_path=output_path,
-        step_cost=step_cost,
-        registry_imports=registry_imports,
-        task_map=task_map,
-    )
-    runtime.blackboard.write("rl_reward_tracker", tracker, event_type="rl.reward_tracker_installed")
-    emit_status_notice(
-        "rl_reward_tracker_installed",
-        success=True,
-        source="run_loop",
-        reason=f"task={task_name} output={output_path}",
-        always=True,
-    )
-
-
-def _reward_registry_defaults(config: AgentConfig, task_name: str) -> tuple[list[str], dict[str, str]]:
-    env_type = str(config.environment.type or "robotwin").lower()
-    if env_type == "libero":
-        return ["clawvla.rl.reward_registry:register_builtin_libero"], {task_name: "libero"}
-    if env_type in {"robocasa", "robo_casa"}:
-        return ["clawvla.rl.reward_registry:register_builtin_robocasa"], {task_name: "robocasa"}
-    if env_type in {"calvin", "calvin_env"}:
-        return ["clawvla.rl.reward_registry:register_builtin_calvin"], {task_name: "calvin"}
-    return ["clawvla.rl.reward_registry:register_builtin_robotwin"], {task_name: "robotwin"}
-
-
-def _reward_registry_from_env() -> tuple[list[str], dict[str, str]] | None:
-    registry_raw = os.environ.get("CLAWVLA_RL_REWARD_REGISTRY")
-    task_map_raw = os.environ.get("CLAWVLA_RL_REWARD_TASK_MAP")
-    if registry_raw is None and task_map_raw is None:
-        return None
-    if registry_raw is None or task_map_raw is None:
-        raise ValueError("CLAWVLA_RL_REWARD_REGISTRY and CLAWVLA_RL_REWARD_TASK_MAP must be set together.")
-    registry = json.loads(registry_raw)
-    task_map = json.loads(task_map_raw)
-    if not isinstance(registry, list) or not all(isinstance(item, str) for item in registry):
-        raise TypeError("CLAWVLA_RL_REWARD_REGISTRY must be a JSON list of import strings.")
-    if not isinstance(task_map, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in task_map.items()):
-        raise TypeError("CLAWVLA_RL_REWARD_TASK_MAP must be a JSON object mapping task names to handler names.")
-    return list(registry), dict(task_map)
 
 
 if __name__ == "__main__":

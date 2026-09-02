@@ -4,19 +4,26 @@ import argparse
 import json
 import os
 import socketserver
+import threading
 from pathlib import Path
 
 from clawvla.action_backends.pi05 import Pi05ActionBackend
 from clawvla.config import load_config
-from clawvla.scripts.pi05_inference_smoke import _observation_from_artifact
+from clawvla.schema import CameraView, ObservationBundle, RobotArmState
 
 
-class Pi05WorkerServer(socketserver.TCPServer):
+class Pi05WorkerServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
     def __init__(self, server_address, handler_class, backend: Pi05ActionBackend):
         super().__init__(server_address, handler_class)
         self.backend = backend
+        # Multiple rollout lanes may share one resident model.  Accept their
+        # sockets concurrently so health checks remain responsive, while the
+        # lock keeps GPU inference serialized and avoids racing shared backend
+        # state or doubling peak model memory.
+        self.inference_lock = threading.Lock()
 
 
 class Pi05WorkerHandler(socketserver.StreamRequestHandler):
@@ -33,16 +40,17 @@ class Pi05WorkerHandler(socketserver.StreamRequestHandler):
             motion_plan = request.get("motion_plan")
             prompt = _worker_prompt(motion_plan)
             observation = _observation_from_artifact(artifact_dir, prompt)
-            result = self.server.backend.build_action_chunk(  # type: ignore[attr-defined]
-                motion_goal=None,
-                world_state=None,
-                observation=observation,
-                request={
-                    "motion_plan": motion_plan,
-                    "num_steps": request.get("num_steps"),
-                    "horizon": request.get("horizon"),
-                },
-            )
+            with self.server.inference_lock:  # type: ignore[attr-defined]
+                result = self.server.backend.build_action_chunk(  # type: ignore[attr-defined]
+                    motion_goal=None,
+                    world_state=None,
+                    observation=observation,
+                    request={
+                        "motion_plan": motion_plan,
+                        "num_steps": request.get("num_steps"),
+                        "horizon": request.get("horizon"),
+                    },
+                )
             self._write(result.to_dict())
         except Exception as exc:
             self._write(
@@ -65,9 +73,39 @@ def _worker_prompt(motion_plan: object) -> str:
     raise ValueError("motion_plan.vla_prompt is required by pi05_worker; request must come from motion.plan_motion.")
 
 
+def _observation_from_artifact(artifact_dir: Path, prompt: str) -> ObservationBundle:
+    image_dir = artifact_dir / "images"
+    summary_path = artifact_dir / "raw_observation_summary.json"
+    payload = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    vector = payload.get("joint_action_vector")
+    robot_arms = {}
+    if isinstance(vector, list) and len(vector) == 14:
+        robot_arms = {
+            "left": RobotArmState(
+                arm_name="left",
+                joint_positions=[float(item) for item in vector[:6]],
+                gripper_value=float(vector[6]),
+            ),
+            "right": RobotArmState(
+                arm_name="right",
+                joint_positions=[float(item) for item in vector[7:13]],
+                gripper_value=float(vector[13]),
+            ),
+        }
+    return ObservationBundle(
+        task_instruction=prompt,
+        camera_views={
+            name: CameraView(name=name, rgb_path=str(image_dir / f"{name}_rgb.png"))
+            for name in ("head_camera", "left_camera", "right_camera")
+        },
+        robot_arms=robot_arms,
+        raw={"summary_ref": str(summary_path)} if summary_path.exists() else {},
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Persistent pi0.5 OpenPI worker.")
-    parser.add_argument("--config", default="configs/robotwin_pi05_enabled_probe.json")
+    parser.add_argument("--config", default="configs/runtime/robotwin.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     return parser.parse_args()

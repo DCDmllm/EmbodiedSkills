@@ -1,344 +1,221 @@
-# ClawVLA
+# EmbodiedSkills
 
-ClawVLA 是一个面向 RoboTwin、LIBERO 和 RoboCasa 的多组件 VLA agent 运行时。当前主线是：
+<p align="center">
+  <img src="docs/assets/teaser.png" width="100%" alt="EmbodiedSkills overview">
+</p>
 
-```text
-environment observation -> VLM grounding -> scheduler subgoal loop -> frozen action backend -> environment execute -> verifier
-```
+EmbodiedSkills is a closed-loop runtime for vision-language-action agents. A
+high-level VLM works through six stages: observation, planning, preflight,
+bounded execution, verification, and recovery. The runtime checks every skill
+request before it reaches the robot and records the result for the next model
+decision. Planning, verification, the low-level VLA policy, and the environment
+adapter share stable interfaces and can be trained or replaced independently.
 
-运行时由 **scheduler 选择 skill + runtime 检查前置条件** 共同驱动：
+This release contains the AgentLoop used in our experiments, adapters for
+RoboTwin 2.0, RMBench, and LIBERO, a persistent OpenPI/$\pi_{0.5}$ action
+backend, frame-aligned subtask training for $\pi_{0.5}$, and Qwen3-VL LoRA
+training from full AgentLoop trajectories. The Python package remains
+`clawvla` for compatibility with existing manifests and checkpoints; the
+distribution and repository are named `embodiedskills`.
 
-- scheduler 可以在当前阶段选择允许的 skill。
-- 关键 skill 有硬前置，例如 `execute_action` 必须已有 fresh `action_chunk`。
-- stale artifact 不会复用：新 observation 会让 overlay/motion artifact 失效，执行过的 action chunk 会标记 consumed。
-- placeholder/unavailable/exception 都必须进入 terminal、agent log 和 result，不做静默兜底。
-- source/target grounding 不做 label fallback；模型必须显式输出 candidate id。
+## Results
 
-## 当前架构
+| Benchmark | Evaluation | Reference | EmbodiedSkills |
+| --- | ---: | ---: | ---: |
+| RoboTwin 2.0 | 50 tasks, 100 episodes per task | $\pi_{0.5}$ 82.74 | **86.20** |
+| LIBERO | Spatial, Object, Goal, and Long | OpenPI 96.85 | **97.40** |
+| RMBench $M(n)$ | 4 memory-dependent tasks | X-VLA 7.3 | **12.5** |
 
-核心组件：
+The controlled RoboTwin 2.0 study uses the same 50 tasks and 5,000 episodes for
+each setting. Full AgentLoop reaches 86.20%; removing intermediate verification
+reduces success to 48.2%, using the full task instruction in place of semantic
+subtasks reaches 34.4%, and limiting every subtask to one action chunk reaches
+19.5%.
 
-- `vision`：采集 RoboTwin 公开观测、生成候选、绑定 source/target、渲染 bbox overlay。
-- `state`：把 perception 更新为 world state，维护 task object、stage 和简短历史。
-- `scheduler`：选择下一步 skill，构建/推进 subgoal plan。
-- `motion`：从当前 subgoal 构建 motion goal、motion plan、动作 backend action chunk，并执行。
-- `verifier`：动作后判断当前 subgoal 是否完成，以及下一步应该继续执行、重观察、重规划或恢复。
-- `recovery`：失败后显式路由，不偷偷执行动作。
+<p align="center">
+  <img src="docs/assets/results.png" width="96%" alt="RoboTwin, LIBERO, and AgentLoop ablation results">
+</p>
 
-六个阶段：
+## System
 
-```text
-observe -> plan -> preflight -> execute -> verify -> recover
-```
+<p align="center">
+  <img src="docs/assets/architecture.png" width="100%" alt="EmbodiedSkills architecture">
+</p>
 
-阶段可按反馈重复进入。一次 action chunk 执行完成后会进入 `verify`，verifier 再决定 `advance_subgoal`、`continue_execute`、`reobserve`、`replan`、`recover` 或 `finish`。
+The VLM receives the task instruction, current images, world state, active plan,
+and compact loop history. It proposes a typed skill call. The guarded runtime
+checks phase compatibility, required inputs, freshness, action validity, and
+legal state transitions. A validated execution request is sent to the VLA
+backend as an active subgoal, current observation, robot state, and bounded
+action budget. The execution report and fresh verification images return to the
+AgentLoop, which can continue, advance, re-observe, recover, or replan.
 
-## 环境
+The local vLLM launcher keeps multiple LoRAs resident and routes model calls by
+component or skill. Adapter selection changes the served LoRA name without
+loading weights for every request.
 
-项目按进程职责拆为六套环境，避免把互相冲突的 CUDA、仿真器和训练依赖装进同一个 Python：
+<p align="center">
+  <img src="docs/assets/examples.png" width="96%" alt="Successful RoboTwin execution examples">
+</p>
 
-| 环境 | 职责 | requirements |
-| --- | --- | --- |
-| `robotwin-py312` | 主 runtime、RoboTwin/LIBERO rollout、数据与评测工具 | `requirements/robotwin-py312.txt` |
-| `vllm` | 本地 Qwen3-VL 服务 | `requirements/vllm.txt` |
-| `openpi-torch-py312` | pi0.5/OpenPI worker | `requirements/openpi-torch-py312.txt` |
-| `.venv-openrlhf-py310-cu128` | OpenRLHF/DeepSpeed/Ray 训练 | `requirements/openrlhf-py310-cu128.txt` |
-| `groot-py312` | RoboCasa rollout 和 GR00T worker | 复用 RoboCasa/LeRobot 环境 |
-| `calvin-py38` | CALVIN rollout 和 task oracle | `requirements/calvin-py38.txt` |
+## Installation
 
-完整安装、路径布局、代理设置和验证命令见 [环境安装与进程分工](docs/environment_setup.md)。LIBERO 复用
-`robotwin-py312`，不单独增加环境。
-
-### 1. robotwin-py312
-
-主 agent、RoboTwin 环境、wrapper 脚本运行在这里。
-
-```bash
-cd /mnt/wangwai/vla/clawvla
-conda activate robotwin-py312
-pip install -r requirements/robotwin-py312.txt
-```
-
-RoboTwin/CUDA/SAPIEN/PyTorch 依赖默认由现有 `robotwin-py312` 环境提供，requirements 里不强行装 torch，避免动 CUDA 栈。
-专家子任务采集和合并工具直接使用的 `h5py`、OpenCV 已显式写入 requirements。
-
-### 2. vllm
-
-本地 Qwen3-VL scheduler/vision/verifier/recovery 服务运行在这里。
+The runtime uses Python 3.12. Benchmark simulators, OpenPI, LLaMA-Factory, and
+vLLM have separate CUDA environments and are installed from their upstream
+repositories.
 
 ```bash
-conda activate vllm
-pip install -r /mnt/wangwai/vla/clawvla/requirements/vllm.txt
+git clone https://github.com/DCDmllm/EmbodiedSkills.git
+cd EmbodiedSkills
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+cp .env.example .env
 ```
 
-当前 profile 使用模型：
-
-```text
-/mnt/wangwai/weights/Qwen/Qwen3-VL-8B-Instruct
-```
-
-### 3. openpi-torch-py312
-
-pi0.5/OpenPI worker 运行在这里。
+Fill in the repository, checkpoint, and endpoint paths in `.env`, then export
+them before loading a runtime config. Missing variables are reported when the
+config is read.
 
 ```bash
-cd /mnt/linyutong/wangwai_mirror/vla/clawvla
-conda activate openpi-torch-py312
-pip install -r requirements/openpi-torch-py312.txt
+set -a
+source .env
+set +a
 ```
 
-正式 RoboTwin worker 通过 `PYTHONPATH` 引入 mirror 中与训练一致的 OpenPI 源码：
+## Running AgentLoop
 
-```text
-/mnt/linyutong/wangwai_mirror/pi0.5/src
-```
-
-新的 PyTorch 直推路径还直接依赖 `sentencepiece`，已写入该环境 requirements。
-
-### 4. openrlhf-py310-cu128
-
-Agent RL trainer 使用仓库内的 Python 3.10 venv：
+An OpenAI-compatible VLM endpoint and a persistent OpenPI worker are sufficient
+for the standard launcher:
 
 ```bash
-cd /mnt/wangwai/vla/clawvla
-python3.10 -m venv .venv-openrlhf-py310-cu128
-.venv-openrlhf-py310-cu128/bin/python -m pip install -r requirements/openrlhf-py310-cu128.txt
-```
-
-runner 通过 `PYTHONPATH` 引入 ClawVLA，不在 Python 3.10 环境执行 `pip install -e .`。
-
-### 5. groot-py312
-
-RoboCasa rollout 和 GR00T worker 运行在这里。
-
-```bash
-cd /mnt/wangwai/vla/clawvla
-conda activate groot-py312
-export PYTHONPATH=/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/lerobot/src:/mnt/wangwai/RoboCasa:/mnt/wangwai/robosuite
-export MUJOCO_GL=egl
-export PYOPENGL_PLATFORM=egl
-export __EGL_VENDOR_LIBRARY_DIRS=/usr/share/glvnd/egl_vendor.d
-```
-
-当前本地 GR00T checkpoint：
-
-```text
-/mnt/wangwai/weights/robocasa/robocasa365_checkpoints/gr00t_n1-5/multitask_learning/checkpoint-120000
-```
-
-### 6. calvin-py38
-
-CALVIN rollout 使用独立的 Python 3.8 环境，并通过 HTTP 调冻结的 X-VLA action server：
-
-```bash
-cd /mnt/wangwai/vla/clawvla
-conda activate calvin-py38
-python -m pip install -r requirements/calvin-py38.txt
-export PYTHONPATH=/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/vla/CALVIN/calvin_env:/mnt/wangwai/vla/CALVIN/calvin_models
-export PYOPENGL_PLATFORM=egl
-export __EGL_VENDOR_LIBRARY_DIRS=/usr/share/glvnd/egl_vendor.d
-```
-
-不要在 `calvin-py38` 中执行 `pip install -e .`；项目包元数据要求 Python 3.12+，该子进程通过 `PYTHONPATH`
-加载源码。完整说明见 [CALVIN + X-VLA 接入说明](docs/calvin_xvla.md)。
-
-如果机器设置了 HTTP proxy，本地 vLLM、PolicyProxy、OpenPI 和 X-VLA 服务必须绕过代理：
-
-```bash
-export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
-export no_proxy="$NO_PROXY"
-```
-
-## 配置
-
-主配置：
-
-```text
-configs/robotwin_default.json
-configs/robotwin_pi05_worker_probe.json
-configs/robotwin_pi05_subtasks_25k.json
-configs/libero_pi05_enabled_probe.json
-configs/robocasa_groot_enabled_probe.json
-configs/calvin_xvla_enabled_probe.json
-configs/run_profiles/qwen3vl_pi05_vllm.json
-configs/run_profiles/qwen3vl_pi05_libero_vllm.json
-```
-
-`robotwin_pi05_subtasks_25k.json` 是当前正式 RoboTwin 配置，加载验证 loss 最低的 25k checkpoint。
-它使用 32-step action horizon、10 次 flow 去噪、256 token 上限，以及仅由训练 split 计算的归一化统计。
-
-远程 OpenAI-compatible 配置不再写明文 key。需要远程模型时设置：
-
-```bash
-export OPENAI_COMPATIBLE_API_BASE_URL="http://host:port/v1"
-export OPENAI_COMPATIBLE_API_KEY="..."
-```
-
-本地 vLLM 路径会在运行时生成临时 config，自动把 `vision/scheduler/verifier/recovery` 指到本地 vLLM 服务。
-
-## 正式运行
-
-推荐入口：
-
-```bash
-cd /mnt/linyutong/wangwai_mirror/vla/clawvla
-./scripts/run_qwen3vl_pi05_agent.sh \
-  --instruction "place the container on the plate" \
-  --artifact-prefix agent_subgoal_loop_25 \
-  --max-steps 25 \
+embodiedskills-run \
+  --config configs/runtime/robotwin.json \
+  --instruction "Place the container on the plate." \
+  --artifact-prefix robotwin_example \
+  --max-steps 80 \
   --run
 ```
 
-先看最终展开命令：
+`configs/runtime/rmbench.json` and `configs/runtime/libero.json` select the
+other environments. Subgoal verification controls local progress; final task
+success always comes from the benchmark evaluator.
+
+For a local Qwen3-VL model with resident LoRAs:
 
 ```bash
-./scripts/run_qwen3vl_pi05_agent.sh \
-  --instruction "place the container on the plate" \
-  --artifact-prefix agent_subgoal_loop_25 \
-  --max-steps 25 \
-  --dry-run
+embodiedskills-run-vllm \
+  --base-config configs/runtime/robotwin.json \
+  --model Qwen/Qwen3-VL-8B-Instruct \
+  --served-model-name base \
+  --lora-module agent=/path/to/agent_skill_lora \
+  --model-route scheduler=agent \
+  --model-route vision=agent \
+  --model-route state=agent \
+  --model-route verifier=agent \
+  --model-route recovery=agent \
+  --gpus 0,1 \
+  --tensor-parallel-size 2 \
+  --instruction "Place the container on the plate." \
+  --max-steps 80 \
+  --run
 ```
 
-profile 默认会：
+## Training
 
-- 在 `vllm` 环境启动 Qwen3-VL OpenAI-compatible server。
-- 在 `robotwin-py312` 环境跑 agent loop。
-- 在 `openpi-torch-py312` 环境启动常驻 pi0.5 worker。
-- 进程结束时清理 vLLM 和 pi0.5 worker。
+### Subtask-conditioned $\pi_{0.5}$
 
-输出位置：
+RoboTwin demonstrations are collected from successful expert executions. Each
+subtask keeps its source HDF5, frame range, accepted instruction, and completion
+criterion. The loader samples the current frame, three RGB views, 14-dimensional
+robot state, current subtask, and at most 32 actions from the same segment. A
+short final window repeats the segment's last action, so its label never enters
+the next subtask.
+
+```bash
+bash scripts/collect_robotwin_expert_subtasks.sh \
+  --settings both \
+  --episodes-per-task 50 \
+  --workers 4 \
+  --gpus 0,1,2,3
+
+python scripts/merge_robotwin_expert_subtasks.py \
+  --source data/run_a \
+  --source data/run_b \
+  --output-dir data/robotwin_merged
+
+embodiedskills-build-robotwin-vla-data \
+  --mapping data/accepted_subtask_mapping.jsonl \
+  --source-root data/robotwin_merged \
+  --split-manifest data/robotwin_merged/splits/task_split.json \
+  --output-dir data/pi05_subtasks
+```
+
+RMBench uses the segment durations in its official `language_annotation.json`:
+
+```bash
+embodiedskills-build-rmbench-vla-data \
+  --source-root /path/to/rmbench/data/task_name/demo_clean \
+  --output-root data/rmbench_task_subtasks \
+  --val-episodes 5
+```
+
+OpenPI integration is documented in
+[`integrations/openpi/README.md`](integrations/openpi/README.md). The supplied
+recipe uses a 32-step action horizon, episode-level splits, FSDP, normalization
+statistics from the prepared dataset, and checkpoint initialization through
+OpenPI's standard trainer. Per-task specialist datasets can be prepared with
+`embodiedskills-split-vla-tasks`.
+
+### Qwen3-VL AgentLoop LoRA
+
+The trajectory collector replays successful expert segments through the same
+AgentLoop prompt renderer and history compaction used at deployment. Training
+rows cover plan generation, observation, state updates, scheduling, preflight,
+execution, verification, and engineering recovery cases. Every plan-generation
+row and every accepted recovery row is retained; remaining skills are sampled
+across tasks, decision families, and history depths.
+
+```bash
+embodiedskills-collect-agent-trajectories \
+  --dataset-root data/robotwin_merged \
+  --repair-ledger data/subtask_repairs.jsonl \
+  --task-instruction-repairs data/task_instruction_repairs.jsonl \
+  --split-manifest data/robotwin_merged/splits/task_split.json \
+  --config configs/runtime/robotwin.json \
+  --output-dir data/qwen_agent_corpus
+
+embodiedskills-build-agent-sft \
+  --corpus-dir data/qwen_agent_corpus \
+  --engineering-dir data/qwen_agent_engineering \
+  --output-dir data/qwen_agent_skill \
+  --train-size 30000 \
+  --val-size 3000
+
+LLAMA_FACTORY_ROOT=/path/to/LLaMA-Factory \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+bash scripts/train_qwen_agent_lora.sh
+```
+
+The default recipe uses Qwen3-VL-8B-Instruct, FlashAttention 2, DeepSpeed
+ZeRO-3, LoRA rank 64, a 65,536-token context, validation every 50 optimizer
+steps, and W&B logging. Configuration details and data contracts are in
+[`docs/training.md`](docs/training.md).
+
+## Repository layout
 
 ```text
-tmp_runs/<prefix>_agent.log        # agent stdout/stderr 全量日志
-tmp_runs/<prefix>_result.json      # 最终大 JSON
-tmp_runs/<prefix>_vllm.log         # vLLM 服务日志
-tmp_runs/<prefix>_pi05_worker.log  # pi0.5 worker 日志
-tmp_artifacts/<prefix>/            # observation/action/overlay artifacts
+src/clawvla/               AgentLoop, runtime, skills, components, and adapters
+src/clawvla/training/      frame-aligned subtask dataset
+configs/runtime/           RoboTwin, RMBench, and LIBERO runtime configurations
+configs/qwen/              Qwen3-VL LoRA and DeepSpeed configuration
+integrations/openpi/       OpenPI dataset hook and training recipe
+scripts/                   collection, merge, and training wrappers
+docs/                      architecture, benchmark, and training notes
 ```
 
-terminal 只显示 Rich trace 和关键事件；完整 JSON 写入文件。
-
-## Agent RL
-
-RL 训练代码是项目的一部分，位于：
-
-```text
-src/clawvla/rl/          # OpenRLHF GRPO runner、agent executor、policy proxy、trajectory archive
-src/clawvla/rewards/     # RoboTwin reward snapshot / dense reward
-configs/rl/              # 训练、smoke、reward、cluster 配置
-scripts/run_clawvla_rl.sh
-```
-
-核心约束：
-
-- 训练一个统一 VLM policy；`vision/scheduler/verifier/recovery` 都走同一个 policy。
-- OpenPI/pi0.5 和 GR00T 冻结，只作为动作 backend。
-- 训练样本保留真实图文输入；有 image ref 但没有 multimodal payload 会直接报错。
-- `action_ranges` 只覆盖模型输出 token；工具返回、环境状态、skill 结果不作为 action token 训练。
-- 超长 prompt/response 不静默截断，配置不够会显式失败。
-- 50 个 RoboTwin 任务已在 `configs/rl/rewards/robotwin.yaml` 映射到 reward handler。
-- LIBERO object tasks 已通过 `configs/rl/tasks/libero_object_*.yaml` 和 `configs/rl/rewards/libero.yaml` 接入同一套 RL runner。
-- RoboCasa `PickPlaceCounterToCabinet` 已通过 `configs/robocasa_groot_enabled_probe.json`、`configs/rl/rewards/robocasa.yaml` 和 GR00T action backend 接入同一套 loop；GR00T 模型动作维度 32，RoboCasa 环境执行动作维度 12。
-- CALVIN 已通过 `configs/calvin_xvla_enabled_probe.json`、`configs/rl/rewards/calvin.yaml` 和 X-VLA HTTP action backend 接入同一套 loop；外部 X-VLA server 仍由用户单独启动。
-- OpenRLHF 多卡训练会对 mixed text/multimodal samples 做 modality-aligned replay 排列，保持 ZeRO-3 collective 顺序一致。
-
-常用入口：
-
-```bash
-cd /mnt/wangwai/vla/clawvla
-./scripts/run_clawvla_rl.sh --help
-./scripts/run_clawvla_rl.sh --preset robotwin-multitask --mode dry-run
-./scripts/run_clawvla_rl.sh --preset robotwin-real5 --mode train --run-id robotwin_rl_real5
-./scripts/run_clawvla_rl.sh --preset libero-multitask --mode train --run-id libero_rl_multitask
-./scripts/run_clawvla_rl.sh --preset robocasa-rollout --mode dry-run
-./scripts/run_clawvla_rl.sh --preset robocasa-1update --mode dry-run
-./scripts/run_clawvla_rl.sh --preset calvin-xvla --mode dry-run
-./scripts/run_clawvla_rl.sh --preset rynnbrain-train-smoke --mode dry-run
-clawvla-rl --preset libero-multitask --mode dry-run
-```
-
-更完整说明见 [docs/agent_rl.md](docs/agent_rl.md)。
-
-已验证的真实 smoke：
-
-- `configs/rl/qwen3vl_pi05_libero_multitask_1update.yaml`：2 张 policy GPU，LIBERO mixed text/multimodal GRPO 一次更新，checkpoint 正常写出。
-- `configs/rl/qwen3vl_pi05_real_5step_1update.yaml`：4 张 policy GPU，RobotWin/OpenPI 5-step rollout + 一次更新，mixed modality path 正常完成。
-
-## 脚本说明
-
-主入口：
-
-- `scripts/run_qwen3vl_pi05_agent.sh`：推荐正式入口，读取 run profile。
-- `scripts/run_clawvla_rl.sh`：RL 入口，支持 `--preset robotwin-real5`、`--preset libero-multitask` 等短名。
-- `python -m clawvla.scripts.run_profile`：profile runner，可覆盖 instruction/max-steps/gpus 等。
-- `python -m clawvla.scripts.run_loop_with_vllm`：手动启动本地 vLLM 并跑 agent。
-- `python -m clawvla.scripts.run_loop`：只跑 agent loop，不负责启动 vLLM。
-
-OpenPI/pi0.5：
-
-- `python -m clawvla.scripts.pi05_worker`：常驻 pi0.5 worker。
-- `python -m clawvla.scripts.pi05_backend_probe`：诊断 pi0.5 checkpoint/schema/adapter。
-- `python -m clawvla.scripts.pi05_inference_smoke`：只跑 pi0.5 inference，不执行 RoboTwin。
-- `python -m clawvla.scripts.robotwin_pi05_execute_once`：采集、推理并执行一次，用于端到端诊断。
-- `python -m clawvla.scripts.libero_pi05_execute_once`：LIBERO 采集、pi0.5 推理、7D action 执行诊断。
-- `python -m clawvla.scripts.pi05_libero_action_smoke`：LIBERO action adapter 轻量 smoke。
-
-GR00T / RoboCasa：
-
-- `configs/robocasa_groot_enabled_probe.json`：RoboCasa + GR00T 本地 probe 配置，默认任务 `robocasa/PickPlaceCounterToCabinet`。
-- `python -m clawvla.scripts.groot_worker --config configs/robocasa_groot_enabled_probe.json --load-policy`：常驻 GR00T worker。
-- `python -m clawvla.scripts.groot_inference_smoke --config configs/robocasa_groot_enabled_probe.json --artifact-dir <artifact_dir> --prompt "move to the bottle"`：只测 GR00T action backend，不执行环境。
-
-完整整理见 [docs/robocasa_groot.md](docs/robocasa_groot.md)。
-
-CALVIN / X-VLA：
-
-- `configs/calvin_xvla_enabled_probe.json`：CALVIN validation 环境和 X-VLA `/act` endpoint 配置。
-- `python -m clawvla.rl.openrlhf_runner --preset calvin-xvla --mode dry-run`：展开 CALVIN one-update 配置。
-
-完整整理见 [docs/calvin_xvla.md](docs/calvin_xvla.md)。
-
-轻量 smoke/probe：
-
-- `python -m clawvla.scripts.inspect_stack`
-- `python -m clawvla.scripts.artifact_smoke`
-- `python -m clawvla.scripts.geometry_smoke`
-- `python -m clawvla.scripts.robotwin_capture_once`
-- `python -m clawvla.scripts.libero_capture_once`
-- `python -m clawvla.scripts.robotwin_execute_smoke`
-- `python -m clawvla.scripts.round_once`
-
-这些脚本目前都保留；它们用于定位环境、artifact、geometry、RoboTwin capture 或 action bridge 问题。
-
-## 开发检查
-
-不启动真实模型/环境的基础检查：
-
-```bash
-cd /mnt/wangwai/vla/clawvla
-PYTHONPATH=src python -m clawvla.scripts.inspect_stack --config configs/robotwin_default.json
-PYTHONPATH=src python -m clawvla.scripts.artifact_smoke --config configs/robotwin_default.json
-PYTHONPATH=src python -m clawvla.scripts.geometry_smoke --config configs/robotwin_default.json
-PYTHONPATH=src python -m clawvla.scripts.robotwin_execute_smoke
-```
-
-编译检查：
-
-```bash
-PYTHONPATH=src python -m compileall -q src/clawvla
-```
-
-单元测试（显式绕过本机 HTTP proxy）：
-
-```bash
-NO_PROXY=127.0.0.1,localhost PYTHONPATH=src \
-  /mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python -m pytest -q
-```
-
-## 当前注意点
-
-- `preflight` 是正式执行前检查；不可用或检查失败必须显式返回失败，不写 placeholder 成功状态。
-- `localize_task_objects` 必须显式产出顶层 `source_candidate_id` 和 `target_candidate_id`，不会根据 label 暗中补。
-- `build_task_plan` 在模型输出空 subgoals 时会返回 `task_plan_invalid_model_output`，不会偷偷生成模板计划。
-- vLLM profile 的 `--max-model-len` 当前为 `32768`，用于容纳四视角图像和较长 agent 上下文。
-- `tmp_runs/`、`tmp_artifacts/`、`runs/`、`outputs/`、`checkpoints/`、`ray_results/`、`__pycache__/`、`.deps/` 和本地模型权重文件都是生成物或本机产物，不提交。
+The release is focused on the supervised training and deployment path used by
+the paper. Historical RL experiments, generated datasets, checkpoints, videos,
+machine-specific paths, and fixed-sequence VLA replay programs are outside the
+source tree. Generated artifacts belong under `data/` or `artifacts/`, both of
+which are ignored by Git.

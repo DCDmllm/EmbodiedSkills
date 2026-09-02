@@ -121,7 +121,6 @@ def _compact_task_plan(value: Any) -> Any:
         payload["subgoals"] = [
             {
                 "subgoal_id": item.get("subgoal_id"),
-                "type": item.get("type"),
                 "instruction": item.get("instruction"),
                 "source_candidate_id": item.get("source_candidate_id"),
                 "target_candidate_id": item.get("target_candidate_id"),

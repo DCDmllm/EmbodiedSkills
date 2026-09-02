@@ -30,11 +30,28 @@ from clawvla.scripts.robotwin_official_seed_check import (
 )
 
 
-DEFAULT_TASKS_CONFIG = "/mnt/wangwai/vla/clawvla/configs/rl/tasks/robotwin_all.yaml"
-DEFAULT_BASE_CONFIG = "/mnt/wangwai/vla/clawvla/configs/robotwin_pi05_worker_probe.json"
-DEFAULT_ROBOTWIN_PYTHON = "/mnt/wangwai/miniconda3/envs/robotwin-py312/bin/python"
-DEFAULT_OUTPUT_ROOT = "/mnt/wangwai/vla/clawvla/runs/data"
-DEFAULT_POLISH_CONFIG = "/mnt/wangwai/vla/clawvla/configs/krill_gpt55.local.json"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+WORKSPACE_ROOT = PROJECT_ROOT.parent.parent
+
+
+def _default_robotwin_root() -> Path:
+    configured = os.environ.get("ROBOTWIN_ROOT") or os.environ.get("CLAWVLA_ROBOTWIN_ROOT")
+    if configured:
+        return Path(configured).expanduser()
+    candidates = (
+        WORKSPACE_ROOT / "RoboTwin",
+        PROJECT_ROOT.parent / "RoboTwin",
+        PROJECT_ROOT / "RoboTwin",
+    )
+    return next((path for path in candidates if path.is_dir()), candidates[0])
+
+
+DEFAULT_TASKS_CONFIG = PROJECT_ROOT / "configs/rl/tasks/robotwin_all.yaml"
+DEFAULT_BASE_CONFIG = PROJECT_ROOT / "configs/robotwin_pi05_worker_probe.json"
+DEFAULT_ROBOTWIN_PYTHON = os.environ.get("ROBOTWIN_PYTHON", sys.executable)
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "runs/data"
+DEFAULT_POLISH_CONFIG = PROJECT_ROOT / "configs/krill_gpt55.local.json"
+DEFAULT_ROBOTWIN_ROOT = _default_robotwin_root()
 OFFICIAL_SEED_RANGE = "100000:199999"
 
 
@@ -65,7 +82,7 @@ def parse_args() -> argparse.Namespace:
             "Jobs are scheduled interleaved: task1 episode0, task2 episode0, ..., then episode1."
         )
     )
-    parser.add_argument("--tasks-config", default=DEFAULT_TASKS_CONFIG)
+    parser.add_argument("--tasks-config", default=str(DEFAULT_TASKS_CONFIG))
     parser.add_argument(
         "--task-name",
         action="append",
@@ -73,9 +90,17 @@ def parse_args() -> argparse.Namespace:
         help="Restrict to one or more RoboTwin task names.",
     )
     parser.add_argument("--task-limit", type=int, default=None)
-    parser.add_argument("--repo-root", default="/mnt/wangwai/RoboTwin")
-    parser.add_argument("--base-config", default=DEFAULT_BASE_CONFIG)
-    parser.add_argument("--task-config", default="demo_clean")
+    parser.add_argument(
+        "--repo-root",
+        default=str(DEFAULT_ROBOTWIN_ROOT),
+        help="RoboTwin repository root. Defaults to $ROBOTWIN_ROOT or a nearby RoboTwin checkout.",
+    )
+    parser.add_argument("--base-config", default=str(DEFAULT_BASE_CONFIG))
+    parser.add_argument(
+        "--task-config",
+        default="demo_clean",
+        help="RoboTwin task config name, normally demo_clean or demo_randomized.",
+    )
     parser.add_argument("--split", default="train", choices=["train", "val", "custom"])
     parser.add_argument("--episodes-per-task", type=int, default=100)
     parser.add_argument("--start-seed", type=int, default=None, help="Defaults: train=200000, val=300000.")
@@ -90,13 +115,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-profile", default=None)
     parser.add_argument("--save-freq", type=int, default=15)
     parser.add_argument("--max-candidates-per-episode", type=int, default=2000)
-    parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--gpus", default="0,1,2,3,4,5,6,7", help="Comma-separated GPU ids for collection lanes.")
-    parser.add_argument("--robotwin-python", default=DEFAULT_ROBOTWIN_PYTHON)
+    parser.add_argument(
+        "--robotwin-python",
+        default=DEFAULT_ROBOTWIN_PYTHON,
+        help="Python executable for the RoboTwin environment. Defaults to $ROBOTWIN_PYTHON or current Python.",
+    )
+    parser.add_argument(
+        "--pythonpath-prefix",
+        action="append",
+        default=[],
+        help=(
+            "Extra directory prepended to worker PYTHONPATH. May be repeated, for example for a local "
+            "pytorch3d installation. The ClawVLA src directory is always added automatically."
+        ),
+    )
     parser.add_argument("--episode-timeout", type=float, default=3600.0)
     parser.add_argument("--status-interval", type=float, default=5.0)
     parser.add_argument("--progress-task-limit", type=int, default=60)
@@ -117,6 +155,15 @@ def parse_args() -> argparse.Namespace:
         help="memory preserves RoboTwin's fast in-memory merge; stream uses lower peak RAM.",
     )
     parser.add_argument(
+        "--rgb-input-order",
+        choices=["rgb", "bgr"],
+        default="rgb",
+        help=(
+            "Channel order of RoboTwin PKL image arrays. Official RoboTwin observations are RGB; "
+            "the value is converted explicitly before OpenCV JPEG encoding."
+        ),
+    )
+    parser.add_argument(
         "--save-video",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -128,7 +175,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Rewrite raw expert comments into VLA-style subgoal commands with the configured model.",
     )
-    parser.add_argument("--subgoal-polish-config", default=DEFAULT_POLISH_CONFIG)
+    parser.add_argument("--subgoal-polish-config", default=str(DEFAULT_POLISH_CONFIG))
     parser.add_argument("--subgoal-polish-n", type=int, default=4)
     parser.add_argument("--subgoal-polish-temperature", type=float, default=0.35)
     parser.add_argument("--subgoal-polish-max-tokens", type=int, default=2000)
@@ -159,6 +206,7 @@ def main() -> None:
 
 
 async def _manager_main(args: argparse.Namespace) -> None:
+    _validate_collection_inputs(args)
     tasks = _filter_tasks(_load_tasks(Path(args.tasks_config)), args)
     args.start_seed = _resolve_start_seed(args)
     seed_ranges = _parse_seed_ranges(args.forbidden_seed_range)
@@ -280,6 +328,8 @@ async def _run_worker_job(
         str(args.episode_cache_root),
         "--merge-hdf5-mode",
         str(args.merge_hdf5_mode),
+        "--rgb-input-order",
+        str(args.rgb_input_order),
         "--output-dir",
         str(run_dir),
         "--subgoal-polish-config",
@@ -317,7 +367,7 @@ async def _run_worker_job(
     with log_path.open("ab") as log:
         process = await asyncio.create_subprocess_exec(
             *command,
-            cwd="/mnt/wangwai/vla/clawvla",
+            cwd=str(PROJECT_ROOT),
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=log,
@@ -555,6 +605,7 @@ def _try_collect_seed(
                 cache_task_dir.mkdir(parents=True, exist_ok=True)
                 task_env.save_dir = str(cache_task_dir)
             task_env._clawvla_merge_hdf5_mode = str(args.merge_hdf5_mode)
+            task_env._clawvla_rgb_input_order = str(args.rgb_input_order)
             _install_segment_trace(task_env, repo_root, job, plan, segments)
             episode_info = task_env.play_once()
             plan_success = bool(getattr(task_env, "plan_success", False))
@@ -752,7 +803,7 @@ def _segment_polish_input(segment: dict[str, Any]) -> dict[str, Any]:
 
 def _load_polish_config(path: Path) -> dict[str, Any]:
     if not path.is_absolute():
-        path = Path("/mnt/wangwai/vla/clawvla") / path
+        path = PROJECT_ROOT / path
     if not path.exists():
         raise RuntimeError(f"subgoal_polish_failed: config not found: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -994,6 +1045,12 @@ def _episode_metadata(
         "task_instruction_from_config": job.task_instruction,
         "instruction_type": args.instruction_type,
         "save_freq": int(args.save_freq),
+        "image_encoding": {
+            "source_array_channel_order": str(args.rgb_input_order).upper(),
+            "jpeg_encoder_input_order": "BGR",
+            "decoded_training_order": "RGB",
+            "explicit_channel_conversion": bool(args.rgb_input_order == "rgb"),
+        },
         "hdf5_path": str(hdf5_path),
         "task_dir": str(task_dir),
         "frame_count": frame_count,
@@ -1483,33 +1540,37 @@ def _attach_hdf5_metadata(hdf5_path: Path, metadata: dict[str, Any]) -> None:
 
 
 def _merge_episode_cache(task_env: Any, task_dir: Path, episode_index: int, *, save_video: bool) -> None:
-    if save_video:
-        task_env.merge_pkl_to_hdf5_video()
-        return
-
     cache_path = Path(task_env.folder_path["cache"])
     hdf5_path = task_dir / "data" / f"episode{episode_index}.hdf5"
     hdf5_path.parent.mkdir(parents=True, exist_ok=True)
     pkl_files = _numeric_pkl_files(cache_path)
     merge_mode = str(getattr(task_env, "_clawvla_merge_hdf5_mode", "memory"))
+    rgb_input_order = str(getattr(task_env, "_clawvla_rgb_input_order", "rgb"))
     if merge_mode == "stream":
-        _stream_pkl_files_to_hdf5(pkl_files, hdf5_path)
-        return
+        _stream_pkl_files_to_hdf5(pkl_files, hdf5_path, rgb_input_order=rgb_input_order)
+    else:
+        import h5py
 
-    import h5py
+        from envs.utils.pkl2hdf5 import (
+            append_data_to_structure,
+            create_hdf5_from_dict,
+            load_pkl_file,
+            parse_dict_structure,
+        )
 
-    from envs.utils.pkl2hdf5 import (
-        append_data_to_structure,
-        create_hdf5_from_dict,
-        load_pkl_file,
-        parse_dict_structure,
-    )
+        data = parse_dict_structure(load_pkl_file(str(pkl_files[0])))
+        for pkl_file in pkl_files:
+            append_data_to_structure(data, load_pkl_file(str(pkl_file)))
+        _prepare_rgb_lists_for_cv2(data, rgb_input_order=rgb_input_order)
+        with h5py.File(hdf5_path, "w") as handle:
+            create_hdf5_from_dict(handle, data)
 
-    data = parse_dict_structure(load_pkl_file(str(pkl_files[0])))
-    for pkl_file in pkl_files:
-        append_data_to_structure(data, load_pkl_file(str(pkl_file)))
-    with h5py.File(hdf5_path, "w") as handle:
-        create_hdf5_from_dict(handle, data)
+    if save_video:
+        _write_episode_video(
+            pkl_files,
+            task_dir / "video" / f"episode{episode_index}.mp4",
+            rgb_input_order=rgb_input_order,
+        )
 
 
 def _numeric_pkl_files(cache_path: Path) -> list[Path]:
@@ -1591,7 +1652,12 @@ def _remove_cache_path(cache_path: Path, *, purpose: str) -> dict[str, Any]:
     }
 
 
-def _stream_pkl_files_to_hdf5(pkl_files: list[Path], hdf5_path: Path) -> None:
+def _stream_pkl_files_to_hdf5(
+    pkl_files: list[Path],
+    hdf5_path: Path,
+    *,
+    rgb_input_order: str,
+) -> None:
     import cv2
     import h5py
     import numpy as np
@@ -1604,7 +1670,8 @@ def _stream_pkl_files_to_hdf5(pkl_files: list[Path], hdf5_path: Path) -> None:
         payload = load_pkl_file(str(pkl_file))
         for path, value in _iter_leaf_items(payload):
             if _is_rgb_leaf(path):
-                ok, encoded = cv2.imencode(".jpg", value)
+                encoder_input = _image_for_cv2(value, rgb_input_order=rgb_input_order)
+                ok, encoded = cv2.imencode(".jpg", encoder_input)
                 if not ok:
                     raise ValueError(f"failed to JPEG-encode {'/'.join(path)} from {pkl_file}")
                 rgb_max_len[path] = max(rgb_max_len.get(path, 0), len(encoded.tobytes()))
@@ -1632,7 +1699,8 @@ def _stream_pkl_files_to_hdf5(pkl_files: list[Path], hdf5_path: Path) -> None:
                 dataset = datasets[path]
                 seen.add(path)
                 if _is_rgb_leaf(path):
-                    ok, encoded = cv2.imencode(".jpg", value)
+                    encoder_input = _image_for_cv2(value, rgb_input_order=rgb_input_order)
+                    ok, encoded = cv2.imencode(".jpg", encoder_input)
                     if not ok:
                         raise ValueError(f"failed to JPEG-encode {'/'.join(path)} from {pkl_file}")
                     dataset[frame_index] = encoded.tobytes()
@@ -1642,6 +1710,57 @@ def _stream_pkl_files_to_hdf5(pkl_files: list[Path], hdf5_path: Path) -> None:
             if missing:
                 names = ", ".join("/".join(path) for path in sorted(missing)[:5])
                 raise ValueError(f"missing fields in {pkl_file}: {names}")
+
+
+def _image_for_cv2(value: Any, *, rgb_input_order: str) -> Any:
+    import cv2
+    import numpy as np
+
+    image = np.asarray(value)
+    if rgb_input_order == "bgr":
+        return np.ascontiguousarray(image)
+    if rgb_input_order != "rgb":
+        raise ValueError(f"unsupported RGB input order: {rgb_input_order}")
+    if image.ndim != 3 or image.shape[-1] not in (3, 4):
+        raise ValueError(f"expected an RGB/RGBA image, got shape={image.shape}")
+    conversion = cv2.COLOR_RGB2BGR if image.shape[-1] == 3 else cv2.COLOR_RGBA2BGRA
+    return cv2.cvtColor(image, conversion)
+
+
+def _prepare_rgb_lists_for_cv2(
+    value: Any,
+    *,
+    rgb_input_order: str,
+    path: tuple[str, ...] = (),
+) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _prepare_rgb_lists_for_cv2(
+                child,
+                rgb_input_order=rgb_input_order,
+                path=(*path, str(key)),
+            )
+        return
+    if isinstance(value, list) and _is_rgb_leaf(path):
+        for index, image in enumerate(value):
+            value[index] = _image_for_cv2(image, rgb_input_order=rgb_input_order)
+
+
+def _write_episode_video(
+    pkl_files: list[Path],
+    video_path: Path,
+    *,
+    rgb_input_order: str,
+) -> None:
+    import numpy as np
+
+    from envs.utils.images_to_video import images_to_video
+    from envs.utils.pkl2hdf5 import load_pkl_file
+
+    frames = np.stack(
+        [load_pkl_file(str(path))["observation"]["head_camera"]["rgb"] for path in pkl_files]
+    )
+    images_to_video(frames, out_path=str(video_path), is_rgb=rgb_input_order == "rgb")
 
 
 def _iter_leaf_items(value: Any, prefix: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], Any]]:
@@ -1971,8 +2090,12 @@ def _make_lanes(args: argparse.Namespace) -> list[Lane]:
 
 def _robotwin_env(args: argparse.Namespace, gpu: str | None) -> dict[str, str]:
     env = dict(os.environ)
-    env.pop("PYTHONPATH", None)
-    env["PYTHONPATH"] = "/mnt/wangwai/tmp_pytorch3d_target:/mnt/wangwai/vla/clawvla/src"
+    python_paths = [
+        *(str(Path(path).expanduser().resolve()) for path in args.pythonpath_prefix if str(path).strip()),
+        str(PROJECT_ROOT / "src"),
+        *_split_path_list(env.get("PYTHONPATH")),
+    ]
+    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(python_paths))
     library_paths = _robotwin_library_paths(args)
     if library_paths:
         existing = env.get("LD_LIBRARY_PATH")
@@ -1982,6 +2105,43 @@ def _robotwin_env(args: argparse.Namespace, gpu: str | None) -> dict[str, str]:
     if gpu:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     return env
+
+
+def _validate_collection_inputs(args: argparse.Namespace) -> None:
+    repo_root = Path(args.repo_root).expanduser().resolve()
+    tasks_config = Path(args.tasks_config).expanduser().resolve()
+    task_config = repo_root / "task_config" / f"{args.task_config}.yml"
+    required = {
+        "RoboTwin repository": repo_root,
+        "RoboTwin env directory": repo_root / "envs",
+        "RoboTwin task config": task_config,
+        "task list": tasks_config,
+    }
+    missing = [f"{label}: {path}" for label, path in required.items() if not path.exists()]
+    if missing:
+        raise FileNotFoundError("collection inputs are missing:\n  " + "\n  ".join(missing))
+
+    executable = str(args.robotwin_python)
+    if os.path.sep in executable:
+        python_path = Path(executable).expanduser()
+        if not python_path.is_file():
+            raise FileNotFoundError(f"RoboTwin Python executable not found: {python_path}")
+    elif shutil.which(executable) is None:
+        raise FileNotFoundError(f"RoboTwin Python executable is not on PATH: {executable}")
+
+    if int(args.episodes_per_task) <= 0:
+        raise ValueError("--episodes-per-task must be positive")
+    if int(args.workers) <= 0:
+        raise ValueError("--workers must be positive")
+    if args.polish_subgoals and not args.dry_run:
+        polish_config = Path(args.subgoal_polish_config).expanduser()
+        if not polish_config.is_absolute():
+            polish_config = PROJECT_ROOT / polish_config
+        if not polish_config.is_file():
+            raise FileNotFoundError(
+                f"subgoal polish config not found: {polish_config}; "
+                "use --no-polish-subgoals to collect raw expert segments without an API"
+            )
 
 
 def _ensure_worker_env() -> None:
@@ -2024,6 +2184,12 @@ def _split_csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _split_path_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item for item in str(value).split(os.pathsep) if item]
 
 
 def _last_json_line(text: str) -> dict[str, Any] | None:

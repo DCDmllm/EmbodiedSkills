@@ -1,0 +1,58 @@
+model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
+trust_remote_code: true
+flash_attn: fa2
+disable_gradient_checkpointing: false
+
+stage: sft
+do_train: true
+do_eval: true
+finetuning_type: lora
+lora_rank: 64
+lora_alpha: 128
+lora_dropout: 0.05
+lora_target: all
+freeze_vision_tower: true
+freeze_multi_modal_projector: true
+freeze_language_model: false
+deepspeed: configs/qwen/ds_z3_config.json
+
+dataset_dir: data/qwen_agent_skill
+dataset: robotwin_agent_skill_subset_30k_train
+eval_dataset: robotwin_agent_skill_subset_3k_val
+template: qwen3_vl_nothink
+enable_thinking: false
+cutoff_len: 65536
+packing: false
+neat_packing: false
+max_samples: 10000000
+overwrite_cache: false
+preprocessing_num_workers: 16
+dataloader_num_workers: 2
+
+output_dir: artifacts/checkpoints/qwen_agent_skill_lora
+run_name: embodiedskills-qwen-agent-skill
+logging_steps: 5
+save_strategy: steps
+save_steps: 100
+save_total_limit: 3
+plot_loss: true
+overwrite_output_dir: false
+save_only_model: false
+
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 5.0e-5
+num_train_epochs: 1
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.01
+max_grad_norm: 1.0
+bf16: true
+fp16: false
+ddp_find_unused_parameters: false
+ddp_timeout: 180000000
+
+per_device_eval_batch_size: 1
+eval_strategy: steps
+eval_steps: 50
+report_to: wandb

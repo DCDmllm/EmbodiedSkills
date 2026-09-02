@@ -1,1 +1,1 @@
-"""Command line entrypoints for ClawVLA."""
+"""Command-line entry points for EmbodiedSkills."""

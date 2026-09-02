@@ -187,6 +187,13 @@ class Subgoal(DictSerializable):
     completion_criteria: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        # Kept only as an in-memory compatibility slot for old checkpoints and
+        # recovery code. It is not part of planner/verifier model I/O.
+        payload.pop("type", None)
+        return payload
+
     @classmethod
     def from_payload(cls, payload: dict[str, Any], index: int = 0) -> "Subgoal":
         return cls(
@@ -222,6 +229,15 @@ class TaskPlan(DictSerializable):
     current_subgoal_id: str | None = None
     status: str = "pending"
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task": self.task,
+            "subgoals": [subgoal.to_dict() for subgoal in self.subgoals],
+            "current_subgoal_id": self.current_subgoal_id,
+            "status": self.status,
+            "metadata": dict(self.metadata),
+        }
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "TaskPlan":

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, field
 try:
     from enum import StrEnum
@@ -13,6 +15,11 @@ from pathlib import Path
 from typing import Any
 
 from .schema import StageDefinition
+
+
+_ENVIRONMENT_REFERENCE = re.compile(
+    r"\$(?:\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))"
+)
 
 
 class ModelBackend(StrEnum):
@@ -46,6 +53,7 @@ class ModelConfig:
 class ComponentConfig:
     enabled: bool = True
     model: str | None = None
+    skill_models: dict[str, str] = field(default_factory=dict)
     skills: list[str] = field(default_factory=list)
     prompt_format: str = "json"
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -53,7 +61,7 @@ class ComponentConfig:
 
 @dataclass
 class RobotwinConfig:
-    repo_root: str = "/mnt/wangwai/RoboTwin"
+    repo_root: str = "./third_party/RoboTwin"
     task_name: str = "place_container_plate"
     task_config: str = "demo_clean"
     seed: int = 0
@@ -69,7 +77,7 @@ class RobotwinConfig:
     camera_profile: str | None = None
     planner_image_mode: str = "current_rgb_4"
     static_camera_preset: str = "selected_global_4"
-    artifact_dir: str = "/mnt/wangwai/vla/clawvla/tmp_artifacts"
+    artifact_dir: str = "./artifacts/robotwin"
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -87,11 +95,8 @@ class EnvironmentConfig:
 @dataclass
 class RuntimeEnvironment:
     conda_env: str = "robotwin-py312"
-    conda_bin: str = "/mnt/wangwai/miniconda3/bin/conda"
-    pythonpath_prefix: list[str] = field(default_factory=lambda: [
-        "/mnt/wangwai/tmp_pytorch3d_target",
-        "/mnt/wangwai/vla/clawvla/src",
-    ])
+    conda_bin: str = "conda"
+    pythonpath_prefix: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=lambda: {
         "__EGL_VENDOR_LIBRARY_DIRS": "/usr/share/glvnd/egl_vendor.d",
         "VK_ICD_FILENAMES": "/etc/vulkan/icd.d/nvidia_icd.json",
@@ -127,11 +132,11 @@ def _stage_definition(payload: dict[str, Any]) -> StageDefinition:
 
 
 def load_config(path: str | Path) -> AgentConfig:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    payload = _expand_environment(json.loads(Path(path).read_text(encoding="utf-8")))
     robotwin = RobotwinConfig(**payload.get("robotwin", {}))
     environment = _environment_config(payload.get("environment"), robotwin)
     return AgentConfig(
-        name=str(payload.get("name", "clawvla")),
+        name=str(payload.get("name", "embodiedskills")),
         task=dict(payload.get("task", {})),
         models={name: _model_config(cfg) for name, cfg in payload.get("models", {}).items()},
         components={name: _component_config(cfg) for name, cfg in payload.get("components", {}).items()},
@@ -141,6 +146,27 @@ def load_config(path: str | Path) -> AgentConfig:
         runtime_environment=RuntimeEnvironment(**payload.get("runtime_environment", {})),
         metadata=dict(payload.get("metadata", {})),
     )
+
+
+def _expand_environment(value: Any) -> Any:
+    if isinstance(value, str):
+        missing = sorted(
+            {
+                match.group("braced") or match.group("plain")
+                for match in _ENVIRONMENT_REFERENCE.finditer(value)
+                if (match.group("braced") or match.group("plain")) not in os.environ
+            }
+        )
+        if missing:
+            raise ValueError(
+                "unresolved_environment_variables:" + ",".join(missing)
+            )
+        return os.path.expanduser(os.path.expandvars(value))
+    if isinstance(value, list):
+        return [_expand_environment(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _expand_environment(item) for key, item in value.items()}
+    return value
 
 
 def _environment_config(payload: Any, robotwin: RobotwinConfig) -> EnvironmentConfig:

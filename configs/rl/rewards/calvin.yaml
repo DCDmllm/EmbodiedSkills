@@ -1,6 +1,0 @@
-reward:
-  registry:
-    - clawvla.rl.reward_registry:register_builtin_robotwin
-    - clawvla.rl.reward_registry:register_builtin_calvin
-  task_map:
-    calvin_move_slider_left: calvin

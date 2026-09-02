@@ -13,6 +13,7 @@ class SkillContext:
     component_name: str
     blackboard: Blackboard
     model_runtime: ModelRuntime | None = None
+    model_route: str | None = None
 
     @property
     def has_model(self) -> bool:

@@ -1,4 +1,4 @@
-# Main ClawVLA agent + RoboTwin environment.
+# Main EmbodiedSkills agent + RoboTwin environment.
 # Install this inside the existing robotwin-py312 environment.
 -e .
 

@@ -334,8 +334,6 @@ def _expected_action_dim(action_type: object | None, backend: object | None = No
         return 16
     if action_type == "libero_ee_delta":
         return 7
-    if action_type in {"calvin_ee_pose_10d", "calvin_ee_delta"}:
-        return 10
     return None
 
 

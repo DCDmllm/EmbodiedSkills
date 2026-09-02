@@ -7,6 +7,55 @@ from ..skills.base import SkillContext, SkillRegistry
 from .skill_helpers import get_attr, ok, register_skill, to_dict, unavailable
 
 
+VERIFIER_INSTRUCTION = (
+    "Verify only the current robot manipulation subgoal from the attached fresh post-execution images and execution report. "
+    "Do not judge the whole task when deciding subgoal_success. The task_instruction is background only; "
+    "current_subgoal.completion_criteria is the sole authoritative success target. "
+    "Judge exactly that criterion without adding, removing, strengthening, or replacing any requirement. "
+    "Do not require an action or result that belongs to an adjacent or later subgoal. "
+    "Use the attached verification images as the source of truth. Scheduler narration, state_summary, "
+    "expected_result, and other prior text are not visual evidence and must not override the images. "
+    "Judge the current subgoal first; only mark task_success true if the entire task is complete. "
+    "execution_report.full_task_success is RoboTwin's whole-task check_success result, not the current "
+    "subgoal result; do not mark the current subgoal failed only because full_task_success is false. "
+    "Use failure_type=not_done only when the subgoal is simply incomplete and the current target "
+    "can still be completed by continuing execution without replanning. In that case use "
+    "next_action=continue_execute. Use observation_stale or ambiguous when visual evidence is "
+    "insufficient and next_action=reobserve. Use execution_failed or other only when the executed "
+    "action made the state worse, changed the wrong object, destabilized the scene, or cannot be "
+    "continued directly; in that case use next_action=recover. Do not use recover for normal "
+    "not_done progress."
+)
+
+
+def build_verifier_model_request(
+    blackboard: Blackboard,
+    current_subgoal: object | None,
+    execution_report: object | None,
+) -> tuple[str, dict[str, object]]:
+    """Build the single verifier request contract shared by Runtime and SFT data."""
+    return (
+        VERIFIER_INSTRUCTION,
+        {
+            "task_instruction": blackboard.task_instruction,
+            "blackboard": _verifier_blackboard_context(blackboard),
+            "current_subgoal": to_dict(current_subgoal),
+            "subgoal_success_contract": _subgoal_verification_contract(current_subgoal),
+            "execution_report": _compact_execution_report(execution_report),
+            "required_schema": {
+                "subgoal_success": False,
+                "task_success": False,
+                "partial_progress": False,
+                "failure_type": "none|not_done|observation_stale|execution_failed|ambiguous|other",
+                "progress_score": 0.0,
+                "should_reobserve": False,
+                "next_action": "advance_subgoal|continue_execute|reobserve|recover|finish",
+                "notes": ["short evidence note"],
+            },
+        },
+    )
+
+
 def register_verifier_skills(registry: SkillRegistry) -> None:
     register_skill(registry, "verifier", "verify_progress", "Verify progress from before/after observations.", verify_progress, True)
 
@@ -30,52 +79,15 @@ def verify_progress(request: SkillRequest, context: SkillContext) -> SkillResult
                 },
                 errors=["missing_verify_images"],
             )
+        instruction, model_payload = build_verifier_model_request(
+            blackboard,
+            current_subgoal,
+            execution_report,
+        )
         raw = call_component_json(
             context,
-            instruction=(
-                "Verify only the current robot manipulation subgoal from the attached fresh post-execution images and execution report. "
-                "Do not judge the whole task when deciding subgoal_success. The task_instruction is background only; "
-                "current_subgoal and subgoal_success_contract are the authoritative success target. "
-                "Treat subgoal_success_contract.success_condition as the hard pass condition: if the images do not "
-                "clearly satisfy that condition, subgoal_success must be false even if there was partial progress. "
-                "Use the attached verification images as the source of truth. Scheduler narration, state_summary, "
-                "expected_result, and other prior text are not visual evidence and must not override the images. "
-                "If prior text says an object was grasped but the images show it still resting on the table, "
-                "subgoal_success must be false. "
-                "For example, if current_subgoal.type is grasp, success means the source object is visibly held/lifted by the gripper; "
-                "the gripper merely touching, hovering near, or partly occluding the object is not success. If the object is still "
-                "resting on the table, subgoal_success must be false. It does not need to be on the final target yet. "
-                "If current_subgoal.type is transport, success means the held source "
-                "has moved near/above the target. If current_subgoal.type is place or release, require the source object "
-                "to be stable at the target and not visibly supported by a closed gripper. "
-                "Judge the current subgoal first; only mark task_success true if the entire task is complete. "
-                "execution_report.full_task_success is RoboTwin's whole-task check_success result, not the current "
-                "subgoal result; do not mark a grasp/transport/place subgoal failed only because full_task_success is false. "
-                "Use failure_type=not_done only when the subgoal is simply incomplete and the current target "
-                "can still be completed by continuing execution without replanning. In that case use "
-                "next_action=continue_execute. Use observation_stale or ambiguous when visual evidence is "
-                "insufficient and next_action=reobserve. Use execution_failed or other only when the executed "
-                "action made the state worse, changed the wrong object, destabilized the scene, or cannot be "
-                "continued directly; in that case use next_action=recover. Do not use recover for normal "
-                "not_done progress."
-            ),
-            payload={
-                "task_instruction": blackboard.task_instruction,
-                "blackboard": _verifier_blackboard_context(blackboard),
-                "current_subgoal": to_dict(current_subgoal),
-                "subgoal_success_contract": subgoal_contract,
-                "execution_report": compact_execution,
-                "required_schema": {
-                    "subgoal_success": False,
-                    "task_success": False,
-                    "partial_progress": False,
-                    "failure_type": "none|not_done|observation_stale|execution_failed|ambiguous|other",
-                    "progress_score": 0.0,
-                    "should_reobserve": False,
-                    "next_action": "advance_subgoal|continue_execute|reobserve|recover|finish",
-                    "notes": ["short evidence note"],
-                },
-            },
+            instruction=instruction,
+            payload=model_payload,
             image_paths=image_paths,
             render_format=request.payload.get("render_format", "json"),
         )
@@ -169,39 +181,23 @@ def _verifier_blackboard_context(blackboard: Blackboard) -> dict[str, object]:
 
 
 def _subgoal_verification_contract(current_subgoal: object | None) -> dict[str, object]:
-    subgoal_type = str(get_attr(current_subgoal, "type", "") or "").strip().lower()
     source_id = get_attr(current_subgoal, "source_candidate_id")
     target_id = get_attr(current_subgoal, "target_candidate_id")
+    completion_criteria = dict(get_attr(current_subgoal, "completion_criteria", {}) or {})
+    natural_language = str(completion_criteria.get("natural_language") or "").strip()
     base = {
         "subgoal_id": get_attr(current_subgoal, "subgoal_id"),
-        "subgoal_type": subgoal_type or None,
         "subgoal_instruction": get_attr(current_subgoal, "instruction"),
         "source_candidate_id": source_id,
         "target_candidate_id": target_id,
-        "completion_criteria": dict(get_attr(current_subgoal, "completion_criteria", {}) or {}),
+        "completion_criteria": completion_criteria,
         "judge_only_this_subgoal": True,
+        "success_condition": natural_language or "the visual state satisfies current_subgoal.completion_criteria",
+        "not_required": [
+            "any action or result not explicitly required by current_subgoal.completion_criteria",
+            "full task completion unless this is the final subgoal",
+        ],
     }
-    if subgoal_type == "approach":
-        base["success_condition"] = "the gripper/end effector is close enough to the source object to start grasping"
-        base["not_required"] = ["grasping the object", "moving to the final target", "placing on the target"]
-    elif subgoal_type == "grasp":
-        base["success_condition"] = "the source object is visibly held by the gripper and lifted or controlled"
-        base["not_required"] = ["moving all the way to the target", "placing on the target", "releasing the object"]
-    elif subgoal_type == "transport":
-        base["success_condition"] = "the source object remains held and is moved near or above the target"
-        base["not_required"] = ["releasing the object", "final stable placement after release"]
-    elif subgoal_type == "place":
-        base["success_condition"] = (
-            "the source object is resting stably on or inside the target placement region and is not visibly "
-            "supported, lifted, or held by a closed gripper"
-        )
-        base["not_required"] = ["full task completion beyond the current placement subgoal"]
-    elif subgoal_type == "release":
-        base["success_condition"] = "the gripper has released the source object and it remains stable at the target"
-        base["not_required"] = ["continuing to hold the object"]
-    else:
-        base["success_condition"] = "the visual state satisfies current_subgoal.completion_criteria"
-        base["not_required"] = ["full task completion unless this is the final subgoal"]
     return base
 
 

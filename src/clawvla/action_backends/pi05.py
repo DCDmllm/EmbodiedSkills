@@ -6,7 +6,6 @@ from importlib.util import find_spec
 import os
 from pathlib import Path
 import socket
-import subprocess
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -137,7 +136,7 @@ class Pi05ActionBackend:
                     "ok": False,
                     "backend": self.name,
                     "reason": "lerobot_not_importable",
-                    "required_pythonpath": self.config.get("lerobot_src") or "/mnt/wangwai/lerobot/src",
+                    "required_pythonpath": self.config.get("lerobot_src"),
                 }
             return {
                 "ok": True,
@@ -193,7 +192,7 @@ class Pi05ActionBackend:
         runtime_cfg = self.config.get("openpi_runtime", {})
         if os.environ.get("CLAWVLA_PI05_DIRECT") == "1":
             return False
-        return isinstance(runtime_cfg, dict) and runtime_cfg.get("mode") in {"subprocess", "worker"}
+        return isinstance(runtime_cfg, dict) and runtime_cfg.get("mode") == "worker"
 
     def _build_openpi_action_chunk_subprocess(
         self,
@@ -207,47 +206,7 @@ class Pi05ActionBackend:
         artifact_dir = _artifact_dir_from_observation(observation)
         if runtime_cfg.get("mode") == "worker":
             return self._request_openpi_worker(motion_goal, world_state, observation, request, runtime_cfg, artifact_dir)
-        output_path = artifact_dir / "pi05_action_chunk.json"
-        prompt = _resolve_prompt(self, motion_goal, world_state, observation, request)
-        command = [
-            str(runtime_cfg.get("conda_bin") or "/mnt/wangwai/miniconda3/bin/conda"),
-            "run",
-            "--no-capture-output",
-            "-n",
-            str(runtime_cfg.get("conda_env") or "openpi-torch-py312"),
-            "python",
-            "-m",
-            "clawvla.scripts.pi05_inference_smoke",
-            "--config",
-            str(runtime_cfg.get("config_path") or "/mnt/wangwai/vla/clawvla/configs/robotwin_pi05_enabled_probe.json"),
-            "--artifact-dir",
-            str(artifact_dir),
-            "--prompt",
-            prompt,
-            "--num-steps",
-            str(request.get("num_steps") or self.config.get("policy_kwargs", {}).get("sample_num_steps") or 10),
-            "--horizon",
-            str(request.get("horizon") or self.config.get("policy_kwargs", {}).get("n_action_steps") or 10),
-            "--output",
-            str(output_path),
-        ]
-        env = dict(os.environ)
-        env.pop("PYTHONPATH", None)
-        env["PYTHONPATH"] = str(
-            runtime_cfg.get("pythonpath") or "/mnt/wangwai/vla/clawvla/src:/mnt/wangwai/RoboTwin/policy/pi05/src"
-        )
-        env["CLAWVLA_PI05_DIRECT"] = "1"
-        if runtime_cfg.get("cuda_visible_devices"):
-            env["CUDA_VISIBLE_DEVICES"] = str(runtime_cfg["cuda_visible_devices"])
-        subprocess.run(command, check=True, env=env)
-        payload = json.loads(output_path.read_text(encoding="utf-8"))
-        chunk_payload = payload["action_chunk"]
-        return ActionChunk(
-            action_type=str(chunk_payload["action_type"]),
-            commands=[[float(item) for item in command] for command in chunk_payload["commands"]],
-            control_horizon=int(chunk_payload.get("control_horizon") or len(chunk_payload["commands"])),
-            metadata=dict(chunk_payload.get("metadata") or {}),
-        )
+        raise ValueError(f"unsupported_openpi_runtime_mode:{runtime_cfg.get('mode')}")
 
     def _request_openpi_worker(
         self,
@@ -305,6 +264,7 @@ class Pi05ActionBackend:
             "prompt": inference["prompt"],
             "state_source": inference["state_source"],
             "raw_action_shape": inference["raw_action_shape"],
+            "swap_red_blue_channels_for_policy": inference["swap_red_blue_channels_for_policy"],
             "command_shape": [len(commands), len(commands[0]) if commands else 0],
             "transforms": [
                 "AlohaInputs(adapt_to_pi=True)",
@@ -401,6 +361,11 @@ class Pi05ActionBackend:
         decoded_state14 = _decode_aloha_state(state14, adapt_to_pi=True)
         normalized_state14 = _normalize_quantile(decoded_state14, norm_stats["state"])
         padded_state = _pad_last_dim(normalized_state14, int(model_config.action_dim))
+        robotwin_adapter = self.config.get("robotwin_adapter", {})
+        swap_red_blue_for_policy = bool(
+            isinstance(robotwin_adapter, dict)
+            and robotwin_adapter.get("swap_red_blue_channels_for_policy", False)
+        )
         token_ids, token_mask = _tokenize_prompt(
             tokenizer=runtime["tokenizer"],
             prompt=prompt,
@@ -408,7 +373,12 @@ class Pi05ActionBackend:
             max_len=int(model_config.max_token_len),
         )
         obs = SimpleNamespace(
-            images=_image_tensors_from_observation(observation, torch, device),
+            images=_image_tensors_from_observation(
+                observation,
+                torch,
+                device,
+                swap_red_blue=swap_red_blue_for_policy,
+            ),
             image_masks={key: torch.ones((1,), dtype=torch.bool, device=device) for key in _openpi_image_keys()},
             state=torch.as_tensor(padded_state[None, :], dtype=torch.float32, device=device),
             tokenized_prompt=torch.as_tensor(token_ids[None, :], dtype=torch.long, device=device),
@@ -432,6 +402,7 @@ class Pi05ActionBackend:
             "prompt": prompt,
             "state_source": state_source,
             "raw_action_shape": list(raw_np.shape),
+            "swap_red_blue_channels_for_policy": swap_red_blue_for_policy,
         }
 
     def _build_lerobot_libero_action_chunk(
@@ -1038,8 +1009,7 @@ class Pi05ActionBackend:
         robotwin_adapter = self.config.get("robotwin_adapter", {})
         if isinstance(robotwin_adapter, dict) and robotwin_adapter.get("openpi_src"):
             return str(robotwin_adapter.get("openpi_src"))
-        default = Path("/mnt/wangwai/RoboTwin/policy/pi05/src")
-        return str(default) if default.exists() else None
+        return os.environ.get("OPENPI_SRC")
 
     def _resolve_tokenizer_name(self) -> str | None:
         configured = self.config.get("tokenizer_name")
@@ -1363,7 +1333,13 @@ def _openpi_image_keys() -> tuple[str, str, str]:
     return ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
 
-def _image_tensors_from_observation(observation: ObservationBundle | None, torch: Any, device: str) -> dict[str, Any]:
+def _image_tensors_from_observation(
+    observation: ObservationBundle | None,
+    torch: Any,
+    device: str,
+    *,
+    swap_red_blue: bool = False,
+) -> dict[str, Any]:
     import numpy as np
     from PIL import Image
 
@@ -1381,6 +1357,12 @@ def _image_tensors_from_observation(observation: ObservationBundle | None, torch
             raise ValueError(f"Missing RGB artifact for camera {camera_name}.")
         image = Image.open(view.rgb_path).convert("RGB")
         array = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
+        if swap_red_blue:
+            # Compatibility path for legacy RoboTwin checkpoints trained from
+            # HDF5 JPEGs that encoded RGB arrays through OpenCV as BGR. Keep
+            # saved/runtime observations in normal RGB and swap only the model
+            # input tensor.
+            array = array[..., [2, 1, 0]].copy()
         images[output_key] = torch.as_tensor(array[None, ...], dtype=torch.float32, device=device).permute(0, 3, 1, 2)
     return images
 
@@ -1681,7 +1663,8 @@ def _package_version(package_name: str) -> str | None:
 
 
 def _local_hf_snapshot(model_dir_name: str) -> Path | None:
-    cache_root = Path("/mnt/wangwai/.cache/huggingface/hub") / model_dir_name
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    cache_root = hf_home / "hub" / model_dir_name
     refs_main = cache_root / "refs" / "main"
     if refs_main.exists():
         try:
