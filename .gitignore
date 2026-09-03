@@ -24,6 +24,8 @@ datasets/
 runs/
 checkpoints/
 outputs/
+output/
+rollouts/
 wandb/
 ray_results/
 slurm-*.out
@@ -31,6 +33,7 @@ slurm-*.out
 *.err
 *.log
 *.jsonl
+!robocerebra/samples/*.jsonl
 *.pid
 *.exit
 
@@ -39,6 +42,12 @@ slurm-*.out
 *.pt
 *.pth
 *.safetensors
+*.pkl
+*.mp4
+*.hdf5
+*.npz
+*.npy
+*.zip
 
 # Local-only overrides
 *.local
